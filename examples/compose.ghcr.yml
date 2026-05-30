@@ -1,0 +1,41 @@
+# Example 1 — RECOMMENDED: pull the prebuilt GHCR image, vault read-only,
+# transcripts to a dedicated output volume, shared `ai` network with Ollama.
+#
+# Setup:
+#   docker network create ai          # if it doesn't already exist
+#   docker network connect ai ollama  # attach your existing ollama container
+#   mkdir -p /mnt/docker/rm-ocr/out /mnt/docker/rm-ocr/state
+#   cp ../.env.example .env            # adjust as needed
+#   docker compose -f compose.ghcr.yml up -d
+#
+# Update to the latest published image later with:
+#   docker compose -f compose.ghcr.yml pull && docker compose -f compose.ghcr.yml up -d
+
+services:
+  rm-ocr:
+    image: ghcr.io/delize/scrybble-ocr-handwriting:latest
+    container_name: rm-ocr
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      VAULT_DIR: /vault
+      SOURCE_SUBDIR: remarkable
+      OUT_DIR: /out
+      OUT_SUFFIX: -handwriting_converted
+      STATE_DIR: /state
+      MODEL: qwen3.5:9b
+      OLLAMA_HOST: http://ollama:11434
+      THREADS: "14"
+      NO_THINK: "1"
+      MAX_PX: "1568"
+      INTERVAL: "600"
+      MAX_AGE_HOURS: "24"
+    volumes:
+      - "/mnt/docker/obsidian/config/Obsidian Vault:/vault:ro"   # whole vault, READ-ONLY
+      - "/mnt/docker/rm-ocr/out:/out"                            # transcripts output
+      - "/mnt/docker/rm-ocr/state:/state"                        # manifest + logs (persist!)
+    networks: [ai]
+
+networks:
+  ai:
+    external: true

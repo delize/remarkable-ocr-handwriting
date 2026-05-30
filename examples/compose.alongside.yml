@@ -1,0 +1,34 @@
+# Example 3 — Write transcripts ALONGSIDE each source PDF (Carol.pdf ->
+# Carol-handwriting_converted.md in the same folder). This needs the vault mounted
+# READ-WRITE. The non-empty OUT_SUFFIX guarantees a transcript can never overwrite
+# a source PDF or a Scrybble .md stub (enforced at startup), and the
+# /mnt/docker/scrybble/storage credential path stays blocked in code regardless.
+#
+#   mkdir -p /mnt/docker/rm-ocr/state
+#   docker compose -f compose.alongside.yml up -d
+
+services:
+  rm-ocr:
+    image: ghcr.io/delize/scrybble-ocr-handwriting:latest
+    container_name: rm-ocr
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      VAULT_DIR: /vault
+      SOURCE_SUBDIR: remarkable
+      OUT_ALONGSIDE: "1"                 # write next to source; OUT_DIR ignored
+      OUT_SUFFIX: -handwriting_converted # REQUIRED non-empty in alongside mode
+      STATE_DIR: /state
+      MODEL: qwen3.5:9b
+      OLLAMA_HOST: http://ollama:11434
+      THREADS: "14"
+      NO_THINK: "1"
+      MAX_AGE_HOURS: "24"
+    volumes:
+      - "/mnt/docker/obsidian/config/Obsidian Vault:/vault:rw"   # READ-WRITE (note: not :ro)
+      - "/mnt/docker/rm-ocr/state:/state"
+    networks: [ai]
+
+networks:
+  ai:
+    external: true

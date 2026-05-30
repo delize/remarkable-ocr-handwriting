@@ -1,0 +1,29 @@
+# Example 4 — Reach Ollama via the published HOST PORT instead of a shared Docker
+# network. Use this if you don't want to put rm-ocr on Ollama's user-defined
+# network (e.g. Ollama runs with `docker run -p 11434:11434` and no custom net).
+#
+#   mkdir -p /mnt/docker/rm-ocr/out /mnt/docker/rm-ocr/state
+#   docker compose -f compose.hostport.yml up -d
+
+services:
+  rm-ocr:
+    image: ghcr.io/delize/scrybble-ocr-handwriting:latest
+    container_name: rm-ocr
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      VAULT_DIR: /vault
+      OUT_DIR: /out
+      STATE_DIR: /state
+      # host.docker.internal resolves to the host via the extra_hosts mapping below.
+      OLLAMA_HOST: http://host.docker.internal:11434
+      THREADS: "14"
+      NO_THINK: "1"
+      MAX_AGE_HOURS: "24"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - "/mnt/docker/obsidian/config/Obsidian Vault:/vault:ro"
+      - "/mnt/docker/rm-ocr/out:/out"
+      - "/mnt/docker/rm-ocr/state:/state"
+    # No `networks:` block — uses the default bridge plus the host-gateway mapping.
