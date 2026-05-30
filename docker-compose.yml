@@ -1,0 +1,56 @@
+# rm-ocr — containerized poller that transcribes Scrybble-synced reMarkable PDFs.
+#
+# Joins the same Docker network as Ollama and reaches it at http://ollama:11434.
+# The vault is mounted FULLY READ-ONLY. Transcripts go to an independent output
+# volume (OUT_DIR), and state (manifest + logs) to another — both outside the
+# vault. Because nothing is ever written back into the vault, there is no way to
+# touch Scrybble's files and no scan feedback loop.
+#
+# Create the two host dirs before first run:
+#   mkdir -p /mnt/docker/rm-ocr/out /mnt/docker/rm-ocr/state
+#
+# Want Obsidian to index the transcripts? Point the OUT_DIR host path at a folder
+# INSIDE the vault instead, e.g.:
+#   - "/mnt/docker/obsidian/config/Obsidian Vault/_transcripts:/out"
+# (that one folder is then the only writable path; the rest of the vault stays ro.)
+
+services:
+  rm-ocr:
+    build: .
+    container_name: rm-ocr
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      VAULT_DIR: /vault
+      SOURCE_SUBDIR: remarkable
+      OUT_DIR: /out                 # output base — its own volume (see below)
+      OUT_SUFFIX: -handwriting_converted   # Carol.pdf -> Carol-handwriting_converted.md
+      # OUT_ALONGSIDE: "1"          # write next to each source PDF instead (needs the vault mounted :rw)
+      STATE_DIR: /state
+      MODEL: qwen3.5:9b
+      OLLAMA_HOST: http://ollama:11434
+      THREADS: "14"
+      NO_THINK: "1"
+      DPI: "150"
+      MAX_PX: "1568"
+      TIMEOUT: "1800"
+      INTERVAL: "600"
+      HASH_CHECK: "1"
+      MAX_AGE_HOURS: "24"           # only transcribe PDFs touched in the last 24h
+      MAX_RETRIES: "3"
+      # MIN_REPROCESS_INTERVAL: "0" # optional cooldown (s) vs. non-deterministic re-renders
+    volumes:
+      # READ-ONLY: the whole vault. Nothing is ever written here.
+      # For OUT_ALONGSIDE mode (transcripts next to source PDFs), drop the ":ro".
+      - "/mnt/docker/obsidian/config/Obsidian Vault:/vault:ro"
+      # READ-WRITE: transcripts output base (configurable mount).
+      - "/mnt/docker/rm-ocr/out:/out"
+      # READ-WRITE: manifest + logs (the idempotency state — MUST persist).
+      - "/mnt/docker/rm-ocr/state:/state"
+    # CPU-only inference pegs the box; be polite to Plex/other containers.
+    # (Hard cap optional — Ollama itself does the heavy lifting; this is the poller.)
+    networks: [ai]
+
+networks:
+  ai:
+    external: true   # the user-defined network ollama is attached to
