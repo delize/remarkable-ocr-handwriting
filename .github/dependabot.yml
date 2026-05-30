@@ -1,18 +1,28 @@
 version: 2
 updates:
-  # Keep the GitHub Actions used in workflows current.
+  # Keep the GitHub Actions used in workflows current — grouped into one PR.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
 
-  # Keep the base image / pinned pip deps current.
+  # Base image — grouped into one PR.
   - package-ecosystem: docker
     directory: "/"
     schedule:
       interval: weekly
+    groups:
+      docker:
+        patterns: ["*"]
 
+  # Pinned pip deps — grouped into one PR.
   - package-ecosystem: pip
     directory: "/"
     schedule:
       interval: weekly
+    groups:
+      pip:
+        patterns: ["*"]
