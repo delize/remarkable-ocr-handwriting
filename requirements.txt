@@ -1,0 +1,13 @@
+# Python deps for rm-ocr. Everything else it uses is in the standard library
+# (urllib, json, hashlib, pathlib, logging, ...).
+#
+# pdf2image rasterizes PDF pages; it shells out to poppler (pdftoppm / pdfunite),
+# which is a SYSTEM package, NOT pip-installable:
+#   Debian/Ubuntu : apt-get install poppler-utils
+#   macOS         : brew install poppler
+# pdf2image pulls in Pillow automatically.
+pdf2image>=1.17
+
+# Optional — ONLY needed to render reMarkable .zip bundles (the *.pdf path in the
+# vault does not use it). Install separately if you ever feed raw bundles:
+#   pipx install rmc
