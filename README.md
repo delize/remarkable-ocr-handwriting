@@ -1,5 +1,8 @@
 # rm-ocr — reMarkable → Obsidian handwriting OCR
 
+[![CI](https://github.com/delize/scrybble-ocr-handwriting/actions/workflows/ci.yml/badge.svg)](https://github.com/delize/scrybble-ocr-handwriting/actions/workflows/ci.yml)
+[![Build and publish image](https://github.com/delize/scrybble-ocr-handwriting/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/delize/scrybble-ocr-handwriting/actions/workflows/docker-publish.yml)
+
 Automatically transcribes any new or changed reMarkable PDF (synced into the
 Obsidian vault by Scrybble) into searchable Markdown, **fully local on the NAS**.
 No manual step.
@@ -49,11 +52,17 @@ mkdir -p /mnt/docker/rm-ocr/out /mnt/docker/rm-ocr/state
 #    docker network create ai   # if it doesn't exist
 #    docker network connect ai ollama
 
-# 3. config + build + run
+# 3. config + run (compose pulls the prebuilt GHCR image by default)
 cp .env.example .env            # edit if needed
-docker compose up -d --build
+docker compose up -d
 docker compose logs -f rm-ocr
 ```
+
+The image is published to **GHCR** by CI on every push to `main` and on version
+tags (`vX.Y.Z`): `ghcr.io/delize/scrybble-ocr-handwriting:latest`. It is built
+multi-arch (`linux/amd64` + `linux/arm64`). To build locally instead of pulling,
+swap the `image:`/`build:` lines in `docker-compose.yml` and run
+`docker compose up -d --build`.
 
 If you'd rather not create a shared network, reach the published host port instead:
 set `OLLAMA_HOST=http://host.docker.internal:11434` and add
