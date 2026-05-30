@@ -24,3 +24,29 @@ jobs:
       # Byte-compile both modules to catch syntax errors the self-test doesn't import.
       - name: Compile-check modules
         run: python3 -m py_compile rm_ocr.py ocr_daemon.py selftest.py
+
+  docker-build:
+    name: Build image (no push) + smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build the real image for the host arch and load it locally (no registry
+      # push). This is what actually catches a broken base-image bump or a
+      # pdf2image/poppler install failure on a Dependabot PR.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: rm-ocr:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Smoke test: the entrypoint imports rm_ocr (=> pdf2image/Pillow) and runs
+      # --status, which needs no Ollama, no vault, no PDFs. Proves the image works.
+      - name: Smoke test (--status)
+        run: docker run --rm -e STATE_DIR=/tmp/state rm-ocr:ci --status
