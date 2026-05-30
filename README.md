@@ -64,6 +64,10 @@ multi-arch (`linux/amd64` + `linux/arm64`). To build locally instead of pulling,
 swap the `image:`/`build:` lines in `docker-compose.yml` and run
 `docker compose up -d --build`.
 
+**Ready-made compose files** for common setups live in
+[`examples/`](examples/) — GHCR-pull (default), local-build, alongside-output
+(writable vault), and host-port Ollama. See [`examples/README.md`](examples/README.md).
+
 If you'd rather not create a shared network, reach the published host port instead:
 set `OLLAMA_HOST=http://host.docker.internal:11434` and add
 `extra_hosts: ["host.docker.internal:host-gateway"]` to the service.

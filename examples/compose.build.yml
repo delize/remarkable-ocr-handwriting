@@ -1,0 +1,31 @@
+# Example 2 — Build the image locally from this repo instead of pulling GHCR.
+# Useful for development or air-gapped hosts. Run from the repo root so the build
+# context (`..`) sees the Dockerfile and source.
+#
+#   docker compose -f examples/compose.build.yml up -d --build
+
+services:
+  rm-ocr:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: rm-ocr:local
+    container_name: rm-ocr
+    restart: unless-stopped
+    env_file: ../.env
+    environment:
+      VAULT_DIR: /vault
+      OUT_DIR: /out
+      STATE_DIR: /state
+      OLLAMA_HOST: http://ollama:11434
+      THREADS: "14"
+      NO_THINK: "1"
+    volumes:
+      - "/mnt/docker/obsidian/config/Obsidian Vault:/vault:ro"
+      - "/mnt/docker/rm-ocr/out:/out"
+      - "/mnt/docker/rm-ocr/state:/state"
+    networks: [ai]
+
+networks:
+  ai:
+    external: true

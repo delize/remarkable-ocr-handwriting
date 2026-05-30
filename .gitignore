@@ -1,5 +1,32 @@
-__pycache__/
-*.pyc
+# --- secrets / local config (NEVER commit) ---
 .env
+.env.*
+!.env.example
+
+# --- runtime state & output (host-generated, not source) ---
 rm-ocr-state/
 ocr_out/
+*.log
+manifest.json
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# --- editor / OS cruft ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
