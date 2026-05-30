@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 # OCI labels — link the GHCR package back to the source repo.
 LABEL org.opencontainers.image.source="https://github.com/delize/scrybble-ocr-handwriting" \
