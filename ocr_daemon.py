@@ -65,6 +65,13 @@ DPI = int(os.environ.get("DPI", "150"))
 MAX_PX = int(os.environ.get("MAX_PX", "1568"))
 TIMEOUT = int(os.environ.get("TIMEOUT", "1800"))
 INTERVAL = int(os.environ.get("INTERVAL", "600"))
+# Inotify wake-up signal layered on top of the poll. The poll stays as a
+# correctness floor (so a missed event never strands a file forever), but a
+# CLOSE_WRITE / MOVED_TO on a *.pdf under SRC short-circuits the next pass —
+# typical latency drops from <=INTERVAL to <1s. Linux-only (needs inotify_simple
+# + a backing filesystem that supports inotify; ext4/btrfs/zfs do, SMB/NFS often
+# don't). Falls back to pure poll if the import fails or watches can't be added.
+INOTIFY = _env_bool("INOTIFY", True)
 HASH_CHECK = _env_bool("HASH_CHECK", True)
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
 # Only consider PDFs modified within this many hours (0 = no age limit). Bounds
@@ -481,6 +488,73 @@ def print_status(man):
             print(f"  PENDING  {rel}  (awaiting splitter)")
 
 
+def start_inotify_watcher(src, wake):
+    """Spawn a daemon thread that sets `wake` when a *.pdf event fires under `src`.
+
+    Recursive: walks the tree once, adds watches as new subdirs appear, drops
+    watches on rmdir/mv. Best-effort — any failure here logs and returns without
+    starting the thread, so the caller falls through to pure-poll behavior.
+
+    A threading.Event is naturally idempotent, so a write-then-rename burst (50
+    IN_MODIFY + 1 IN_CLOSE_WRITE + 1 IN_MOVED_TO) collapses to a single wake
+    consumed on the main loop's next wait().
+    """
+    import threading
+    try:
+        from inotify_simple import INotify, flags
+    except ImportError:
+        log.warning("INOTIFY=1 but inotify_simple is not installed — falling back to pure poll")
+        return None
+
+    inotify = INotify()
+    file_mask = flags.CLOSE_WRITE | flags.MOVED_TO
+    dir_mask = file_mask | flags.CREATE | flags.MOVED_FROM | flags.MOVE_SELF | flags.DELETE_SELF
+    wd_to_path = {}
+
+    def add_dir(path):
+        try:
+            wd = inotify.add_watch(str(path), dir_mask)
+            wd_to_path[wd] = path
+        except OSError as e:
+            log.warning("inotify add_watch %s: %s", path, e)
+
+    add_dir(src)
+    for dirpath, dirnames, _ in os.walk(src):
+        for d in dirnames:
+            add_dir(pathlib.Path(dirpath) / d)
+    if not wd_to_path:
+        log.warning("inotify: no watchable dirs under %s — falling back to pure poll", src)
+        return None
+    log.info("inotify watching %d dir(s) under %s", len(wd_to_path), src)
+
+    def loop():
+        while True:
+            try:
+                events = inotify.read()
+            except Exception as e:
+                log.exception("inotify read failed, watcher exiting: %s", e)
+                return
+            for ev in events:
+                base = wd_to_path.get(ev.wd)
+                if base is None:
+                    continue
+                if ev.mask & flags.IGNORED:
+                    wd_to_path.pop(ev.wd, None)
+                    continue
+                # New subdir → watch it too.
+                if ev.mask & flags.CREATE and ev.mask & flags.ISDIR and ev.name:
+                    add_dir(base / ev.name)
+                    continue
+                # File-level event on a *.pdf → fire the wake.
+                if ev.name and ev.name.lower().endswith(".pdf"):
+                    log.debug("inotify wake: %s/%s (mask=0x%x)", base, ev.name, ev.mask)
+                    wake.set()
+
+    t = threading.Thread(target=loop, name="rm-ocr-inotify", daemon=True)
+    t.start()
+    return t
+
+
 def wait_for_model(host, model, timeout):
     """Block until `model` is loadable on `host`, or raise SystemExit on timeout.
 
@@ -580,6 +654,11 @@ def main():
         log.info("scan complete: %d file(s) processed", n)
         return
 
+    import threading
+    wake = threading.Event()
+    if INOTIFY:
+        start_inotify_watcher(SRC, wake)
+
     while True:
         if in_run_window():
             try:
@@ -590,7 +669,8 @@ def main():
                 log.exception("scan pass failed: %s", e)
         else:
             log.info("outside RUN_WINDOW=%s, sleeping", RUN_WINDOW)
-        time.sleep(INTERVAL)
+        wake.wait(INTERVAL)
+        wake.clear()
 
 
 if __name__ == "__main__":

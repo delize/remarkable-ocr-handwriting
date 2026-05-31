@@ -20,6 +20,11 @@ pypdf>=4.0
 numpy>=1.24
 Pillow>=10.0
 
+# inotify_simple powers the optional inotify wake-up signal (INOTIFY=1, on by
+# default). Linux-only — on macOS the import will fail and the daemon falls back
+# to pure polling. Pure-stdlib wrapper, no transitive deps.
+inotify_simple>=1.3 ; sys_platform == "linux"
+
 # Optional — ONLY needed to render reMarkable .zip bundles (the *.pdf path in the
 # vault does not use it). Install separately if you ever feed raw bundles:
 #   pipx install rmc

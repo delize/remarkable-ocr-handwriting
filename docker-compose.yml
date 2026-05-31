@@ -43,10 +43,34 @@ services:
       TIMEOUT: "1800"
       MODEL_WAIT_TIMEOUT: "1800"    # block at startup until the model is loadable on OLLAMA_HOST (0 = disable)
       INTERVAL: "600"
+      INOTIFY: "1"                  # wake immediately on inotify events (Linux only; falls back to pure poll)
       HASH_CHECK: "1"
-      MAX_AGE_HOURS: "24"           # only transcribe PDFs touched in the last 24h
+      MAX_AGE_HOURS: "24"           # only transcribe PDFs touched in the last 24h (0 = no limit, e.g. backfill an existing vault — equivalent to the standalone splitter's PROCESS_EXISTING=true)
       MAX_RETRIES: "3"
       # MIN_REPROCESS_INTERVAL: "0" # optional cooldown (s) vs. non-deterministic re-renders
+
+      # --- tall-page splitter (vendored from remarkable-pdf-splitter) ---
+      # rm-ocr now splits tall reMarkable exports in place, then OCRs in the same
+      # pass — no second container needed. These knobs mirror the standalone
+      # splitter's MIN_ASPECT_RATIO / TARGET_PAGE_HEIGHT / MIN_GAP_HEIGHT /
+      # WHITESPACE_THRESHOLD; the standalone WATCH_MODE is covered by INOTIFY
+      # above, PROCESS_EXISTING by MAX_AGE_HOURS=0, and DELETE_ORIGINAL is N/A
+      # (we always rewrite atomically — `os.replace` in rm_split.py).
+      #
+      # To turn it on: uncomment AUTO_SPLIT and drop the ":ro" from the vault
+      # mount below — splitting writes in place, so the source dir must be :rw.
+      # AUTO_SPLIT: "1"
+      # SPLIT_MAX_ASPECT: "2.0"               # was MIN_ASPECT_RATIO
+      # SPLIT_TARGET_PAGE_HEIGHT: "700"       # was TARGET_PAGE_HEIGHT (px @ 72dpi)
+      # SPLIT_MIN_GAP_HEIGHT: "25"            # was MIN_GAP_HEIGHT
+      # SPLIT_WHITESPACE_THRESHOLD: "248"     # was WHITESPACE_THRESHOLD
+      # SPLIT_MARKER_KEY: "/RemarkableSplitter"
+      # SPLIT_MARKER_VALUE: "processed"
+      #
+      # Alternative — REQUIRE_SPLIT: keep the splitter running as its own
+      # container and have rm-ocr just *wait* for split-ready PDFs. Off by
+      # default; do not enable together with AUTO_SPLIT.
+      # REQUIRE_SPLIT: "1"
     volumes:
       # READ-ONLY: the whole vault. Nothing is ever written here.
       # For OUT_ALONGSIDE mode (transcripts next to source PDFs), drop the ":ro".

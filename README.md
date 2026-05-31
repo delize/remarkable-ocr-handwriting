@@ -175,7 +175,8 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `MAX_PX` | `1568` | The real quality/time lever |
 | `TIMEOUT` | `1800` | Per-page socket timeout |
 | `MODEL_WAIT_TIMEOUT` | `1800` | Block at startup until the model is loadable on `OLLAMA_HOST`. `0` disables the gate (see [Startup readiness gate](#startup-readiness-gate)) |
-| `INTERVAL` | `600` | Poll seconds |
+| `INTERVAL` | `600` | Poll seconds — the latency floor; an inotify event short-circuits this |
+| `INOTIFY` | `1` | `1` = wake immediately on `CLOSE_WRITE` / `MOVED_TO` for `*.pdf` under `SOURCE_SUBDIR` (Linux only; falls back to pure poll if unavailable). See [Inotify wake-up](#inotify-wake-up) |
 | `HASH_CHECK` | `1` | `1` = sha256 content detection (authoritative); `0` = last-modified (mtime) detection — cheaper, but re-OCRs on touch-only changes |
 | `MAX_AGE_HOURS` | `24` | Only consider PDFs modified within this window; `0` = no limit |
 | `MAX_RETRIES` | `3` | Stop retrying a broken PDF |
@@ -227,6 +228,28 @@ permanently failed in the manifest — recovery then needs a manual manifest del
 Tune with `MODEL_WAIT_TIMEOUT` (default `1800` s — generous headroom for a cold
 multi-GB pull plus the first CPU model-load). Set `MODEL_WAIT_TIMEOUT=0` to
 disable the gate entirely (useful for tests or non-ollama setups).
+
+### Inotify wake-up
+
+The daemon is fundamentally a poller (every `INTERVAL` seconds, scan the source
+tree). With `INOTIFY=1` (the default on Linux), a background thread also watches
+`SOURCE_SUBDIR` recursively and **sets a wake event** on `CLOSE_WRITE` or
+`MOVED_TO` for any `*.pdf`. The main loop's `wait(INTERVAL)` returns immediately,
+so a new sync typically starts OCR in seconds rather than waiting out the poll.
+
+The poll keeps running as a correctness floor — if the watcher misses an event
+(e.g., the underlying filesystem doesn't propagate inotify, or the watcher thread
+dies), the next `INTERVAL` tick catches up. Worst case is identical to today.
+
+Requirements:
+- Linux only. `inotify_simple` is `sys_platform == "linux"` in `requirements.txt`;
+  on macOS the import fails cleanly and the daemon logs `falling back to pure poll`.
+- The backing filesystem must support inotify. **ext4 / btrfs / zfs**: yes.
+  **SMB / NFS / FUSE**: typically no — events fire on the server side and don't
+  cross the share boundary. The poll covers this transparently.
+
+Set `INOTIFY=0` to skip starting the watcher (useful if the kernel limit
+`fs.inotify.max_user_watches` is tight, or for noisy filesystems).
 
 ### Tall pages: split then OCR
 
