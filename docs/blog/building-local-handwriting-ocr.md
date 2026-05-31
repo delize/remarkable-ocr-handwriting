@@ -280,6 +280,13 @@ The finished pipeline is small and deliberately unexciting:
 - Shipped as a multi-arch container image, published by CI, with a self-test that
   exercises the whole decision path without needing Ollama or a real PDF.
 
+One deliberate boundary: rm-ocr is *only the transcription poller*. It does not
+run the model — it talks to a **separately running Ollama** (with
+`ollama pull qwen3.5:9b` done once). Keeping the model server as its own
+long-lived process is the right separation of concerns: Ollama stays resident and
+warm across notes, other tools on the box can share it, and the OCR daemon stays
+small and restartable.
+
 None of the individual pieces are clever. The value was in the *empirical* parts:
 discovering that MoE doesn't help prefill, that one `think: false` flag is worth
 26 minutes a page, that a Docker cgroup quirk silently halves your throughput,

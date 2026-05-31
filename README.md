@@ -39,6 +39,28 @@ repeat-prevention design.
 - A malformed PDF logs an error, increments a capped retry counter, and the batch
   continues.
 
+## Prerequisites
+
+rm-ocr is **only the OCR poller** — it does not run Ollama or pull the model for
+you. You must already have, separately:
+
+1. **Ollama running** and reachable from the container (default
+   `OLLAMA_HOST=http://ollama:11434`). It is its own process/container; `docker
+   compose up` for rm-ocr will **not** start it.
+2. **The vision model pulled into that Ollama**, once:
+   ```bash
+   ollama pull qwen3.5:9b
+   ```
+   If the model isn't present, the first transcription fails with a
+   model-not-found error from Ollama.
+3. **Scrybble** syncing reMarkable PDFs into the Obsidian vault (the source this
+   tool reads).
+
+In the default Docker setup, rm-ocr reaches Ollama over a shared user-defined
+network named `ai` — so the Ollama container must be attached to that network
+(see step 2 of the Docker run below). To talk to an Ollama on the host instead,
+use the host-port example in [`examples/`](examples/).
+
 ## Run it
 
 ### Docker (recommended — same network as Ollama)

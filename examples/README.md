@@ -1,5 +1,9 @@
 # docker-compose examples
 
+> **Prerequisite:** these only run the OCR poller. You need a **separate Ollama**
+> already running with the model pulled (`ollama pull qwen3.5:9b`), reachable at
+> `OLLAMA_HOST`. See the [main README's Prerequisites](../README.md#prerequisites).
+
 Pick the one that matches your setup, copy `.env.example` to `.env` next to it
 (`cp ../.env.example .env`), and run with `-f`. Each file is self-contained.
 
