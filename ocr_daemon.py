@@ -54,6 +54,11 @@ MANIFEST = STATE / "manifest.json"
 LOGFILE = STATE / "ocr.log"
 
 MODEL = os.environ.get("MODEL", "qwen3.5:9b")
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+# Block at startup until the model is loadable on OLLAMA_HOST. 0 disables the gate
+# (useful for tests / non-ollama setups). The default headroom accommodates a
+# cold pull on a slow link plus the first CPU model-load.
+MODEL_WAIT_TIMEOUT = int(os.environ.get("MODEL_WAIT_TIMEOUT", "1800"))
 THREADS = int(os.environ.get("THREADS", "14"))
 NO_THINK = _env_bool("NO_THINK", True)
 DPI = int(os.environ.get("DPI", "150"))
@@ -476,6 +481,61 @@ def print_status(man):
             print(f"  PENDING  {rel}  (awaiting splitter)")
 
 
+def wait_for_model(host, model, timeout):
+    """Block until `model` is loadable on `host`, or raise SystemExit on timeout.
+
+    Two stages, both via the same HTTP path rm_ocr.py uses, so DNS / port / model-name
+    problems surface here instead of poisoning the manifest with instant 404s:
+      1. presence — POST /api/show until 200 (404 = not pulled yet; URLError = ollama unreachable).
+      2. smoke    — POST /api/generate (num_predict=1) once; proves the model actually loads.
+    """
+    import urllib.error
+    import urllib.request
+
+    show_url = host + "/api/show"
+    gen_url = host + "/api/generate"
+    show_body = json.dumps({"name": model}).encode()
+    deadline = time.monotonic() + timeout
+    delay = 2.0
+    log.info("waiting for model %s on %s (timeout=%ds)", model, host, timeout)
+    while True:
+        try:
+            req = urllib.request.Request(
+                show_url, data=show_body,
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as r:
+                if r.status == 200:
+                    break
+        except urllib.error.HTTPError as e:
+            log.info("ollama /api/show %d (%s) — waiting...", e.code,
+                     "model not pulled yet" if e.code == 404 else e.reason)
+        except urllib.error.URLError as e:
+            log.warning("ollama unreachable at %s: %s — waiting...", show_url, e.reason)
+        except Exception as e:
+            log.warning("ollama probe error at %s: %s — waiting...", show_url, e)
+        if time.monotonic() > deadline:
+            raise SystemExit(
+                f"timed out after {timeout}s waiting for model {model} on {host} "
+                f"(set MODEL_WAIT_TIMEOUT=0 to disable this gate)")
+        time.sleep(delay)
+        delay = min(delay * 1.5, 30)
+
+    log.info("model present; running smoke test (loads weights, may take a minute on CPU)")
+    smoke_body = json.dumps({
+        "model": model, "prompt": "ping", "stream": False,
+        "options": {"num_predict": 1},
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            gen_url, data=smoke_body,
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=max(timeout, 300)) as r:
+            payload = json.loads(r.read())
+    except Exception as e:
+        raise SystemExit(f"smoke test failed for {model} on {host}: {e}")
+    log.info("smoke test OK (sample=%r)", (payload.get("response") or "")[:40])
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scan", action="store_true", help="Run a single incremental pass and exit")
@@ -509,6 +569,11 @@ def main():
     if REQUIRE_SPLIT:
         log.info("split gate ON | marker=%s value=%s max_aspect=%.2f",
                  SPLIT_MARKER_KEY, SPLIT_MARKER_VALUE, SPLIT_MAX_ASPECT)
+
+    if MODEL_WAIT_TIMEOUT > 0:
+        wait_for_model(OLLAMA_HOST, MODEL, MODEL_WAIT_TIMEOUT)
+    else:
+        log.info("MODEL_WAIT_TIMEOUT=0, skipping startup readiness gate")
 
     if args.scan:
         n = scan_once(load_manifest())
