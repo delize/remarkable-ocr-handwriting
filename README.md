@@ -1,7 +1,7 @@
 # rm-ocr — reMarkable → Obsidian handwriting OCR
 
-[![CI](https://github.com/delize/scrybble-ocr-handwriting/actions/workflows/ci.yml/badge.svg)](https://github.com/delize/scrybble-ocr-handwriting/actions/workflows/ci.yml)
-[![Build and publish image](https://github.com/delize/scrybble-ocr-handwriting/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/delize/scrybble-ocr-handwriting/actions/workflows/docker-publish.yml)
+[![CI](https://github.com/delize/remarkable-ocr-handwriting/actions/workflows/ci.yml/badge.svg)](https://github.com/delize/remarkable-ocr-handwriting/actions/workflows/ci.yml)
+[![Build and publish image](https://github.com/delize/remarkable-ocr-handwriting/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/delize/remarkable-ocr-handwriting/actions/workflows/docker-publish.yml)
 
 Automatically transcribes any new or changed reMarkable PDF dropped into a
 watched directory — into searchable Markdown, **fully local on the NAS**. No
@@ -119,7 +119,7 @@ docker compose logs -f rm-ocr
 ```
 
 The image is published to **GHCR** by CI on every push to `main` and on version
-tags (`vX.Y.Z`): `ghcr.io/delize/scrybble-ocr-handwriting:latest`. It is built
+tags (`vX.Y.Z`): `ghcr.io/delize/remarkable-ocr-handwriting:latest`. It is built
 multi-arch (`linux/amd64` + `linux/arm64`). To build locally instead of pulling,
 swap the `image:`/`build:` lines in `docker-compose.yml` and run
 `docker compose up -d --build`.

@@ -1,7 +1,7 @@
 FROM python:3.14-slim
 
 # OCI labels — link the GHCR package back to the source repo.
-LABEL org.opencontainers.image.source="https://github.com/delize/scrybble-ocr-handwriting" \
+LABEL org.opencontainers.image.source="https://github.com/delize/remarkable-ocr-handwriting" \
       org.opencontainers.image.description="reMarkable -> Obsidian handwriting OCR poller (Qwen3-VL via Ollama)"
 
 # poppler-utils -> pdftoppm/pdfunite for pdf2image and bundle merging

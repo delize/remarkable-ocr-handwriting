@@ -7,7 +7,7 @@
 
 services:
   rm-ocr:
-    image: ghcr.io/delize/scrybble-ocr-handwriting:latest
+    image: ghcr.io/delize/remarkable-ocr-handwriting:latest
     container_name: rm-ocr
     restart: unless-stopped
     env_file: .env

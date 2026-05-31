@@ -22,7 +22,7 @@ services:
     # Pull the prebuilt multi-arch image from GHCR (published by CI on push to
     # main / version tags). To build locally instead, comment `image:` out and
     # uncomment `build: .` below.
-    image: ghcr.io/delize/scrybble-ocr-handwriting:latest
+    image: ghcr.io/delize/remarkable-ocr-handwriting:latest
     # build: .
     container_name: rm-ocr
     restart: unless-stopped
