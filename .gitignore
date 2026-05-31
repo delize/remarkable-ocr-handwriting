@@ -30,3 +30,6 @@ Thumbs.db
 .vscode/
 *.swp
 *~
+
+# personal blog drafts — keep local, never commit
+docs/blog/
