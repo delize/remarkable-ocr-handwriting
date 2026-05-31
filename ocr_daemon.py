@@ -88,6 +88,16 @@ SPLIT_MARKER_VALUE = os.environ.get("SPLIT_MARKER_VALUE", "processed")
 # marker is treated as not-yet-split.
 SPLIT_MAX_ASPECT = float(os.environ.get("SPLIT_MAX_ASPECT", "2.0"))
 
+# AUTO_SPLIT: do the splitting ourselves (one tool, split -> OCR in one pass)
+# instead of waiting on the standalone splitter. Splits the source PDF IN PLACE
+# (so the readable split PDF also persists), then OCRs it. Requires the source
+# dir to be WRITABLE (not the usual :ro vault mount) and pulls in pypdf + Pillow +
+# numpy. Implies split-readiness, so REQUIRE_SPLIT's gate is moot when this is on.
+AUTO_SPLIT = _env_bool("AUTO_SPLIT", False)
+SPLIT_TARGET_PAGE_HEIGHT = int(os.environ.get("SPLIT_TARGET_PAGE_HEIGHT", "700"))
+SPLIT_MIN_GAP_HEIGHT = int(os.environ.get("SPLIT_MIN_GAP_HEIGHT", "25"))
+SPLIT_WHITESPACE_THRESHOLD = int(os.environ.get("SPLIT_WHITESPACE_THRESHOLD", "248"))
+
 # Absolute paths that must NEVER be read or written, no matter what.
 FORBIDDEN_PREFIXES = ("/mnt/docker/scrybble/storage",)
 
@@ -400,9 +410,29 @@ def scan_once(man):
         digest = needs_work(pdf, rel, man)
         if digest is False:
             continue
+        # AUTO_SPLIT: split the (tall) source in place first, then OCR the result
+        # in the same pass. Splitting rewrites the file, so re-derive the change
+        # token from the post-split bytes for the manifest.
+        if AUTO_SPLIT:
+            try:
+                if auto_split_one(pdf, rel):
+                    st = pdf.stat()
+                    digest = sha256(pdf) if HASH_CHECK else f"mtime:{st.st_mtime}:{st.st_size}"
+            except Exception as e:  # a split failure must not abort the batch
+                rec = man.setdefault(rel, {})
+                rec["status"] = "error"
+                rec["error"] = f"auto-split: {e}"
+                rec["retries"] = rec.get("retries", 0) + 1
+                st = pdf.stat()
+                rec["mtime"], rec["size"], rec["sha256"] = st.st_mtime, st.st_size, digest
+                save_manifest(man)
+                log.error("err %s: auto-split: %s [attempt %d]", rel, e, rec["retries"])
+                continue
         # Gate: don't OCR a PDF the splitter hasn't made readable yet. Cheap
         # (reads metadata + page boxes), far cheaper than an OCR run, and only
-        # reached for new/changed files.
+        # reached for new/changed files. (With AUTO_SPLIT on, the file is now
+        # split, so this passes — but it still correctly waits on an external
+        # splitter when AUTO_SPLIT is off and REQUIRE_SPLIT is on.)
         if not split_ready(pdf, rel):
             st = pdf.stat()
             prev = man.get(rel, {}).get("status")
@@ -459,14 +489,23 @@ def main():
         return
 
     assert_safe_paths()
-    if REQUIRE_SPLIT:
+    if REQUIRE_SPLIT or AUTO_SPLIT:
         try:
-            import pypdf  # noqa: F401  fail fast if the gate is on but pypdf is missing
+            import pypdf  # noqa: F401  fail fast if a split feature is on but pypdf is missing
         except ImportError:
-            raise SystemExit("REQUIRE_SPLIT=1 needs pypdf installed (pip install pypdf)")
+            raise SystemExit("REQUIRE_SPLIT/AUTO_SPLIT need pypdf installed (pip install pypdf)")
+    if AUTO_SPLIT:
+        try:
+            import PIL  # noqa: F401
+            import numpy  # noqa: F401
+        except ImportError:
+            raise SystemExit("AUTO_SPLIT needs Pillow + numpy installed (pip install pillow numpy)")
     log.info("rm-ocr starting | model=%s threads=%d no_think=%s dpi=%d max_px=%d max_age=%sh cooldown=%ss",
              MODEL, THREADS, NO_THINK, DPI, MAX_PX, MAX_AGE_HOURS, MIN_REPROCESS_INTERVAL)
     log.info("source=%s  out=%s  state=%s", SRC, OUT, STATE)
+    if AUTO_SPLIT:
+        log.info("AUTO_SPLIT ON | split in place then OCR (max_aspect=%.2f, target_h=%d)",
+                 SPLIT_MAX_ASPECT, SPLIT_TARGET_PAGE_HEIGHT)
     if REQUIRE_SPLIT:
         log.info("split gate ON | marker=%s value=%s max_aspect=%.2f",
                  SPLIT_MARKER_KEY, SPLIT_MARKER_VALUE, SPLIT_MAX_ASPECT)

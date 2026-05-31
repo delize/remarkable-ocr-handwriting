@@ -155,8 +155,12 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `MAX_RETRIES` | `3` | Stop retrying a broken PDF |
 | `MIN_REPROCESS_INTERVAL` | `0` | Min seconds between reprocesses of the **same** path even if it changed; `0` = off |
 | `RUN_WINDOW` | _(empty)_ | Optional, e.g. `01:00-07:00` |
-| `REQUIRE_SPLIT` | `0` | `1` = only OCR PDFs that are split-ready (see below). Needs `pypdf` |
-| `SPLIT_MAX_ASPECT` | `2.0` | Page height/width above which a marker-less PDF is treated as not-yet-split (match the splitter's `MIN_ASPECT_RATIO`) |
+| `AUTO_SPLIT` | `0` | `1` = split tall PDFs **in place** then OCR, in one pass (see below). Needs `pypdf`+`numpy`+Pillow and a **writable** source dir |
+| `SPLIT_TARGET_PAGE_HEIGHT` | `700` | AUTO_SPLIT: desired output page height (px @ 72dpi) |
+| `SPLIT_MIN_GAP_HEIGHT` | `25` | AUTO_SPLIT: smallest whitespace band (px) to cut at |
+| `SPLIT_WHITESPACE_THRESHOLD` | `248` | AUTO_SPLIT: row brightness (0–255) counted as whitespace |
+| `REQUIRE_SPLIT` | `0` | `1` = only OCR PDFs that are split-ready (see below). Needs `pypdf`. For the *external* splitter workflow |
+| `SPLIT_MAX_ASPECT` | `2.0` | Page height/width above which a PDF is "too tall" — splits it (AUTO_SPLIT) or holds it (REQUIRE_SPLIT). Match the splitter's `MIN_ASPECT_RATIO` |
 | `SPLIT_MARKER_KEY` | `/RemarkableSplitter` | PDF Info-dict key the splitter stamps |
 | `SPLIT_MARKER_VALUE` | `processed` | Expected marker value |
 | `LOG_LEVEL` | `INFO` | Set `DEBUG` to log each file's gate decision (see below) |
@@ -176,6 +180,32 @@ and `Notes/2026-01-01.pdf` → `2026-01-01-handwriting_converted.md`.
 Alongside mode requires a non-empty `OUT_SUFFIX` (enforced at startup) so a
 transcript can never overwrite a source PDF or a Scrybble `.md` stub. The
 `/mnt/docker/scrybble/storage` guard stays absolute in every mode.
+
+### Tall pages: split then OCR
+
+Some reMarkable exports are a single, *very* tall page (60+ inches). Rasterized and
+downscaled to `MAX_PX`, the handwriting collapses into unreadable pixels and OCR
+returns garbage. There are **two ways** to handle this — pick one:
+
+**Option A — `AUTO_SPLIT=1` (one tool, recommended).** rm-ocr splits the tall PDF
+itself, **in place**, then OCRs the result in the same pass. The split logic is
+vendored from
+[remarkable-pdf-splitter](https://github.com/delize/remarkable-pdf-splitter)
+(whitespace-band detection → ~`SPLIT_TARGET_PAGE_HEIGHT` pages, `/RemarkableSplitter`
+marker). The source PDF is **replaced** with the split version (atomic temp +
+rename), so the readable split PDF persists *and* gets transcribed. Because the
+bytes change, normal change-detection then OCRs the new version. No second
+container, no async race.
+
+- Requires the **source dir to be writable** (mount the vault `:rw`, not `:ro`).
+- Adds `pypdf` + `numpy` (+ Pillow, already present); rm-ocr refuses to start with
+  `AUTO_SPLIT=1` if they're missing.
+- Already-split or short PDFs are left untouched (idempotent via the marker).
+- A split failure is recorded as `error` (capped retries) and never aborts the batch.
+
+**Option B — `REQUIRE_SPLIT=1` (external splitter).** Keep splitting in the
+standalone tool and have rm-ocr just *wait* for it. See below. Use this if you also
+run the splitter for its own sake, or want OCR to stay read-only.
 
 ### Split-readiness gate (optional)
 

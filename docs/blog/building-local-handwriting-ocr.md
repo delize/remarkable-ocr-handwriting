@@ -288,6 +288,17 @@ change trips the normal pipeline and it gets transcribed. The check only reads
 metadata and page dimensions, so it's cheap enough to run on every changed file.
 Off by default, because plenty of notes never need splitting at all.
 
+That gate, though, still means running *two* tools — the splitter and rm-ocr —
+watching the same folder, each waiting on the other. So there's also a second
+mode, `AUTO_SPLIT=1`, that folds the splitter *into* rm-ocr: it vendors the
+splitting algorithm and, on a tall PDF, splits it in place (replacing the source
+with the readable multi-page version) and then OCRs the result in the same pass —
+one tool, no handshake, no async race. On a real export this turned a single
+6.8:1 page into eight ~1.7:1 pages the model reads cleanly. The trade is that the
+source directory must be writable (the split overwrites the original), so it's
+opt-in; the wait-for-an-external-splitter gate stays the default for setups that
+keep the vault read-only.
+
 ## Putting it together
 
 The finished pipeline is small and deliberately unexciting:

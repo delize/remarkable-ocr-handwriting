@@ -9,9 +9,16 @@
 pdf2image>=1.17
 
 # pypdf reads the splitter's /RemarkableSplitter metadata marker and page sizes
-# for the optional split-readiness gate (REQUIRE_SPLIT=1). Lazily imported, so
-# it's only strictly required when that gate is enabled.
+# for the split-readiness gate (REQUIRE_SPLIT=1) and the in-place splitter
+# (AUTO_SPLIT=1). Lazily imported, so only strictly required when a split feature
+# is enabled.
 pypdf>=4.0
+
+# numpy + Pillow are used ONLY by AUTO_SPLIT (rm_split.py: whitespace-band
+# detection on rendered pages). Pillow is already pulled in by pdf2image; numpy is
+# the only addition. Both lazily imported — not needed unless AUTO_SPLIT=1.
+numpy>=1.24
+Pillow>=10.0
 
 # Optional — ONLY needed to render reMarkable .zip bundles (the *.pdf path in the
 # vault does not use it). Install separately if you ever feed raw bundles:
