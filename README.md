@@ -155,6 +155,10 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `MAX_RETRIES` | `3` | Stop retrying a broken PDF |
 | `MIN_REPROCESS_INTERVAL` | `0` | Min seconds between reprocesses of the **same** path even if it changed; `0` = off |
 | `RUN_WINDOW` | _(empty)_ | Optional, e.g. `01:00-07:00` |
+| `REQUIRE_SPLIT` | `0` | `1` = only OCR PDFs that are split-ready (see below). Needs `pypdf` |
+| `SPLIT_MAX_ASPECT` | `2.0` | Page height/width above which a marker-less PDF is treated as not-yet-split (match the splitter's `MIN_ASPECT_RATIO`) |
+| `SPLIT_MARKER_KEY` | `/RemarkableSplitter` | PDF Info-dict key the splitter stamps |
+| `SPLIT_MARKER_VALUE` | `processed` | Expected marker value |
 | `LOG_LEVEL` | `INFO` | Set `DEBUG` to log each file's gate decision (see below) |
 
 ### Where transcripts go (3 modes)
@@ -172,6 +176,29 @@ and `Notes/2026-01-01.pdf` → `2026-01-01-handwriting_converted.md`.
 Alongside mode requires a non-empty `OUT_SUFFIX` (enforced at startup) so a
 transcript can never overwrite a source PDF or a Scrybble `.md` stub. The
 `/mnt/docker/scrybble/storage` guard stays absolute in every mode.
+
+### Split-readiness gate (optional)
+
+Some reMarkable exports are a single, *very* tall page (60+ inches) — the vision
+model can't read them. The companion
+[remarkable-pdf-splitter](https://github.com/delize/remarkable-pdf-splitter)
+breaks those into readable pages and stamps a `/RemarkableSplitter: processed`
+marker into the PDF's metadata. Set **`REQUIRE_SPLIT=1`** and rm-ocr will only
+transcribe a PDF once it is *split-ready*, meaning **either**:
+
+- it carries the splitter's marker (it has been split), **or**
+- no page exceeds `SPLIT_MAX_ASPECT` (height/width) — i.e. it never needed
+  splitting in the first place (your "page-height requirements are met" case).
+
+A tall, marker-less PDF is recorded as `pending_split` in the manifest (visible in
+`--status`), logged once at INFO, and **left alone** — it consumes no retries and
+isn't re-OCR'd. When the splitter later rewrites it (new bytes + marker), the next
+pass sees the change and transcribes it. The check reads only the PDF's metadata
+and page boxes — far cheaper than an OCR run, and only runs for new/changed files.
+
+This gate is **off by default** (the tool works fine without the splitter) and
+requires `pypdf` (already in the image / `requirements.txt`); rm-ocr refuses to
+start with `REQUIRE_SPLIT=1` if `pypdf` is missing.
 
 ### Not re-doing work: how repeats are prevented
 

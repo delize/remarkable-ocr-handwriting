@@ -162,6 +162,47 @@ def main():
         ocr_daemon.OUT_ALONGSIDE = saved_al
         ocr_daemon.OUT_SUFFIX = saved_sfx
 
+    # --- split-readiness gate (REQUIRE_SPLIT) ---
+    # Stub _pdf_split_info so we don't need pypdf or a real PDF: map filename ->
+    # (marker, max_aspect). Tall.pdf is un-split, Short.pdf never needed it,
+    # Marked.pdf carries the marker.
+    split_info = {
+        "Tall.pdf": (None, 7.8),
+        "Short.pdf": (None, 1.3),
+        "Marked.pdf": ("processed", 7.8),
+    }
+    ocr_daemon._pdf_split_info = lambda pdf: split_info[pathlib.Path(pdf).name]
+    for name in split_info:
+        (tmp / "vault/remarkable/Work" / name).write_text(f"bytes-{name}")
+
+    ocr_daemon.REQUIRE_SPLIT = True
+    ocr_daemon.SPLIT_MAX_ASPECT = 2.0
+    gate_msgs.clear()
+    processed = ocr_daemon.scan_once(ocr_daemon.load_manifest())
+    man = ocr_daemon.load_manifest()
+    check("gate: tall un-split PDF held as pending_split",
+          man["remarkable/Work/Tall.pdf"]["status"], "pending_split")
+    check("gate: short PDF (never needed split) is OCR'd",
+          man["remarkable/Work/Short.pdf"]["status"], "ok")
+    check("gate: marked PDF is OCR'd",
+          man["remarkable/Work/Marked.pdf"]["status"], "ok")
+    check("gate: pending logged once on entry",
+          sum("pending-split remarkable/Work/Tall.pdf" in m for m in gate_msgs), 1)
+
+    # Next pass with unchanged bytes: pending file is skipped silently (not re-logged).
+    gate_msgs.clear()
+    ocr_daemon.scan_once(ocr_daemon.load_manifest())
+    check("gate: unchanged pending file not re-logged",
+          any("pending-split remarkable/Work/Tall.pdf" in m for m in gate_msgs), False)
+
+    # Splitter runs: file changes + now reports the marker -> gets OCR'd.
+    split_info["Tall.pdf"] = ("processed", 7.8)
+    (tmp / "vault/remarkable/Work/Tall.pdf").write_text("bytes-Tall-split")
+    ocr_daemon.scan_once(ocr_daemon.load_manifest())
+    check("gate: file transcribed after splitter marks it",
+          ocr_daemon.load_manifest()["remarkable/Work/Tall.pdf"]["status"], "ok")
+    ocr_daemon.REQUIRE_SPLIT = False
+
     # forbidden-path guard
     saved = ocr_daemon.OUT
     ocr_daemon.OUT = pathlib.Path("/mnt/docker/scrybble/storage/efs/x")

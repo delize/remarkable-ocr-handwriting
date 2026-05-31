@@ -74,6 +74,20 @@ MIN_REPROCESS_INTERVAL = float(os.environ.get("MIN_REPROCESS_INTERVAL", "0"))
 # Optional politeness window, e.g. "01:00-07:00". Empty = always run.
 RUN_WINDOW = os.environ.get("RUN_WINDOW", "").strip()
 
+# Split-readiness gate (opt-in). reMarkable exports can be a single very tall page
+# that the vision model can't read; the companion remarkable-pdf-splitter
+# (github.com/delize/remarkable-pdf-splitter) breaks them into readable pages and
+# stamps a /RemarkableSplitter Info-dict marker. With REQUIRE_SPLIT=1 we only OCR a
+# PDF once it is "ready" = it carries that marker OR no page exceeds the aspect
+# ratio (i.e. it never needed splitting). Off by default so the tool works without
+# the splitter.
+REQUIRE_SPLIT = _env_bool("REQUIRE_SPLIT", False)
+SPLIT_MARKER_KEY = os.environ.get("SPLIT_MARKER_KEY", "/RemarkableSplitter")
+SPLIT_MARKER_VALUE = os.environ.get("SPLIT_MARKER_VALUE", "processed")
+# Must match the splitter's MIN_ASPECT_RATIO (height/width). A taller page with no
+# marker is treated as not-yet-split.
+SPLIT_MAX_ASPECT = float(os.environ.get("SPLIT_MAX_ASPECT", "2.0"))
+
 # Absolute paths that must NEVER be read or written, no matter what.
 FORBIDDEN_PREFIXES = ("/mnt/docker/scrybble/storage",)
 
@@ -185,6 +199,52 @@ def is_under_out(pdf):
 
 
 # ---------------------------------------------------------------------------
+# Split-readiness gate
+# ---------------------------------------------------------------------------
+def _pdf_split_info(pdf):
+    """Return (marker_value, max_aspect_ratio) for a PDF, read with pypdf.
+
+    Isolated so the offline self-test can monkeypatch it without pypdf or a real
+    PDF. ``marker_value`` is the /RemarkableSplitter Info-dict value (or None);
+    ``max_aspect_ratio`` is the tallest page's height/width.
+    """
+    from pypdf import PdfReader  # lazy: only needed when the gate is on
+    reader = PdfReader(str(pdf))
+    md = reader.metadata or {}
+    marker = md.get(SPLIT_MARKER_KEY)
+    max_ar = 0.0
+    for page in reader.pages:
+        box = page.mediabox
+        w, h = float(box.width), float(box.height)
+        if w:
+            max_ar = max(max_ar, h / w)
+    return marker, max_ar
+
+
+def split_ready(pdf, rel):
+    """True if this PDF is safe to OCR w.r.t. the split gate.
+
+    Ready = gate off, OR it carries the splitter's marker, OR no page is tall
+    enough to have needed splitting. A read failure is treated as not-ready (we'd
+    rather wait than feed the model an unreadable page).
+    """
+    if not REQUIRE_SPLIT:
+        return True
+    try:
+        marker, max_ar = _pdf_split_info(pdf)
+    except Exception as e:
+        log.warning("split-check failed for %s: %s (treating as not ready)", rel, e)
+        return False
+    if marker == SPLIT_MARKER_VALUE:
+        return True
+    if max_ar <= SPLIT_MAX_ASPECT:
+        return True  # never needed splitting
+    log.debug("gate=pending-split %s (aspect %.2f > %.2f, no %s marker)",
+              rel, max_ar, SPLIT_MAX_ASPECT, SPLIT_MARKER_KEY)
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Change detection (§3)
 # ---------------------------------------------------------------------------
 def needs_work(pdf, rel, man):
@@ -213,6 +273,11 @@ def needs_work(pdf, rel, man):
         if rec.get("status") == "ok":
             rec["mtime"], rec["size"] = st.st_mtime, st.st_size  # touch-only change
             log.debug("gate=hash-unchanged %s (touched but bytes identical, no OCR)", rel)
+            return False
+        # Same bytes, still waiting on the splitter: don't re-check or re-log every
+        # pass. A real change (splitter ran) bumps the hash and falls through.
+        if rec.get("status") == "pending_split":
+            log.debug("gate=still-pending-split %s (unchanged bytes, awaiting split)", rel)
             return False
         # Same bytes, but last attempt errored: respect the retry cap.
         if rec.get("retries", 0) >= MAX_RETRIES:
@@ -335,6 +400,19 @@ def scan_once(man):
         digest = needs_work(pdf, rel, man)
         if digest is False:
             continue
+        # Gate: don't OCR a PDF the splitter hasn't made readable yet. Cheap
+        # (reads metadata + page boxes), far cheaper than an OCR run, and only
+        # reached for new/changed files.
+        if not split_ready(pdf, rel):
+            st = pdf.stat()
+            prev = man.get(rel, {}).get("status")
+            man[rel] = {"mtime": st.st_mtime, "size": st.st_size, "sha256": digest,
+                        "status": "pending_split",
+                        "checked_at": datetime.datetime.now().isoformat(timespec="seconds")}
+            save_manifest(man)
+            if prev != "pending_split":  # log once on entering the state
+                log.info("pending-split %s (too tall, awaiting splitter)", rel)
+            continue
         try:
             process_one(pdf, rel, digest, man)
             done += 1
@@ -357,12 +435,15 @@ def scan_once(man):
 def print_status(man):
     ok = sum(1 for r in man.values() if r.get("status") == "ok")
     err = sum(1 for r in man.values() if r.get("status") == "error")
+    pending = sum(1 for r in man.values() if r.get("status") == "pending_split")
     pages = sum(r.get("pages", 0) for r in man.values() if r.get("status") == "ok")
     print(f"manifest: {MANIFEST}")
-    print(f"  ok={ok}  error={err}  total_pages={pages}")
+    print(f"  ok={ok}  error={err}  pending_split={pending}  total_pages={pages}")
     for rel, r in sorted(man.items()):
         if r.get("status") == "error":
-            print(f"  ERROR  {rel}  (retries={r.get('retries', 0)}): {r.get('error', '')}")
+            print(f"  ERROR    {rel}  (retries={r.get('retries', 0)}): {r.get('error', '')}")
+        elif r.get("status") == "pending_split":
+            print(f"  PENDING  {rel}  (awaiting splitter)")
 
 
 def main():
@@ -378,9 +459,17 @@ def main():
         return
 
     assert_safe_paths()
+    if REQUIRE_SPLIT:
+        try:
+            import pypdf  # noqa: F401  fail fast if the gate is on but pypdf is missing
+        except ImportError:
+            raise SystemExit("REQUIRE_SPLIT=1 needs pypdf installed (pip install pypdf)")
     log.info("rm-ocr starting | model=%s threads=%d no_think=%s dpi=%d max_px=%d max_age=%sh cooldown=%ss",
              MODEL, THREADS, NO_THINK, DPI, MAX_PX, MAX_AGE_HOURS, MIN_REPROCESS_INTERVAL)
     log.info("source=%s  out=%s  state=%s", SRC, OUT, STATE)
+    if REQUIRE_SPLIT:
+        log.info("split gate ON | marker=%s value=%s max_aspect=%.2f",
+                 SPLIT_MARKER_KEY, SPLIT_MARKER_VALUE, SPLIT_MAX_ASPECT)
 
     if args.scan:
         n = scan_once(load_manifest())

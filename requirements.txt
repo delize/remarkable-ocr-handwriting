@@ -8,6 +8,11 @@
 # pdf2image pulls in Pillow automatically.
 pdf2image>=1.17
 
+# pypdf reads the splitter's /RemarkableSplitter metadata marker and page sizes
+# for the optional split-readiness gate (REQUIRE_SPLIT=1). Lazily imported, so
+# it's only strictly required when that gate is enabled.
+pypdf>=4.0
+
 # Optional — ONLY needed to render reMarkable .zip bundles (the *.pdf path in the
 # vault does not use it). Install separately if you ever feed raw bundles:
 #   pipx install rmc

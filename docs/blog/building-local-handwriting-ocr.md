@@ -267,6 +267,27 @@ observe a note re-transcribing for no visible reason.
 
 ---
 
+## A gate for unreadable pages
+
+There's one more failure mode worth a gate. reMarkable can export a note as a
+*single, absurdly tall* page — sometimes five feet long. Rasterize that, downscale
+the longest edge to `max_px`, and every line of handwriting collapses into a few
+unreadable pixels. OCR "succeeds" and returns garbage.
+
+A companion tool, [remarkable-pdf-splitter](https://github.com/delize/remarkable-pdf-splitter),
+solves this by detecting tall pages (aspect ratio > 2:1) and splitting them at
+whitespace gaps into normal-sized pages — and it stamps a `/RemarkableSplitter`
+marker into the PDF's metadata when it does.
+
+So rm-ocr has an optional gate (`REQUIRE_SPLIT=1`) that only transcribes a PDF
+once it's *readable*: either it carries that marker, or no page is tall enough to
+have needed splitting in the first place. A tall, un-marked PDF is parked as
+`pending_split` (visible in `--status`, logged once) and simply waits — no wasted
+OCR, no retry burn — until the splitter rewrites it, at which point the content
+change trips the normal pipeline and it gets transcribed. The check only reads
+metadata and page dimensions, so it's cheap enough to run on every changed file.
+Off by default, because plenty of notes never need splitting at all.
+
 ## Putting it together
 
 The finished pipeline is small and deliberately unexciting:
