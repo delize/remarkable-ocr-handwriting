@@ -24,10 +24,35 @@ Obsidian indexes the Markdown for search.
 
 ## How it works
 
+Three independent pieces: something that **drops reMarkable PDFs** into a folder,
+**Ollama** (the model server, run separately), and **rm-ocr** (this poller).
+
 ```
-vault/remarkable/**/*.pdf  ──scan (last 24h)──▶  manifest (sha256 diff)  ──▶  ocr_pdf()  ──▶
-    $OUT_DIR/<mirror>/<stem><OUT_SUFFIX>.md      (frontmatter + backlink)
+ reMarkable ──► Scrybble / rmapi / desktop export ──► PDFs land in the watched folder
+                                                              │
+                                                              ▼
+ ┌─────────────────────────── rm-ocr poll loop (every INTERVAL) ───────────────────────────┐
+ │                                                                                          │
+ │   for each *.pdf in SOURCE_SUBDIR:                                                        │
+ │                                                                                          │
+ │   1. recency filter      modified within MAX_AGE_HOURS?            no ─► skip            │
+ │   2. change detection    mtime+size moved? then sha256 changed?    no ─► skip (no OCR)   │
+ │   3. tall-page handling  AUTO_SPLIT: split in place ─┐                                    │
+ │                          REQUIRE_SPLIT: wait ─► pending_split                             │
+ │   4. OCR (Ollama)        page images ─► qwen3.5:9b ─► text   ◄── the only expensive step │
+ │   5. write transcript    $OUT_DIR/<mirror>/<stem><OUT_SUFFIX>.md  (frontmatter+backlink) │
+ │   6. record in manifest  sha256 + status ─► skipped next pass unless it changes again    │
+ │                                                                                          │
+ └──────────────────────────────────────────┬───────────────────────────────────────────┘
+                                             ▼
+                    searchable Markdown transcript (Obsidian indexes it)
 ```
+
+The funnel is ordered **cheapest-check-first**: a still vault costs microseconds of
+`stat()` per file; `sha256` runs only when mtime/size moved; OCR runs only when the
+bytes actually changed. See
+[deciding before OCR](#not-re-doing-work-how-repeats-are-prevented) for why
+re-scanning every cycle stays cheap.
 
 Each pass enumerates source PDFs **modified within `MAX_AGE_HOURS`**, processes the
 **new or changed** ones serially, writes one `.md` per PDF into the configurable
