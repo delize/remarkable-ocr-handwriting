@@ -187,13 +187,13 @@ def main():
     check("gate: marked PDF is OCR'd",
           man["remarkable/Work/Marked.pdf"]["status"], "ok")
     check("gate: pending logged once on entry",
-          sum("pending-split remarkable/Work/Tall.pdf" in m for m in gate_msgs), 1)
+          sum("Tall.pdf (too tall, awaiting splitter)" in m for m in gate_msgs), 1)
 
     # Next pass with unchanged bytes: pending file is skipped silently (not re-logged).
     gate_msgs.clear()
     ocr_daemon.scan_once(ocr_daemon.load_manifest())
     check("gate: unchanged pending file not re-logged",
-          any("pending-split remarkable/Work/Tall.pdf" in m for m in gate_msgs), False)
+          any("Tall.pdf (too tall, awaiting splitter)" in m for m in gate_msgs), False)
 
     # Splitter runs: file changes + now reports the marker -> gets OCR'd.
     split_info["Tall.pdf"] = ("processed", 7.8)
