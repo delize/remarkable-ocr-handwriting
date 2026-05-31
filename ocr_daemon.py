@@ -24,6 +24,7 @@ import sys
 import time
 
 from rm_ocr import ocr_pdf  # reuse the proven core
+from rm_split import SplitConfig, split_in_place
 
 
 # ---------------------------------------------------------------------------
@@ -427,7 +428,13 @@ def scan_once(man):
         # token from the post-split bytes for the manifest.
         if AUTO_SPLIT:
             try:
-                if auto_split_one(pdf, rel):
+                cfg = SplitConfig(
+                    min_aspect_ratio=SPLIT_MAX_ASPECT,
+                    target_page_height=SPLIT_TARGET_PAGE_HEIGHT,
+                    min_gap_height=SPLIT_MIN_GAP_HEIGHT,
+                    whitespace_threshold=SPLIT_WHITESPACE_THRESHOLD,
+                )
+                if split_in_place(pdf, cfg):
                     st = pdf.stat()
                     digest = sha256(pdf) if HASH_CHECK else f"mtime:{st.st_mtime}:{st.st_size}"
             except Exception as e:  # a split failure must not abort the batch
