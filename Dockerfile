@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends poppler-utils \
 WORKDIR /app
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
-COPY rm_ocr.py rm_split.py ocr_daemon.py /app/
+COPY *.py /app/
 
 # Unbuffered so logs stream to `docker logs` in real time.
 ENV PYTHONUNBUFFERED=1
