@@ -1,10 +1,13 @@
-# rm-ocr — containerized poller that transcribes Scrybble-synced reMarkable PDFs.
+# rm-ocr — containerized poller that transcribes reMarkable PDFs found in a
+# watched directory. The reference source is Scrybble syncing into an Obsidian
+# vault, but any tool that drops reMarkable PDFs on disk works (rmapi, desktop
+# export, synced folder, manual copy) — point the vault mount at wherever they land.
 #
 # Joins the same Docker network as Ollama and reaches it at http://ollama:11434.
 # The vault is mounted FULLY READ-ONLY. Transcripts go to an independent output
 # volume (OUT_DIR), and state (manifest + logs) to another — both outside the
 # vault. Because nothing is ever written back into the vault, there is no way to
-# touch Scrybble's files and no scan feedback loop.
+# touch the source files and no scan feedback loop.
 #
 # Create the two host dirs before first run:
 #   mkdir -p /mnt/docker/rm-ocr/out /mnt/docker/rm-ocr/state

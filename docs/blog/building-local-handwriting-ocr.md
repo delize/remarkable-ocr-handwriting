@@ -271,7 +271,10 @@ observe a note re-transcribing for no visible reason.
 
 The finished pipeline is small and deliberately unexciting:
 
-- A **read-only** mount of the Obsidian vault (so it can never harm the source).
+- A **read-only** mount of the source directory (so it can never harm the
+  source). Scrybble + an Obsidian vault is just the reference setup — the only
+  real requirement is reMarkable PDFs landing in a watched folder, however they
+  get there (`rmapi`, desktop export, a synced directory, a manual drop).
 - Transcripts written to a separate, configurable location as one `.md` per PDF,
   with frontmatter (`source`, `model`, `source_modified`, `pages`, …) and an
   Obsidian backlink, mirroring the source folder layout.

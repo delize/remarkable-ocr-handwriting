@@ -3,9 +3,19 @@
 [![CI](https://github.com/delize/scrybble-ocr-handwriting/actions/workflows/ci.yml/badge.svg)](https://github.com/delize/scrybble-ocr-handwriting/actions/workflows/ci.yml)
 [![Build and publish image](https://github.com/delize/scrybble-ocr-handwriting/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/delize/scrybble-ocr-handwriting/actions/workflows/docker-publish.yml)
 
-Automatically transcribes any new or changed reMarkable PDF (synced into the
-Obsidian vault by Scrybble) into searchable Markdown, **fully local on the NAS**.
-No manual step.
+Automatically transcribes any new or changed reMarkable PDF dropped into a
+watched directory — into searchable Markdown, **fully local on the NAS**. No
+manual step.
+
+The only hard requirement on the input side is **PDFs landing in a folder**. The
+reference setup uses [Scrybble](https://scrybble.ink) to sync reMarkable notes
+into an Obsidian vault, but anything that puts reMarkable PDFs on disk works just
+as well — `rmapi`/`rmapy` downloads, the reMarkable desktop app's export folder, a
+`Syncthing`/`rsync`'d directory, or a manual drop. Point `VAULT_DIR` +
+`SOURCE_SUBDIR` at wherever the PDFs are. (`rm_ocr.py` can also render raw
+reMarkable `.zip` bundles via `rmc` — see the CLI.) Writing transcripts into an
+Obsidian vault is likewise optional; it's just a convenient target because
+Obsidian indexes the Markdown for search.
 
 - `rm_ocr.py` — the **proven OCR core** (Qwen3-VL via Ollama). Importable + a CLI.
 - `ocr_daemon.py` — the automation: scanner, change-detection manifest, transcript
@@ -53,8 +63,11 @@ you. You must already have, separately:
    ```
    If the model isn't present, the first transcription fails with a
    model-not-found error from Ollama.
-3. **Scrybble** syncing reMarkable PDFs into the Obsidian vault (the source this
-   tool reads).
+3. **reMarkable PDFs landing in a watched directory.** *How* they get there is
+   up to you — Scrybble syncing into an Obsidian vault (the reference setup), an
+   `rmapi` download script, the reMarkable desktop app's export folder, a synced
+   directory, etc. The tool only needs `*.pdf` files under
+   `VAULT_DIR/SOURCE_SUBDIR`; it doesn't care what produced them.
 
 In the default Docker setup, rm-ocr reaches Ollama over a shared user-defined
 network named `ai` — so the Ollama container must be attached to that network
@@ -123,7 +136,7 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | Var | Default | Notes |
 |---|---|---|
 | `VAULT_DIR` | `/vault` | Mounted **read-only** (whole vault) |
-| `SOURCE_SUBDIR` | `remarkable` | Where Scrybble drops PDFs |
+| `SOURCE_SUBDIR` | `remarkable` | Subdir of `VAULT_DIR` where the source PDFs land (whatever drops them) |
 | `OUT_DIR` | `/out` | **Transcripts output base — its own volume mount.** Mirrors the source subpath under it |
 | `OUT_SUBDIR` | `remarkable/_transcripts` | Legacy fallback: used only if `OUT_DIR` is unset (writes inside the vault) |
 | `OUT_SUFFIX` | `-handwriting_converted` | Filename = `<source stem><suffix>.md`, e.g. `Carol-handwriting_converted.md` |
