@@ -41,6 +41,7 @@ services:
       DPI: "150"
       MAX_PX: "1568"
       TIMEOUT: "1800"
+      MODEL_WAIT_TIMEOUT: "1800"    # block at startup until the model is loadable on OLLAMA_HOST (0 = disable)
       INTERVAL: "600"
       HASH_CHECK: "1"
       MAX_AGE_HOURS: "24"           # only transcribe PDFs touched in the last 24h

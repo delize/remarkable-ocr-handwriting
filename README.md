@@ -174,6 +174,7 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `DPI` | `150` | Raising alone does nothing (downscaled to `MAX_PX`) |
 | `MAX_PX` | `1568` | The real quality/time lever |
 | `TIMEOUT` | `1800` | Per-page socket timeout |
+| `MODEL_WAIT_TIMEOUT` | `1800` | Block at startup until the model is loadable on `OLLAMA_HOST`. `0` disables the gate (see [Startup readiness gate](#startup-readiness-gate)) |
 | `INTERVAL` | `600` | Poll seconds |
 | `HASH_CHECK` | `1` | `1` = sha256 content detection (authoritative); `0` = last-modified (mtime) detection — cheaper, but re-OCRs on touch-only changes |
 | `MAX_AGE_HOURS` | `24` | Only consider PDFs modified within this window; `0` = no limit |
@@ -205,6 +206,27 @@ and `Notes/2026-01-01.pdf` → `2026-01-01-handwriting_converted.md`.
 Alongside mode requires a non-empty `OUT_SUFFIX` (enforced at startup) so a
 transcript can never overwrite a source PDF or a Scrybble `.md` stub. The
 `/mnt/docker/scrybble/storage` guard stays absolute in every mode.
+
+### Startup readiness gate
+
+Before the first scan, rm-ocr blocks until the model is actually loadable on
+`OLLAMA_HOST`:
+
+1. **Presence** — `POST /api/show` is polled with exponential backoff (capped at 30 s);
+   404 means "not pulled yet", `URLError` means "ollama unreachable" — each round
+   logs the exact failure mode so DNS / port / model-name mistakes surface here
+   instead of being masked.
+2. **Smoke test** — one `POST /api/generate` with `num_predict=1` to confirm the
+   weights actually load (not just that the model is in the catalog).
+
+Without this gate, a cold start that races ahead of `ollama pull` produces a burst
+of instant `404`s on `/api/generate`. Those fail in microseconds, so `MAX_RETRIES`
+burns in well under a second and every PDF in the first scan ends up flagged as
+permanently failed in the manifest — recovery then needs a manual manifest delete.
+
+Tune with `MODEL_WAIT_TIMEOUT` (default `1800` s — generous headroom for a cold
+multi-GB pull plus the first CPU model-load). Set `MODEL_WAIT_TIMEOUT=0` to
+disable the gate entirely (useful for tests or non-ollama setups).
 
 ### Tall pages: split then OCR
 
