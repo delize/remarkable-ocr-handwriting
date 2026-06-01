@@ -21,9 +21,10 @@ jobs:
       - name: Run self-test
         run: python3 selftest.py
 
-      # Byte-compile both modules to catch syntax errors the self-test doesn't import.
+      # Byte-compile every module to catch syntax errors the self-test doesn't import.
+      # Glob so new helper modules are covered automatically.
       - name: Compile-check modules
-        run: python3 -m py_compile rm_ocr.py ocr_daemon.py selftest.py
+        run: python3 -m py_compile *.py
 
   docker-build:
     name: Build image (no push) + smoke test
@@ -45,6 +46,12 @@ jobs:
           tags: rm-ocr:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Prove every runtime import (especially rmc, which is invoked as a subprocess
+      # so import-time silence is what bit us in v0.3.1). Catches a broken rmc/rmscene
+      # release the same way the build catches a broken pdf2image/poppler.
+      - name: Smoke test (imports)
+        run: docker run --rm rm-ocr:ci python3 -c "import rmc, rm_render, rm_split, rm_ocr, ocr_daemon"
 
       # Smoke test: the entrypoint imports rm_ocr (=> pdf2image/Pillow) and runs
       # --status, which needs no Ollama, no vault, no PDFs. Proves the image works.

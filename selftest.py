@@ -46,6 +46,44 @@ def main():
     rm_ocr.ocr_pdf = fake_ocr
     import ocr_daemon
     ocr_daemon.ocr_pdf = fake_ocr
+
+    # Stub the renderer so bundle/.rm tests don't need rmc, rmscene, or real
+    # .rm bytes. The stub mirrors rm_render.render_to_pdf's contract: .pdf is
+    # passthrough; bundles/.rm produce a fake PDF in cache_dir (or workdir).
+    # RENDER_TITLES overrides the title per source filename (mimics visibleName);
+    # RENDER_FAILS makes a source raise to exercise the error path.
+    import rm_render
+    RENDER_TITLES = {}
+    RENDER_FAILS = set()
+
+    def fake_render(src, *, cache_dir=None, workdir=None, use_chrome=False):
+        src = pathlib.Path(src)
+        suffix = src.suffix.lower()
+        if suffix not in rm_render.SUPPORTED_INPUT_SUFFIXES:
+            raise ValueError(f"unsupported: {suffix}")
+        sha = rm_render._sha256_file(src)
+        if suffix == ".pdf":
+            return rm_render.RenderResult(pdf=src, title=src.stem, rendered=False,
+                                          source_sha256=sha)
+        if src.name in RENDER_FAILS:
+            raise RuntimeError("simulated render failure")
+        title = RENDER_TITLES.get(src.name, src.stem)
+        if cache_dir is not None:
+            out = rm_render._cache_path(cache_dir, sha)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(b"%PDF-1.4\nfake-rendered-bytes")
+        elif workdir is not None:
+            workdir = pathlib.Path(workdir)
+            workdir.mkdir(parents=True, exist_ok=True)
+            out = workdir / f"{sha[:16]}.pdf"
+            out.write_bytes(b"%PDF-1.4\nfake-rendered-bytes")
+        else:
+            raise ValueError("need cache_dir or workdir")
+        return rm_render.RenderResult(pdf=out, title=title, rendered=True,
+                                      source_sha256=sha)
+
+    rm_render.render_to_pdf = fake_render
+
     ocr_daemon.setup_logging()
     ocr_daemon.assert_safe_paths()
 
@@ -202,6 +240,95 @@ def main():
     check("gate: file transcribed after splitter marks it",
           ocr_daemon.load_manifest()["remarkable/Work/Tall.pdf"]["status"], "ok")
     ocr_daemon.REQUIRE_SPLIT = False
+
+    # --- bundle / loose-.rm dispatch ---
+    gate_msgs.clear()
+
+    # .zip dispatch — stub assigns the visibleName-derived title via RENDER_TITLES.
+    (tmp / "vault/remarkable/Work/Bundle.zip").write_bytes(b"PK\x03\x04bundle-bytes-v1")
+    RENDER_TITLES["Bundle.zip"] = "Bundle Notes"
+    check(".zip dispatch processes one file",
+          ocr_daemon.scan_once(ocr_daemon.load_manifest()), 1)
+    zip_entry = ocr_daemon.load_manifest()["remarkable/Work/Bundle.zip"]
+    check(".zip manifest entry records render_sha256", "render_sha256" in zip_entry, True)
+    check(".zip transcript uses visibleName-derived filename",
+          (out_base / "Work/Bundle Notes-handwriting_converted.md").exists(), True)
+    check(".zip pass2 idempotent",
+          ocr_daemon.scan_once(ocr_daemon.load_manifest()), 0)
+
+    # .rmdoc dispatch — proves .zip and .rmdoc share the bundle path.
+    (tmp / "vault/remarkable/Work/Modern.rmdoc").write_bytes(b"PK\x03\x04rmdoc-bytes-v1")
+    RENDER_TITLES["Modern.rmdoc"] = "Modern Doc"
+    check(".rmdoc dispatch processes one file",
+          ocr_daemon.scan_once(ocr_daemon.load_manifest()), 1)
+    check(".rmdoc transcript named from visibleName",
+          (out_base / "Work/Modern Doc-handwriting_converted.md").exists(), True)
+
+    # loose .rm — single-file render path; no .metadata, title falls back to stem.
+    (tmp / "vault/remarkable/Work/Stray.rm").write_bytes(b"rm-bytes")
+    check("loose .rm processes one file",
+          ocr_daemon.scan_once(ocr_daemon.load_manifest()), 1)
+    check("loose .rm transcript named from stem",
+          (out_base / "Work/Stray-handwriting_converted.md").exists(), True)
+
+    # Title precedence: a uuid-named bundle gets the friendly visibleName title.
+    uuid_name = "9c4f1234-5678.rmdoc"
+    (tmp / "vault/remarkable/Work" / uuid_name).write_bytes(b"PK\x03\x04uuid-bundle")
+    RENDER_TITLES[uuid_name] = "Real Name"
+    check("uuid bundle is queued and processed",
+          ocr_daemon.scan_once(ocr_daemon.load_manifest()), 1)
+    check("uuid bundle transcript uses friendly title, not uuid",
+          (out_base / "Work/Real Name-handwriting_converted.md").exists(), True)
+    check("uuid bundle did NOT write a uuid-named transcript",
+          (out_base / "Work/9c4f1234-5678-handwriting_converted.md").exists(), False)
+
+    # Title fallback: no RENDER_TITLES entry → stub uses stem; safe_output_path
+    # safe-ifies it (no special chars here, passes through verbatim).
+    (tmp / "vault/remarkable/Work/Fallback.rmdoc").write_bytes(b"PK\x03\x04fallback")
+    check("fallback bundle processes one file",
+          ocr_daemon.scan_once(ocr_daemon.load_manifest()), 1)
+    check("fallback transcript uses stem-derived filename",
+          (out_base / "Work/Fallback-handwriting_converted.md").exists(), True)
+
+    # Bundle bytes change → reprocess. Note: the OCR step runs because the bundle
+    # hash changed, even though the FAKE render cache writes the same bytes; that
+    # mirrors production where the change-detection key is the source, not the cache.
+    (tmp / "vault/remarkable/Work/Bundle.zip").write_bytes(b"PK\x03\x04bundle-bytes-v2")
+    check("bundle bytes change reprocesses",
+          ocr_daemon.scan_once(ocr_daemon.load_manifest()), 1)
+
+    # Render failure → manifest records status=error with the render: prefix.
+    (tmp / "vault/remarkable/Work/Broken.rmdoc").write_bytes(b"PK\x03\x04broken")
+    RENDER_FAILS.add("Broken.rmdoc")
+    ocr_daemon.scan_once(ocr_daemon.load_manifest())
+    broken = ocr_daemon.load_manifest()["remarkable/Work/Broken.rmdoc"]
+    check("render failure recorded as status=error", broken["status"], "error")
+    check("render failure error message starts with 'render:'",
+          broken["error"].startswith("render:"), True)
+    check("render failure retries=1", broken["retries"], 1)
+
+    # --- rm_render unit checks (visibleName precedence — exercised w/o the stub) ---
+    import zipfile as _zip
+    fixt_dir = tmp / "rmrender-fixtures"
+    fixt_dir.mkdir()
+
+    zp = fixt_dir / "real.zip"
+    with _zip.ZipFile(zp, "w") as zf:
+        zf.writestr("uuid.metadata", '{"visibleName": "From Metadata"}')
+    check("rm_render._title_for reads visibleName from .metadata",
+          rm_render._title_for(zp), "From Metadata")
+
+    zp_nomet = fixt_dir / "nometadata.zip"
+    with _zip.ZipFile(zp_nomet, "w") as zf:
+        zf.writestr("uuid.content", "{}")
+    check("rm_render._title_for falls back to stem when no .metadata",
+          rm_render._title_for(zp_nomet), "nometadata")
+
+    zp_empty = fixt_dir / "emptyname.zip"
+    with _zip.ZipFile(zp_empty, "w") as zf:
+        zf.writestr("uuid.metadata", '{"visibleName": "   "}')
+    check("rm_render._title_for ignores blank visibleName, uses stem",
+          rm_render._title_for(zp_empty), "emptyname")
 
     # forbidden-path guard
     saved = ocr_daemon.OUT

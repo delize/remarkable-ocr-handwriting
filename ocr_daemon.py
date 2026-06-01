@@ -23,7 +23,8 @@ import pathlib
 import sys
 import time
 
-from rm_ocr import ocr_pdf  # reuse the proven core
+import rm_render
+from rm_ocr import _safe, ocr_pdf  # reuse the proven core
 from rm_split import SplitConfig, split_in_place
 
 
@@ -185,24 +186,47 @@ def assert_safe_paths():
         raise SystemExit("output dir equals source dir with empty OUT_SUFFIX — would overwrite sources")
 
 
-def safe_output_path(pdf):
-    """Map a source PDF to its transcript path and prove the result is safe to write.
+def safe_output_path(src, title=None, *, source_sha256=None):
+    """Map a source file to its transcript path and prove the result is safe to write.
 
-    Filename is ``<stem><OUT_SUFFIX>.md``. In alongside mode the transcript sits in
-    the source PDF's own folder; otherwise it mirrors the source subpath under OUT.
-    Guarantees the target is a .md, never equals the source PDF, never lands under a
-    forbidden prefix, and (mirror mode) stays strictly under OUT.
+    Filename is ``<safe(title)><OUT_SUFFIX>.md``. ``title`` defaults to ``src.stem``
+    (the historical PDF behavior); bundles pass the visibleName-derived title from
+    rm_render so the transcript isn't named after a uuid. In alongside mode the
+    transcript sits in the source file's own folder; otherwise it mirrors the
+    source subpath under OUT. Guarantees the target is a .md, never equals the
+    source, never lands under a forbidden prefix, and (mirror mode) stays strictly
+    under OUT.
+
+    Collision handling: if a transcript with this exact path already exists but
+    its frontmatter ``source:`` line points at a different rel, append
+    ``-<source_sha256[:8]>`` to the stem. Only kicks in when ``source_sha256`` is
+    supplied (production callers) — keeps the test fixtures simple.
     """
-    name = pdf.stem + OUT_SUFFIX + ".md"
+    if title is None:
+        title = src.stem
+    safe_title = _safe(title)
+    name = safe_title + OUT_SUFFIX + ".md"
     if OUT_ALONGSIDE:
-        out_md = pdf.with_name(name)
+        out_md = src.with_name(name)
     else:
-        rel = pdf.relative_to(SRC)
+        rel = src.relative_to(SRC)
         out_md = OUT / rel.parent / name
+
+    if source_sha256 and out_md.exists():
+        try:
+            head = out_md.read_text()[:512]
+            rel_str = str(src.relative_to(VAULT))
+            if f"source: {rel_str}" not in head:
+                # Different bundle, same visibleName — disambiguate by content hash.
+                name = f"{safe_title}-{source_sha256[:8]}{OUT_SUFFIX}.md"
+                out_md = src.with_name(name) if OUT_ALONGSIDE else OUT / rel.parent / name
+        except OSError:
+            pass
+
     out_res = out_md.resolve()
     if out_res.suffix.lower() != ".md":
         raise ValueError(f"refusing non-.md output: {out_md}")
-    if out_res == pdf.resolve():
+    if out_res == src.resolve():
         raise ValueError(f"output path would overwrite the source: {out_md}")
     for forbidden in FORBIDDEN_PREFIXES:
         if str(out_res) == forbidden or str(out_res).startswith(forbidden.rstrip("/") + "/"):
@@ -373,13 +397,21 @@ def in_run_window():
     return now >= start or now <= end  # window wraps midnight
 
 
-def process_one(pdf, rel, digest, man):
-    out_md = safe_output_path(pdf)
+def process_one(src, result, rel, digest, man):
+    """OCR a single (rendered) PDF and write its manifest entry + transcript.
+
+    ``src`` is the original input path (.pdf or bundle); ``result`` is the
+    rm_render.RenderResult (``result.pdf`` is what OCR actually reads,
+    ``result.title`` drives the transcript filename). For bundles, the manifest
+    records ``render_sha256`` so we can trace which cached PDF produced this
+    transcript (handy for a future --purge-orphans).
+    """
+    out_md = safe_output_path(src, result.title, source_sha256=result.source_sha256)
     log.info("processing %s", rel)
-    st = pdf.stat()
-    source_modified = _iso_mtime(st)             # last-modified of the rendered PDF
-    pages = ocr_pdf(pdf, MODEL, DPI, MAX_PX, timeout=TIMEOUT, threads=THREADS, no_think=NO_THINK)
-    chars = write_md(out_md, pdf.stem, rel, pages, source_modified=source_modified)
+    st = src.stat()
+    source_modified = _iso_mtime(st)             # last-modified of the source file
+    pages = ocr_pdf(result.pdf, MODEL, DPI, MAX_PX, timeout=TIMEOUT, threads=THREADS, no_think=NO_THINK)
+    chars = write_md(out_md, result.title, rel, pages, source_modified=source_modified)
     out_rel = str(out_md)
     for base in (OUT, VAULT):                     # prefer a tidy relative path
         try:
@@ -387,7 +419,7 @@ def process_one(pdf, rel, digest, man):
             break
         except ValueError:
             continue
-    man[rel] = {
+    entry = {
         "mtime": st.st_mtime,
         "size": st.st_size,
         "sha256": digest,
@@ -399,6 +431,9 @@ def process_one(pdf, rel, digest, man):
         "status": "ok",
         "retries": 0,
     }
+    if result.rendered:
+        entry["render_sha256"] = sha256(result.pdf)
+    man[rel] = entry
     save_manifest(man)
     log.info("ok %s -> %s (%dp, %d chars)", rel, out_md.name, len(pages), sum(chars))
 
@@ -410,22 +445,42 @@ def scan_once(man):
         return 0
     cutoff = (time.time() - MAX_AGE_HOURS * 3600) if MAX_AGE_HOURS > 0 else None
     done = skipped_old = 0
-    for pdf in sorted(SRC.rglob("*.pdf")):
-        if is_under_out(pdf):
+    for src in rm_render.iter_inputs(SRC):
+        if is_under_out(src):
             continue  # never transcribe files inside our own transcripts tree
-        if cutoff is not None and pdf.stat().st_mtime < cutoff:
+        if cutoff is not None and src.stat().st_mtime < cutoff:
             skipped_old += 1
             continue  # outside the recency window (MAX_AGE_HOURS)
         try:
-            rel = str(pdf.relative_to(VAULT))
+            rel = str(src.relative_to(VAULT))
         except ValueError:
             continue
-        digest = needs_work(pdf, rel, man)
+        digest = needs_work(src, rel, man)
         if digest is False:
             continue
-        # AUTO_SPLIT: split the (tall) source in place first, then OCR the result
-        # in the same pass. Splitting rewrites the file, so re-derive the change
-        # token from the post-split bytes for the manifest.
+        # Render: passthrough for .pdf; rmc + pdfunite for .zip/.rmdoc/.rm.
+        # Cached under STATE/rendered, keyed by source bytes hash, so a re-
+        # extracted-but-byte-identical bundle never re-renders.
+        try:
+            result = rm_render.render_to_pdf(src, cache_dir=STATE / "rendered")
+        except Exception as e:
+            rec = man.setdefault(rel, {})
+            rec["status"] = "error"
+            rec["error"] = f"render: {e}"
+            rec["retries"] = rec.get("retries", 0) + 1
+            st = src.stat()
+            rec["mtime"], rec["size"] = st.st_mtime, st.st_size
+            rec["sha256"] = digest if isinstance(digest, str) else rec.get("sha256")
+            save_manifest(man)
+            capped = " (retry cap reached)" if rec["retries"] >= MAX_RETRIES else ""
+            log.error("err %s: render: %s [attempt %d]%s", rel, e, rec["retries"], capped)
+            continue
+        pdf_for_ocr = result.pdf
+        # AUTO_SPLIT: split the (tall) input in place first, then OCR the result.
+        # For .pdf passthrough this rewrites the source — re-derive the change
+        # token from the post-split bytes. For bundles, the bundle file is in
+        # the read-only vault and untouched; only the cached render is split,
+        # so the manifest's change token (bundle hash) stays valid as-is.
         if AUTO_SPLIT:
             try:
                 cfg = SplitConfig(
@@ -434,26 +489,25 @@ def scan_once(man):
                     min_gap_height=SPLIT_MIN_GAP_HEIGHT,
                     whitespace_threshold=SPLIT_WHITESPACE_THRESHOLD,
                 )
-                if split_in_place(pdf, cfg):
-                    st = pdf.stat()
-                    digest = sha256(pdf) if HASH_CHECK else f"mtime:{st.st_mtime}:{st.st_size}"
+                if split_in_place(pdf_for_ocr, cfg) and not result.rendered:
+                    st = src.stat()
+                    digest = sha256(src) if HASH_CHECK else f"mtime:{st.st_mtime}:{st.st_size}"
             except Exception as e:  # a split failure must not abort the batch
                 rec = man.setdefault(rel, {})
                 rec["status"] = "error"
                 rec["error"] = f"auto-split: {e}"
                 rec["retries"] = rec.get("retries", 0) + 1
-                st = pdf.stat()
+                st = src.stat()
                 rec["mtime"], rec["size"], rec["sha256"] = st.st_mtime, st.st_size, digest
                 save_manifest(man)
                 log.error("err %s: auto-split: %s [attempt %d]", rel, e, rec["retries"])
                 continue
         # Gate: don't OCR a PDF the splitter hasn't made readable yet. Cheap
         # (reads metadata + page boxes), far cheaper than an OCR run, and only
-        # reached for new/changed files. (With AUTO_SPLIT on, the file is now
-        # split, so this passes — but it still correctly waits on an external
-        # splitter when AUTO_SPLIT is off and REQUIRE_SPLIT is on.)
-        if not split_ready(pdf, rel):
-            st = pdf.stat()
+        # reached for new/changed files. Applied to the rendered PDF — what OCR
+        # will actually see — not the bundle.
+        if not split_ready(pdf_for_ocr, rel):
+            st = src.stat()
             prev = man.get(rel, {}).get("status")
             man[rel] = {"mtime": st.st_mtime, "size": st.st_size, "sha256": digest,
                         "status": "pending_split",
@@ -463,15 +517,15 @@ def scan_once(man):
                 log.info("pending-split %s (too tall, awaiting splitter)", rel)
             continue
         try:
-            process_one(pdf, rel, digest, man)
+            process_one(src, result, rel, digest, man)
             done += 1
-        except Exception as e:  # one bad PDF must not stop the batch
+        except Exception as e:  # one bad input must not stop the batch
             rec = man.setdefault(rel, {})
             rec["status"] = "error"
             rec["error"] = str(e)
             rec["sha256"] = digest if isinstance(digest, str) else rec.get("sha256")
             rec["retries"] = rec.get("retries", 0) + 1
-            st = pdf.stat()
+            st = src.stat()
             rec["mtime"], rec["size"] = st.st_mtime, st.st_size
             save_manifest(man)
             capped = " (retry cap reached)" if rec["retries"] >= MAX_RETRIES else ""
@@ -496,7 +550,7 @@ def print_status(man):
 
 
 def start_inotify_watcher(src, wake):
-    """Spawn a daemon thread that sets `wake` when a *.pdf event fires under `src`.
+    """Spawn a daemon thread that sets `wake` when a supported input file event fires under `src`.
 
     Recursive: walks the tree once, adds watches as new subdirs appear, drops
     watches on rmdir/mv. Best-effort — any failure here logs and returns without
@@ -553,7 +607,7 @@ def start_inotify_watcher(src, wake):
                     add_dir(base / ev.name)
                     continue
                 # File-level event on a *.pdf → fire the wake.
-                if ev.name and ev.name.lower().endswith(".pdf"):
+                if ev.name and ev.name.lower().endswith((".pdf", ".zip", ".rmdoc", ".rm")):
                     log.debug("inotify wake: %s/%s (mask=0x%x)", base, ev.name, ev.mask)
                     wake.set()
 

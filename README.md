@@ -7,20 +7,25 @@ Automatically transcribes any new or changed reMarkable PDF dropped into a
 watched directory — into searchable Markdown, **fully local on the NAS**. No
 manual step.
 
-The only hard requirement on the input side is **PDFs landing in a folder**. The
-reference setup uses [Scrybble](https://scrybble.ink) to sync reMarkable notes
-into an Obsidian vault, but anything that puts reMarkable PDFs on disk works just
-as well — `rmapi`/`rmapy` downloads, the reMarkable desktop app's export folder, a
-`Syncthing`/`rsync`'d directory, or a manual drop. Point `VAULT_DIR` +
-`SOURCE_SUBDIR` at wherever the PDFs are. (`rm_ocr.py` can also render raw
-reMarkable `.zip` bundles via `rmc` — see the CLI.) Writing transcripts into an
-Obsidian vault is likewise optional; it's just a convenient target because
-Obsidian indexes the Markdown for search.
+The input side accepts any of **`.pdf`**, **`.zip`**, **`.rmdoc`**, or loose
+**`.rm`** files (any mix, in nested folders). PDFs pass through directly;
+bundles and loose pages are rendered to PDF via `rmc` first and cached under
+`STATE_DIR/rendered/` so a re-extracted-but-byte-identical bundle never re-
+renders. The reference setup uses [Scrybble](https://scrybble.ink) to sync
+reMarkable notes into an Obsidian vault, but anything that drops one of those
+formats on disk works just as well — `rmapi`/`rmapy` downloads, the reMarkable
+desktop app's export folder, a `Syncthing`/`rsync`'d directory, or a manual drop.
+Point `VAULT_DIR` + `SOURCE_SUBDIR` at wherever they land. Writing transcripts
+into an Obsidian vault is likewise optional; it's just a convenient target
+because Obsidian indexes the Markdown for search.
 
 - `rm_ocr.py` — the **proven OCR core** (Qwen3-VL via Ollama). Importable + a CLI.
 - `ocr_daemon.py` — the automation: scanner, change-detection manifest, transcript
   writer, and the polling loop. Built *around* the core, not a rewrite of it.
-- `selftest.py` — offline test harness (stubs Ollama + poppler; zero deps).
+- `rm_render.py` — shared rendering layer: dispatches `.pdf` / `.zip` / `.rmdoc` /
+  `.rm` inputs to a PDF ready for OCR. Used by both the daemon and the CLI.
+- `rm_split.py` — vendored `AUTO_SPLIT` implementation (whitespace-band splitter).
+- `selftest.py` — offline test harness (stubs Ollama + poppler + the renderer; zero deps).
 
 ## How it works
 
@@ -347,18 +352,36 @@ gate=queued          Work/Carol.pdf  (changed -> will OCR)
 
 ## Dependencies
 
-The code is three plain Python files (`rm_ocr.py`, `ocr_daemon.py`, `selftest.py`)
-and is **pure standard library** except for one rasterizer:
+Plain Python with a small set of pip + system deps, all baked into the image:
 
 - **`pdf2image`** (pip — see `requirements.txt`; pulls in Pillow) + **poppler**
-  (system: `apt-get install poppler-utils` / `brew install poppler`).
+  (system: `apt-get install poppler-utils` / `brew install poppler`). Poppler also
+  provides `pdfunite`, used to merge per-page renders into a single bundle PDF.
+- **`rmc`** (pip; pulls in `rmscene`) — renders `.zip` / `.rmdoc` / `.rm` inputs
+  to PDF. Invoked with `--no-chrome`, so no Chrome or cairo system libs are
+  needed. Pure-PDF workflows ignore it entirely.
+- **`pypdf` + `numpy`** — used only by `AUTO_SPLIT` (lazy-imported; rm-ocr refuses
+  to start with `AUTO_SPLIT=1` if they're missing).
+- **`inotify_simple`** (Linux only) — opt-in wake-up signal layered on top of
+  the poll; gracefully no-ops on macOS.
 - **Ollama** running with the model pulled: `ollama pull qwen3.5:9b`.
-- *Optional:* `rmc` (`pipx install rmc`) — only to render raw reMarkable `.zip`
-  bundles; the vault's `*.pdf` path never touches it.
 
-The Docker image bakes poppler + `pdf2image` in, so in the container the only
-external requirement is a reachable Ollama. `selftest.py` stubs `pdf2image` and
-Ollama, so it runs with **no dependencies at all**: `python3 selftest.py`.
+`selftest.py` stubs `pdf2image`, the OCR call, and the renderer, so it runs with
+**no dependencies at all** — even rmc — via `python3 selftest.py`.
+
+**Forcing a re-render after an `rmc` upgrade.** The render cache key is the
+source bundle's bytes, so an `rmc` version bump does *not* invalidate cached
+PDFs. If you want a clean re-render after a deliberate `rmc` upgrade, wipe the
+cache:
+
+```bash
+docker compose down                       # or just stop the container
+rm -rf /mnt/docker/rm-ocr/state/rendered  # wherever your STATE volume lives
+docker compose up -d
+```
+
+The manifest is untouched, so the next scan re-renders each bundle and re-OCRs
+it cleanly.
 
 ## Transcript format
 
@@ -384,6 +407,18 @@ Source: [[remarkable/Work/Carol.pdf]]
 
 ## State
 
-`STATE_DIR/manifest.json` keyed by vault-relative PDF path:
-`{ mtime, size, sha256, source_modified, out_path, pages, chars_per_page, processed_at, status, retries }`.
-Written atomically (temp file + rename). `STATE_DIR/ocr.log` mirrors stdout.
+`STATE_DIR/manifest.json` keyed by vault-relative source path:
+`{ mtime, size, sha256, source_modified, out_path, pages, chars_per_page,
+processed_at, status, retries, render_sha256? }`. Written atomically (temp file
++ rename). `STATE_DIR/ocr.log` mirrors stdout.
+
+- `sha256` is always the **source bytes** hash — for `.pdf` that's the PDF, for
+  bundles that's the `.zip`/`.rmdoc`/`.rm`. It's the change-detection token.
+- `render_sha256` is set for rendered inputs only — the hash of the cached PDF
+  under `STATE_DIR/rendered/<sha[:2]>/<sha>.pdf`. Useful for tracing which
+  rendered output produced a transcript.
+
+`STATE_DIR/rendered/` is the render cache. Sharded two levels deep
+(`<sha[:2]>/<sha>.pdf`). Keyed by source bytes, so renaming a bundle is a free
+cache hit and an `rmc` upgrade is *not* a cache invalidation (see the
+re-render tip in Dependencies if you want one).
