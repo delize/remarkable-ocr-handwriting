@@ -45,7 +45,7 @@ if os.environ.get("OUT_DIR"):
     OUT = pathlib.Path(os.environ["OUT_DIR"])
 else:
     OUT = VAULT / os.environ.get("OUT_SUBDIR", "remarkable/_transcripts")
-# Filename = <source stem><OUT_SUFFIX>.md, e.g. "Carol-handwriting_converted.md".
+# Filename = <source stem><OUT_SUFFIX>.md, e.g. "Sample-handwriting_converted.md".
 OUT_SUFFIX = os.environ.get("OUT_SUFFIX", "-handwriting_converted")
 # Alongside mode: write each transcript into the SAME folder as its source PDF,
 # instead of mirroring under OUT_DIR. Needs a writable vault and a non-empty
@@ -112,8 +112,16 @@ SPLIT_TARGET_PAGE_HEIGHT = int(os.environ.get("SPLIT_TARGET_PAGE_HEIGHT", "700")
 SPLIT_MIN_GAP_HEIGHT = int(os.environ.get("SPLIT_MIN_GAP_HEIGHT", "25"))
 SPLIT_WHITESPACE_THRESHOLD = int(os.environ.get("SPLIT_WHITESPACE_THRESHOLD", "248"))
 
-# Absolute paths that must NEVER be read or written, no matter what.
-FORBIDDEN_PREFIXES = ("/mnt/docker/scrybble/storage",)
+# Absolute paths the daemon must NEVER read or write under, no matter what.
+# Comma-separated override via FORBIDDEN_PATHS; default protects the standalone
+# Scrybble container's auth-credential storage in case both tools run on the
+# same host. Set to empty to disable the guard entirely (not recommended).
+FORBIDDEN_PREFIXES = tuple(
+    p.strip() for p in os.environ.get(
+        "FORBIDDEN_PATHS",
+        "/mnt/docker/scrybble/storage",
+    ).split(",") if p.strip()
+)
 
 log = logging.getLogger("rm-ocr")
 

@@ -1,5 +1,5 @@
-# Example 3 — Write transcripts ALONGSIDE each source PDF (Carol.pdf ->
-# Carol-handwriting_converted.md in the same folder). This needs the vault mounted
+# Example 3 — Write transcripts ALONGSIDE each source PDF (Sample.pdf ->
+# Sample-handwriting_converted.md in the same folder). This needs the vault mounted
 # READ-WRITE. The non-empty OUT_SUFFIX guarantees a transcript can never overwrite
 # a source PDF or a Scrybble .md stub (enforced at startup), and the
 # /mnt/docker/scrybble/storage credential path stays blocked in code regardless.

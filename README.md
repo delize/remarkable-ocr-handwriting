@@ -73,9 +73,10 @@ repeat-prevention design.
   `OUT_DIR` volume, so nothing is ever written back into the vault.
 - `safe_output_path()` proves every target is a `.md`, never equals the source
   PDF, never lands under a forbidden prefix, and (mirror mode) stays under `OUT_DIR`.
-- `assert_safe_paths()` + `FORBIDDEN_PREFIXES` refuse to operate anywhere under
-  `/mnt/docker/scrybble/storage` (the `.rmapi-auth` credential lives there) — in
-  every mode.
+- `assert_safe_paths()` refuses to operate anywhere under any path in
+  `FORBIDDEN_PATHS` (env, comma-separated; default `/mnt/docker/scrybble/storage`,
+  which is where the standalone Scrybble container keeps its `.rmapi-auth` if
+  you run both tools on the same host) — in every mode.
 - A malformed PDF logs an error, increments a capped retry counter, and the batch
   continues.
 
@@ -154,7 +155,7 @@ Example crontab (hourly, niced):
 ### Direct core CLI (ad-hoc, no manifest)
 
 ```bash
-python3 rm_ocr.py "/path/to/Vault/remarkable/Work/Carol.pdf" --out ~/ocr_out \
+python3 rm_ocr.py "/path/to/Vault/remarkable/Work/Sample.pdf" --out ~/ocr_out \
     --model qwen3.5:9b --threads 14 --no-think
 ```
 
@@ -169,7 +170,7 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `SOURCE_SUBDIR` | `remarkable` | Subdir of `VAULT_DIR` where the source PDFs land (whatever drops them) |
 | `OUT_DIR` | `/out` | **Transcripts output base — its own volume mount.** Mirrors the source subpath under it |
 | `OUT_SUBDIR` | `remarkable/_transcripts` | Legacy fallback: used only if `OUT_DIR` is unset (writes inside the vault) |
-| `OUT_SUFFIX` | `-handwriting_converted` | Filename = `<source stem><suffix>.md`, e.g. `Carol-handwriting_converted.md` |
+| `OUT_SUFFIX` | `-handwriting_converted` | Filename = `<source stem><suffix>.md`, e.g. `Sample-handwriting_converted.md` |
 | `OUT_ALONGSIDE` | `0` | `1` = write the transcript next to its source PDF (needs a **writable** vault; `OUT_DIR` ignored) |
 | `STATE_DIR` | `/state` | Manifest + logs — **must be a persistent volume** |
 | `MODEL` | `qwen3.5:9b` | Vision-capable, ~67 s/page neat |
@@ -200,14 +201,14 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 ### Where transcripts go (3 modes)
 
 The filename is always `<source stem><OUT_SUFFIX>.md` (default suffix
-`-handwriting_converted`), so `Work/Carol.pdf` → `Carol-handwriting_converted.md`
+`-handwriting_converted`), so `Work/Sample.pdf` → `Sample-handwriting_converted.md`
 and `Notes/2026-01-01.pdf` → `2026-01-01-handwriting_converted.md`.
 
 | Mode | Set | Result | Vault mount |
 |---|---|---|---|
 | **Separate base** (default, recommended) | `OUT_DIR=/out` | mirrors source subpath under `/out` | `:ro` |
 | **Inside the vault** (Obsidian-indexed) | `OUT_DIR=/vault/_transcripts` (or `OUT_SUBDIR=...`) | mirrors under a vault subfolder | mostly `:ro`, that folder `:rw` |
-| **Alongside the source** | `OUT_ALONGSIDE=1` | transcript next to each PDF (`Work/Carol-handwriting_converted.md`) | **`:rw`** |
+| **Alongside the source** | `OUT_ALONGSIDE=1` | transcript next to each PDF (`Work/Sample-handwriting_converted.md`) | **`:rw`** |
 
 Alongside mode requires a non-empty `OUT_SUFFIX` (enforced at startup) so a
 transcript can never overwrite a source PDF or a Scrybble `.md` stub. The
@@ -344,10 +345,10 @@ OCR is never run to *decide* anything — `needs_work()` gates first; only a
 compare (no hashing). Set `LOG_LEVEL=DEBUG` to watch it:
 
 ```
-gate=prefilter-skip  Work/Carol.pdf  (mtime+size unchanged, no hash, no OCR)
-gate=hash-unchanged  Work/Carol.pdf  (touched but bytes identical, no OCR)
+gate=prefilter-skip  Work/Sample.pdf  (mtime+size unchanged, no hash, no OCR)
+gate=hash-unchanged  Work/Sample.pdf  (touched but bytes identical, no OCR)
 gate=retry-capped    Work/Bad.pdf    (errored 3 times, no OCR)
-gate=queued          Work/Carol.pdf  (changed -> will OCR)
+gate=queued          Work/Sample.pdf  (changed -> will OCR)
 ```
 
 ## Dependencies
@@ -387,7 +388,7 @@ it cleanly.
 
 ```markdown
 ---
-source: remarkable/Work/Carol.pdf
+source: remarkable/Work/Sample.pdf
 model: qwen3.5:9b
 source_modified: 2026-05-30T09:14:02
 processed_at: 2026-05-30T12:00:00
@@ -396,9 +397,9 @@ chars_per_page: [812, 640, 91]
 status: ok
 ---
 
-# Carol
+# Sample
 
-Source: [[remarkable/Work/Carol.pdf]]
+Source: [[remarkable/Work/Sample.pdf]]
 
 ## Page 1
 

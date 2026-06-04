@@ -18,7 +18,7 @@ def main():
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="rmocr-selftest-"))
     for d in ["vault/remarkable/Work", "out", "state"]:
         (tmp / d).mkdir(parents=True, exist_ok=True)
-    (tmp / "vault/remarkable/Work/Carol.pdf").write_text("pdf-bytes-v1")
+    (tmp / "vault/remarkable/Work/Sample.pdf").write_text("pdf-bytes-v1")
     (tmp / "vault/remarkable/Work/Bad.pdf").write_text("broken")
 
     os.environ.update(
@@ -107,7 +107,7 @@ def main():
     ocr_daemon.log.addHandler(_Capture())
     ocr_daemon.log.setLevel(_logging.DEBUG)
 
-    check("pass1 processes new files (Carol ok, Bad errors)",
+    check("pass1 processes new files (Sample ok, Bad errors)",
           ocr_daemon.scan_once(ocr_daemon.load_manifest()), 1)
     check("pass1 logs a queued gate (file changed -> OCR)",
           any("gate=queued" in m for m in gate_msgs), True)
@@ -117,11 +117,11 @@ def main():
     check("pass2 skips via prefilter (no hash, no OCR)",
           any("gate=prefilter-skip" in m for m in gate_msgs), True)
 
-    (tmp / "vault/remarkable/Work/Carol.pdf").write_text("pdf-bytes-v1")  # same bytes, new mtime
+    (tmp / "vault/remarkable/Work/Sample.pdf").write_text("pdf-bytes-v1")  # same bytes, new mtime
     check("touch-only change skipped",
           ocr_daemon.scan_once(ocr_daemon.load_manifest()), 0)
 
-    (tmp / "vault/remarkable/Work/Carol.pdf").write_text("pdf-bytes-v2")  # real edit
+    (tmp / "vault/remarkable/Work/Sample.pdf").write_text("pdf-bytes-v2")  # real edit
     check("real edit reprocesses one file",
           ocr_daemon.scan_once(ocr_daemon.load_manifest()), 1)
 
@@ -149,7 +149,7 @@ def main():
     # cooldown: a byte-changed file reprocessed within the interval is held off
     saved_cd = ocr_daemon.MIN_REPROCESS_INTERVAL
     ocr_daemon.MIN_REPROCESS_INTERVAL = 3600
-    (tmp / "vault/remarkable/Work/Carol.pdf").write_text("pdf-bytes-v3-rapid-edit")
+    (tmp / "vault/remarkable/Work/Sample.pdf").write_text("pdf-bytes-v3-rapid-edit")
     check("cooldown suppresses rapid reprocess",
           ocr_daemon.scan_once(ocr_daemon.load_manifest()), 0)
     ocr_daemon.MIN_REPROCESS_INTERVAL = saved_cd
@@ -164,17 +164,17 @@ def main():
           ocr_daemon.is_under_out(inside), True)
     ocr_daemon.OUT = saved_out
 
-    carol_md = out_base / "Work/Carol-handwriting_converted.md"
+    sample_md = out_base / "Work/Sample-handwriting_converted.md"
     check("filename uses OUT_SUFFIX",
-          ocr_daemon.safe_output_path(tmp / "vault/remarkable/Work/Carol.pdf").name,
-          "Carol-handwriting_converted.md")
-    check("transcript written to OUT_DIR base with suffix", carol_md.exists(), True)
-    md = carol_md.read_text()
-    check("transcript has frontmatter source", "source: remarkable/Work/Carol.pdf" in md, True)
+          ocr_daemon.safe_output_path(tmp / "vault/remarkable/Work/Sample.pdf").name,
+          "Sample-handwriting_converted.md")
+    check("transcript written to OUT_DIR base with suffix", sample_md.exists(), True)
+    md = sample_md.read_text()
+    check("transcript has frontmatter source", "source: remarkable/Work/Sample.pdf" in md, True)
     check("transcript records source last-modified", "source_modified:" in md, True)
     check("manifest records source last-modified",
-          "source_modified" in ocr_daemon.load_manifest()["remarkable/Work/Carol.pdf"], True)
-    check("transcript has backlink", "Source: [[remarkable/Work/Carol.pdf]]" in md, True)
+          "source_modified" in ocr_daemon.load_manifest()["remarkable/Work/Sample.pdf"], True)
+    check("transcript has backlink", "Source: [[remarkable/Work/Sample.pdf]]" in md, True)
     check("transcript has per-page bodies", "## Page 1" in md and "## Page 2" in md, True)
     check("transcript not written for failed pdf",
           (out_base / "Work/Bad-handwriting_converted.md").exists(), False)
@@ -182,9 +182,9 @@ def main():
     # alongside mode: transcript lands in the source PDF's own folder
     saved_al = ocr_daemon.OUT_ALONGSIDE
     ocr_daemon.OUT_ALONGSIDE = True
-    op = ocr_daemon.safe_output_path(tmp / "vault/remarkable/Work/Carol.pdf")
+    op = ocr_daemon.safe_output_path(tmp / "vault/remarkable/Work/Sample.pdf")
     check("alongside mode writes next to source",
-          op == tmp / "vault/remarkable/Work/Carol-handwriting_converted.md", True)
+          op == tmp / "vault/remarkable/Work/Sample-handwriting_converted.md", True)
     ocr_daemon.OUT_ALONGSIDE = saved_al
 
     # empty suffix + alongside is refused (could clobber a Scrybble stub)
