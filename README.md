@@ -1,10 +1,10 @@
-# rm-ocr — reMarkable → Obsidian handwriting OCR
+# rm-ocr — reMarkable handwriting OCR
 
 [![CI](https://github.com/delize/remarkable-ocr-handwriting/actions/workflows/ci.yml/badge.svg)](https://github.com/delize/remarkable-ocr-handwriting/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/delize/remarkable-ocr-handwriting/actions/workflows/codeql.yml/badge.svg)](https://github.com/delize/remarkable-ocr-handwriting/actions/workflows/codeql.yml)
 
 Automatically transcribes any new or changed reMarkable PDF dropped into a
-watched directory — into searchable Markdown, **fully local on the NAS**. No
+watched directory — into searchable Markdown, **fully local on your device**. No
 manual step.
 
 The input side accepts any of **`.pdf`**, **`.zip`**, **`.rmdoc`**, or loose
