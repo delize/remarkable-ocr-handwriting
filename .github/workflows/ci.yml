@@ -148,7 +148,7 @@ jobs:
       # green.
       - name: Trivy (image vuln scan, SARIF)
         if: always()
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@0.35.0
         with:
           image-ref: rm-ocr:ci
           format: sarif
@@ -165,7 +165,7 @@ jobs:
           category: trivy-image
 
       - name: Trivy (gate on CRITICAL/HIGH fixable CVEs)
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@0.35.0
         with:
           image-ref: rm-ocr:ci
           format: table

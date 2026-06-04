@@ -76,7 +76,7 @@ jobs:
       # CVEs. Same threshold as CI's docker-build job — keeps PR-time gates
       # and publish-time gates consistent so nothing slips through.
       - name: Trivy (publish gate)
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@0.35.0
         with:
           image-ref: rm-ocr:scan
           format: table
@@ -88,7 +88,7 @@ jobs:
       # the gate above failed so we never lose visibility on findings.
       - name: Trivy (SARIF for Security tab)
         if: always()
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@0.35.0
         with:
           image-ref: rm-ocr:scan
           format: sarif
