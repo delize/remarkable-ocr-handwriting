@@ -1,89 +1,112 @@
 name: CI
 
+# The single source of truth for build/test/publish. Job graph:
+#
+#   lint  ─┐
+#   selftest ─┼─► docker-build ─► publish (main / vX.Y.Z only)
+#   security ─┘                    │
+#                                  └─ Trivy gate, SBOM + provenance on the multi-arch push
+#
+# Cheap checks gate the expensive ones — a typo never burns a 90s image build,
+# a leaked secret never produces a pushed image. CodeQL stays in its own file
+# (weekly schedule + GitHub's "Code Scanning" UI looks for the dedicated workflow).
+
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
-# Drop in-flight runs on PR pushes — keeps the queue from piling up while
-# you iterate on a branch.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Read-only by default; per-job overrides where we need to upload SARIF.
 permissions:
   contents: read
 
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
 jobs:
-  selftest:
-    name: Self-test (offline, no deps)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      # selftest.py stubs pdf2image + Ollama, so it needs no third-party deps.
-      - name: Run self-test
-        run: python3 selftest.py
-
-      # Byte-compile every module to catch syntax errors the self-test doesn't import.
-      # Glob so new helper modules are covered automatically.
-      - name: Compile-check modules
-        run: python3 -m py_compile ./*.py
+  # -----------------------------------------------------------------
+  # Fast parallel checks — no dependencies between them.
+  # -----------------------------------------------------------------
 
   lint:
-    name: Lint (Python / Dockerfile / Actions)
+    name: Lint (${{ matrix.tool }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false  # all three linters report — fix everything in one pass
+      matrix:
+        tool: [ruff, hadolint, actionlint]
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v6
+      - if: matrix.tool == 'ruff'
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
-      # ruff: fast Python linter. Default rules only (E, F, W) — strict
-      # rule sets can be opted into later via ruff.toml without touching CI.
-      - name: ruff (Python lint)
+      - if: matrix.tool == 'ruff'
+        name: ruff (Python lint)
         uses: astral-sh/ruff-action@v3
         with:
           args: "check --output-format=github ."
 
-      # hadolint: Dockerfile linter. DL3008/DL3013 (unpinned apt/pip versions)
-      # are intentionally ignored — this is a homelab tool and pinning every
-      # transitive system package is more noise than signal here.
-      - name: hadolint (Dockerfile lint)
+      # DL3008/DL3013 (unpinned apt/pip versions) are intentionally ignored —
+      # homelab tool, pinning every transitive system package is more noise
+      # than signal here.
+      - if: matrix.tool == 'hadolint'
+        name: hadolint (Dockerfile lint)
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Dockerfile
           ignore: DL3008,DL3013
           failure-threshold: warning
 
-      # actionlint: catches typos / wrong contexts / shellcheck issues in
-      # the workflow YAML itself — the kind of bug you'd only otherwise find
-      # by pushing and watching CI go red.
-      - name: actionlint (workflow lint)
+      - if: matrix.tool == 'actionlint'
+        name: actionlint (workflow lint)
         uses: raven-actions/actionlint@v2
+
+  selftest:
+    name: Self-test (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false  # if 3.12 fails and 3.14 passes, we want to know both
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+
+      # selftest.py stubs pdf2image + Ollama + the renderer, so it needs no
+      # third-party deps. 3.14 is what the production image ships with; 3.12
+      # and 3.13 catch syntax regressions for anyone running outside Docker.
+      - name: Run self-test
+        run: python3 selftest.py
+
+      # Glob (./*.py guards against filenames starting with -).
+      - name: Compile-check modules
+        run: python3 -m py_compile ./*.py
 
   security:
     name: Security (secrets + dep audit)
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      security-events: write   # for pip-audit SARIF upload
+      security-events: write
     steps:
       - uses: actions/checkout@v6
         with:
-          # gitleaks needs the full history to scan past commits.
-          fetch-depth: 0
+          fetch-depth: 0  # gitleaks needs full history to scan past commits
 
-      # gitleaks: scans the full git history for committed secrets. Fails the
-      # build on any finding — we want this hard-stopped, not "report-only,"
-      # because a secret in history is a real exposure even after deletion.
+      # Fails the build on any finding. A secret in history is a real
+      # exposure even after deletion; we want this hard-stopped.
       - name: gitleaks (secret scan)
         uses: gitleaks/gitleaks-action@v2
         env:
@@ -93,64 +116,63 @@ jobs:
         with:
           python-version: "3.12"
 
-      # pip-audit: scans requirements.txt for known CVEs against the PyPI
-      # advisory DB. Fails the build on any finding — Dependabot is already
-      # configured to bump pip deps weekly, so a finding is genuinely
-      # actionable (either bump or pin away). If a specific CVE is unfixable
-      # short-term, add it to a `.pip-audit-ignore` and document why.
+      # Fails on any finding. Dependabot bumps pip deps weekly, so a finding
+      # is actionable (bump, pin away, or document in .pip-audit-ignore).
       - name: pip-audit (dep CVEs)
         uses: pypa/gh-action-pip-audit@v1.1.0
         with:
           inputs: requirements.txt
           require-hashes: false
 
+  # -----------------------------------------------------------------
+  # Expensive: only runs if every fast check passes.
+  # -----------------------------------------------------------------
+
   docker-build:
-    name: Build image (no push) + smoke + Trivy
+    name: Build image + smoke + Trivy
+    needs: [lint, selftest, security]
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      security-events: write   # for Trivy SARIF upload
+      security-events: write  # Trivy SARIF upload
+      actions: read           # codeql-action/upload-sarif reads run metadata
+    outputs:
+      # Tag the locally-built scan image with the run SHA so the publish job
+      # can re-tag rather than rebuild.
+      image-tag: rm-ocr:scan
     steps:
       - uses: actions/checkout@v6
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v4
 
-      # Build the real image for the host arch and load it locally (no registry
-      # push). This is what actually catches a broken base-image bump or a
-      # pdf2image/poppler install failure on a Dependabot PR.
-      - name: Build image
+      # Build the real image for the host arch and load it locally. The
+      # publish job's multi-arch build reuses these layers from the GHA cache.
+      - name: Build image (local, for scan + smoke)
         uses: docker/build-push-action@v7
         with:
           context: .
           load: true
-          tags: rm-ocr:ci
+          tags: rm-ocr:scan
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Prove every runtime import (especially rmc, which is invoked as a subprocess
-      # so import-time silence is what bit us in v0.3.1). Catches a broken rmc/rmscene
-      # release the same way the build catches a broken pdf2image/poppler.
+      # Prove every runtime import — rmc is invoked as a subprocess so
+      # import-time silence is what bit us in v0.3.1.
       - name: Smoke test (imports)
-        run: docker run --rm --entrypoint python3 rm-ocr:ci -c "import rmc, rm_render, rm_split, rm_ocr, ocr_daemon"
+        run: docker run --rm --entrypoint python3 rm-ocr:scan -c "import rmc, rm_render, rm_split, rm_ocr, ocr_daemon"
 
-      # Smoke test: the entrypoint imports rm_ocr (=> pdf2image/Pillow) and runs
-      # --status, which needs no Ollama, no vault, no PDFs. Proves the image works.
+      # --status needs no Ollama, no vault, no PDFs. Proves the image boots.
       - name: Smoke test (--status)
-        run: docker run --rm -e STATE_DIR=/tmp/state rm-ocr:ci --status
+        run: docker run --rm -e STATE_DIR=/tmp/state rm-ocr:scan --status
 
-      # Trivy: scan the built image for CRITICAL + HIGH CVEs in OS packages
-      # and Python deps. Fails the build on any finding that has a fixed
-      # version available — ignore-unfixed:true skips CVEs the upstream hasn't
-      # patched yet (false friction we can't act on). MEDIUM is deliberately
-      # off — too noisy on a Debian-slim base. SARIF still uploads on every
-      # run so the Security tab has the full picture even when the build's
-      # green.
-      - name: Trivy (image vuln scan, SARIF)
+      # Full severity for the Security tab; MEDIUM included for visibility
+      # but NOT gated below.
+      - name: Trivy (SARIF for Security tab)
         if: always()
         uses: aquasecurity/trivy-action@0.35.0
         with:
-          image-ref: rm-ocr:ci
+          image-ref: rm-ocr:scan
           format: sarif
           output: trivy-results.sarif
           severity: CRITICAL,HIGH,MEDIUM
@@ -159,16 +181,81 @@ jobs:
 
       - name: Upload Trivy SARIF
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-results.sarif
           category: trivy-image
 
+      # Gate: fail the build on CRITICAL/HIGH FIXABLE CVEs only. ignore-unfixed
+      # skips CVEs upstream hasn't patched yet (no action we can take).
       - name: Trivy (gate on CRITICAL/HIGH fixable CVEs)
         uses: aquasecurity/trivy-action@0.35.0
         with:
-          image-ref: rm-ocr:ci
+          image-ref: rm-ocr:scan
           format: table
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           exit-code: '1'
+
+  # -----------------------------------------------------------------
+  # Publish: only on push to main or vX.Y.Z tag. Never on PRs.
+  # Runs only if docker-build (and all its needs) passed.
+  # -----------------------------------------------------------------
+
+  publish:
+    name: Publish to GHCR (multi-arch, SBOM + provenance)
+    needs: [docker-build]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write          # push to GHCR
+      security-events: write   # post-publish Trivy SARIF
+      actions: read            # codeql-action/upload-sarif reads run metadata
+      id-token: write          # SLSA provenance attestation
+      attestations: write      # build provenance attestation
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
+      # Multi-arch push. amd64 layers come from the GHA cache populated by
+      # docker-build above (effectively free); only arm64 builds fresh.
+      # SBOM + SLSA provenance attestations attach to the image manifest in
+      # GHCR — inspect via `docker buildx imagetools inspect <image>`.
+      - name: Build and push (multi-arch, SBOM + provenance)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
