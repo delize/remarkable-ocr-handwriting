@@ -216,7 +216,7 @@ def main():
     ocr_daemon.REQUIRE_SPLIT = True
     ocr_daemon.SPLIT_MAX_ASPECT = 2.0
     gate_msgs.clear()
-    processed = ocr_daemon.scan_once(ocr_daemon.load_manifest())
+    ocr_daemon.scan_once(ocr_daemon.load_manifest())
     man = ocr_daemon.load_manifest()
     check("gate: tall un-split PDF held as pending_split",
           man["remarkable/Work/Tall.pdf"]["status"], "pending_split")

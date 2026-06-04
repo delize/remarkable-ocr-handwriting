@@ -1,0 +1,39 @@
+name: CodeQL
+
+# GitHub-native static analysis. Catches the class of bug a linter doesn't:
+# data-flow issues (e.g. an HTTP arg reaching subprocess), missing escaping,
+# uses of crypto-weak APIs, etc. Free for public repos.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly run catches new rules / new advisories landing in the CodeQL
+    # database without waiting for a code change. Off-peak (UTC) so we don't
+    # compete with weekday workflow queue.
+    - cron: "27 5 * * 1"
+
+permissions:
+  contents: read
+  security-events: write   # required to upload CodeQL findings as SARIF
+  packages: read
+
+jobs:
+  analyze:
+    name: Analyze (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          queries: security-and-quality
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python"

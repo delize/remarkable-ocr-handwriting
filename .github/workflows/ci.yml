@@ -6,6 +6,16 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Drop in-flight runs on PR pushes — keeps the queue from piling up while
+# you iterate on a branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Read-only by default; per-job overrides where we need to upload SARIF.
+permissions:
+  contents: read
+
 jobs:
   selftest:
     name: Self-test (offline, no deps)
@@ -26,9 +36,80 @@ jobs:
       - name: Compile-check modules
         run: python3 -m py_compile *.py
 
-  docker-build:
-    name: Build image (no push) + smoke test
+  lint:
+    name: Lint (Python / Dockerfile / Actions)
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # ruff: fast Python linter. Default rules only (E, F, W) — strict
+      # rule sets can be opted into later via ruff.toml without touching CI.
+      - name: ruff (Python lint)
+        uses: astral-sh/ruff-action@v3
+        with:
+          args: "check --output-format=github ."
+
+      # hadolint: Dockerfile linter. DL3008/DL3013 (unpinned apt/pip versions)
+      # are intentionally ignored — this is a homelab tool and pinning every
+      # transitive system package is more noise than signal here.
+      - name: hadolint (Dockerfile lint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          ignore: DL3008,DL3013
+          failure-threshold: warning
+
+      # actionlint: catches typos / wrong contexts / shellcheck issues in
+      # the workflow YAML itself — the kind of bug you'd only otherwise find
+      # by pushing and watching CI go red.
+      - name: actionlint (workflow lint)
+        uses: raven-actions/actionlint@v2
+
+  security:
+    name: Security (secrets + dep audit)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # for pip-audit SARIF upload
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # gitleaks needs the full history to scan past commits.
+          fetch-depth: 0
+
+      # gitleaks: scans the full git history for committed secrets. Fails the
+      # build on any finding — we want this hard-stopped, not "report-only,"
+      # because a secret in history is a real exposure even after deletion.
+      - name: gitleaks (secret scan)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # pip-audit: scans requirements.txt for known CVEs against the PyPI
+      # advisory DB. Fails the build on any finding — Dependabot is already
+      # configured to bump pip deps weekly, so a finding is genuinely
+      # actionable (either bump or pin away). If a specific CVE is unfixable
+      # short-term, add it to a `.pip-audit-ignore` and document why.
+      - name: pip-audit (dep CVEs)
+        uses: pypa/gh-action-pip-audit@v1.1.0
+        with:
+          inputs: requirements.txt
+          require-hashes: false
+
+  docker-build:
+    name: Build image (no push) + smoke + Trivy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # for Trivy SARIF upload
     steps:
       - uses: actions/checkout@v6
 
@@ -51,9 +132,43 @@ jobs:
       # so import-time silence is what bit us in v0.3.1). Catches a broken rmc/rmscene
       # release the same way the build catches a broken pdf2image/poppler.
       - name: Smoke test (imports)
-        run: docker run --rm rm-ocr:ci python3 -c "import rmc, rm_render, rm_split, rm_ocr, ocr_daemon"
+        run: docker run --rm --entrypoint python3 rm-ocr:ci -c "import rmc, rm_render, rm_split, rm_ocr, ocr_daemon"
 
       # Smoke test: the entrypoint imports rm_ocr (=> pdf2image/Pillow) and runs
       # --status, which needs no Ollama, no vault, no PDFs. Proves the image works.
       - name: Smoke test (--status)
         run: docker run --rm -e STATE_DIR=/tmp/state rm-ocr:ci --status
+
+      # Trivy: scan the built image for CRITICAL + HIGH CVEs in OS packages
+      # and Python deps. Fails the build on any finding that has a fixed
+      # version available — ignore-unfixed:true skips CVEs the upstream hasn't
+      # patched yet (false friction we can't act on). MEDIUM is deliberately
+      # off — too noisy on a Debian-slim base. SARIF still uploads on every
+      # run so the Security tab has the full picture even when the build's
+      # green.
+      - name: Trivy (image vuln scan, SARIF)
+        if: always()
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: rm-ocr:ci
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+          ignore-unfixed: true
+          exit-code: '0'
+
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-image
+
+      - name: Trivy (gate on CRITICAL/HIGH fixable CVEs)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: rm-ocr:ci
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'

@@ -26,6 +26,9 @@ jobs:
     permissions:
       contents: read
       packages: write          # required to push to GHCR
+      security-events: write   # required to upload Trivy SARIF to the Security tab
+      id-token: write          # required for SLSA provenance attestation
+      attestations: write      # required for build provenance attestation
     steps:
       - uses: actions/checkout@v6
 
@@ -55,7 +58,58 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
 
-      - name: Build and push
+      # Build once locally (amd64 only — local-load can't do multi-arch) so we
+      # can Trivy-scan the actual artifact BEFORE pushing. The subsequent
+      # multi-arch push step reuses this layer cache, so the amd64 half is
+      # essentially free; only arm64 builds fresh.
+      - name: Build (local, for scan)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: rm-ocr:scan
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Trivy gate: refuse to publish an image with CRITICAL/HIGH fixable
+      # CVEs. Same threshold as CI's docker-build job — keeps PR-time gates
+      # and publish-time gates consistent so nothing slips through.
+      - name: Trivy (publish gate)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: rm-ocr:scan
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
+
+      # Same scan, full severity + SARIF, for the Security tab. Runs even if
+      # the gate above failed so we never lose visibility on findings.
+      - name: Trivy (SARIF for Security tab)
+        if: always()
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: rm-ocr:scan
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+          ignore-unfixed: true
+          exit-code: '0'
+
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-image-publish
+
+      # Multi-arch push. SBOM + provenance attestations get attached to the
+      # image manifest in GHCR (visible via `docker buildx imagetools inspect`)
+      # — SLSA provenance proves which workflow + commit produced the image,
+      # SBOM lets downstream tooling enumerate every package without scanning.
+      - name: Build and push (multi-arch, SBOM + provenance)
+        id: push
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -64,5 +118,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          sbom: true
+          provenance: mode=max
           cache-from: type=gha
           cache-to: type=gha,mode=max
