@@ -60,7 +60,7 @@ jobs:
       # than signal here.
       - if: matrix.tool == 'hadolint'
         name: hadolint (Dockerfile lint)
-        uses: hadolint/hadolint-action@v3.1.0
+        uses: hadolint/hadolint-action@v3.3.0
         with:
           dockerfile: Dockerfile
           ignore: DL3008,DL3013
@@ -108,7 +108,7 @@ jobs:
       # Fails the build on any finding. A secret in history is a real
       # exposure even after deletion; we want this hard-stopped.
       - name: gitleaks (secret scan)
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -170,7 +170,7 @@ jobs:
       # but NOT gated below.
       - name: Trivy (SARIF for Security tab)
         if: always()
-        uses: aquasecurity/trivy-action@0.35.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: rm-ocr:scan
           format: sarif
@@ -194,7 +194,7 @@ jobs:
       # Gate: fail the build on CRITICAL/HIGH FIXABLE CVEs only. ignore-unfixed
       # skips CVEs upstream hasn't patched yet (no action we can take).
       - name: Trivy (gate on CRITICAL/HIGH fixable CVEs)
-        uses: aquasecurity/trivy-action@0.35.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: rm-ocr:scan
           format: table
