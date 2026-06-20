@@ -42,7 +42,7 @@ jobs:
       matrix:
         tool: [ruff, hadolint, actionlint]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - if: matrix.tool == 'ruff'
         uses: actions/setup-python@v6
@@ -78,7 +78,7 @@ jobs:
       matrix:
         python: ["3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v6
         with:
@@ -101,7 +101,7 @@ jobs:
       contents: read
       security-events: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0  # gitleaks needs full history to scan past commits
 
@@ -141,7 +141,7 @@ jobs:
       # can re-tag rather than rebuild.
       image-tag: rm-ocr:scan
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v4
@@ -220,7 +220,7 @@ jobs:
       id-token: write          # SLSA provenance attestation
       attestations: write      # build provenance attestation
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
