@@ -12,7 +12,7 @@ pdf2image>=1.17
 # for the split-readiness gate (REQUIRE_SPLIT=1) and the in-place splitter
 # (AUTO_SPLIT=1). Lazily imported, so only strictly required when a split feature
 # is enabled.
-pypdf>=6.13.0
+pypdf>=6.13.3
 
 # numpy + Pillow are used ONLY by AUTO_SPLIT (rm_split.py: whitespace-band
 # detection on rendered pages). Pillow is already pulled in by pdf2image; numpy is
