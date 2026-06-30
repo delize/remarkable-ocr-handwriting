@@ -55,7 +55,7 @@ STATE = pathlib.Path(os.environ.get("STATE_DIR", "/state"))
 MANIFEST = STATE / "manifest.json"
 LOGFILE = STATE / "ocr.log"
 
-MODEL = os.environ.get("MODEL", "qwen3.5:9b")
+MODEL = os.environ.get("MODEL", "gemma4:26b")
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 # Block at startup until the model is loadable on OLLAMA_HOST. 0 disables the gate
 # (useful for tests / non-ollama setups). The default headroom accommodates a

@@ -26,7 +26,7 @@ def main():
         SOURCE_SUBDIR="remarkable",
         OUT_DIR=str(tmp / "out"),          # output base OUTSIDE the (read-only) vault
         STATE_DIR=str(tmp / "state"),
-        MODEL="qwen3.5:9b",
+        MODEL="gemma4:26b",
     )
     out_base = tmp / "out"
 

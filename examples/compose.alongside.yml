@@ -19,7 +19,7 @@ services:
       OUT_ALONGSIDE: "1"                 # write next to source; OUT_DIR ignored
       OUT_SUFFIX: -handwriting_converted # REQUIRED non-empty in alongside mode
       STATE_DIR: /state
-      MODEL: qwen3.5:9b
+      MODEL: gemma4:26b
       OLLAMA_HOST: http://ollama:11434
       THREADS: "14"
       NO_THINK: "1"

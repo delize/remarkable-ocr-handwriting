@@ -44,7 +44,7 @@ Three independent pieces: something that **drops reMarkable PDFs** into a folder
  │   2. change detection    mtime+size moved? then sha256 changed?    no ─► skip (no OCR)   │
  │   3. tall-page handling  AUTO_SPLIT: split in place ─┐                                    │
  │                          REQUIRE_SPLIT: wait ─► pending_split                             │
- │   4. OCR (Ollama)        page images ─► qwen3.5:9b ─► text   ◄── the only expensive step │
+ │   4. OCR (Ollama)        page images ─► gemma4:26b ─► text   ◄── the only expensive step │
  │   5. write transcript    $OUT_DIR/<mirror>/<stem><OUT_SUFFIX>.md  (frontmatter+backlink) │
  │   6. record in manifest  sha256 + status ─► skipped next pass unless it changes again    │
  │                                                                                          │
@@ -90,7 +90,7 @@ you. You must already have, separately:
    compose up` for rm-ocr will **not** start it.
 2. **The vision model pulled into that Ollama**, once:
    ```bash
-   ollama pull qwen3.5:9b
+   ollama pull gemma4:26b
    ```
    If the model isn't present, the first transcription fails with a
    model-not-found error from Ollama.
@@ -156,7 +156,7 @@ Example crontab (hourly, niced):
 
 ```bash
 python3 rm_ocr.py "/path/to/Vault/remarkable/Work/Sample.pdf" --out ~/ocr_out \
-    --model qwen3.5:9b --threads 14 --no-think
+    --model gemma4:26b --threads 14 --no-think
 ```
 
 ## Configuration
@@ -173,7 +173,7 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `OUT_SUFFIX` | `-handwriting_converted` | Filename = `<source stem><suffix>.md`, e.g. `Sample-handwriting_converted.md` |
 | `OUT_ALONGSIDE` | `0` | `1` = write the transcript next to its source PDF (needs a **writable** vault; `OUT_DIR` ignored) |
 | `STATE_DIR` | `/state` | Manifest + logs — **must be a persistent volume** |
-| `MODEL` | `qwen3.5:9b` | Vision-capable, ~67 s/page neat |
+| `MODEL` | `gemma4:26b` | Vision-capable; larger model, expect slower per-page than a 9B |
 | `OLLAMA_HOST` | `http://ollama:11434` | |
 | `THREADS` | `14` | cgroup under-detection workaround |
 | `NO_THINK` | `1` | **Required** — thinking ON = unusable |
@@ -365,7 +365,7 @@ Plain Python with a small set of pip + system deps, all baked into the image:
   to start with `AUTO_SPLIT=1` if they're missing).
 - **`inotify_simple`** (Linux only) — opt-in wake-up signal layered on top of
   the poll; gracefully no-ops on macOS.
-- **Ollama** running with the model pulled: `ollama pull qwen3.5:9b`.
+- **Ollama** running with the model pulled: `ollama pull gemma4:26b`.
 
 `selftest.py` stubs `pdf2image`, the OCR call, and the renderer, so it runs with
 **no dependencies at all** — even rmc — via `python3 selftest.py`.
@@ -389,7 +389,7 @@ it cleanly.
 ```markdown
 ---
 source: remarkable/Work/Sample.pdf
-model: qwen3.5:9b
+model: gemma4:26b
 source_modified: 2026-05-30T09:14:02
 processed_at: 2026-05-30T12:00:00
 pages: 3
