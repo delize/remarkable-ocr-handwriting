@@ -23,7 +23,7 @@ services:
       OUT_DIR: /out
       OUT_SUFFIX: -handwriting_converted
       STATE_DIR: /state
-      MODEL: qwen3.5:9b
+      MODEL: gemma4:26b
       OLLAMA_HOST: http://ollama:11434
       THREADS: "14"
       NO_THINK: "1"

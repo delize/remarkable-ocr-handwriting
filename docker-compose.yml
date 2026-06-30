@@ -34,7 +34,7 @@ services:
       OUT_SUFFIX: -handwriting_converted   # Sample.pdf -> Sample-handwriting_converted.md
       # OUT_ALONGSIDE: "1"          # write next to each source PDF instead (needs the vault mounted :rw)
       STATE_DIR: /state
-      MODEL: qwen3.5:9b
+      MODEL: gemma4:26b
       OLLAMA_HOST: http://ollama:11434
       THREADS: "14"
       NO_THINK: "1"
