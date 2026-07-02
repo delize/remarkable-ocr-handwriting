@@ -4,8 +4,10 @@ FROM python:3.14-slim
 LABEL org.opencontainers.image.source="https://github.com/delize/remarkable-ocr-handwriting" \
       org.opencontainers.image.description="reMarkable -> Obsidian handwriting OCR poller (Qwen3-VL via Ollama)"
 
-# poppler-utils -> pdftoppm/pdfunite for pdf2image and bundle merging
-RUN apt-get update && apt-get install -y --no-install-recommends poppler-utils \
+# poppler-utils -> pdftoppm/pdfunite for pdf2image and bundle merging.
+# inkscape -> rmc shells out to it to rasterize its intermediate SVG when
+# rendering .zip/.rmdoc/.rm inputs to PDF (not needed for plain .pdf input).
+RUN apt-get update && apt-get install -y --no-install-recommends poppler-utils inkscape \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

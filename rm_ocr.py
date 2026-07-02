@@ -11,6 +11,7 @@ shared rm_render module (which shells out to `rmc`). PDFs are processed as-is.
 
 Setup (macOS, Apple Silicon):
   brew install ollama poppler
+  brew install --cask inkscape        # needed by rmc for .zip/.rmdoc/.rm inputs (not for plain .pdf)
   brew services start ollama
   ollama pull qwen3-vl:8b
   pip3 install -r requirements.txt    # pulls pdf2image + rmc
@@ -126,7 +127,7 @@ def _safe(name):
     return s or "untitled"
 
 
-def gather(input_path, work, use_chrome, cache_dir=None):
+def gather(input_path, work, cache_dir=None):
     """Return list of (title, pdf_path) for everything to OCR under input_path.
 
     Dispatches through rm_render: PDFs pass through, bundles/.rm are rendered.
@@ -150,7 +151,6 @@ def gather(input_path, work, use_chrome, cache_dir=None):
                 src,
                 cache_dir=cache_dir,
                 workdir=work if cache_dir is None else None,
-                use_chrome=use_chrome,
             )
         except Exception as e:
             print(f"  [skip] {src.name}: {e}", file=sys.stderr)
@@ -166,7 +166,6 @@ def main():
     ap.add_argument("--model", default="qwen3-vl:8b")
     ap.add_argument("--dpi", type=int, default=150)
     ap.add_argument("--max-px", type=int, default=1568)
-    ap.add_argument("--chrome", action="store_true", help="Use Chrome for rmc bundle rendering")
     ap.add_argument("--cpu", action="store_true", help="Force CPU-only (num_gpu=0) — simulates the GPU-less NAS")
     ap.add_argument("--timeout", type=int, default=1800, help="Per-page timeout in seconds (covers slow CPU prefill)")
     ap.add_argument("--threads", type=int, default=None, help="Force CPU thread count (e.g. 14 on a 13600K; works around Ollama's cgroup under-detection)")
@@ -183,7 +182,7 @@ def main():
     cache_dir = pathlib.Path(args.render_cache).expanduser() if args.render_cache else None
 
     with tempfile.TemporaryDirectory() as tmp:
-        items = gather(input_path, pathlib.Path(tmp), args.chrome, cache_dir=cache_dir)
+        items = gather(input_path, pathlib.Path(tmp), cache_dir=cache_dir)
         if not items:
             sys.exit(f"Nothing to OCR under {input_path} (no .pdf / .zip / .rmdoc / .rm found).")
         print(f"{len(items)} document(s). model={args.model} dpi={args.dpi}\nout: {out}\n")
