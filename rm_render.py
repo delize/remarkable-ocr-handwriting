@@ -11,8 +11,10 @@ Single dispatch point used by both the CLI (`rm_ocr.py`) and the daemon
 
 The merge step uses `pdfunite` (poppler) which is already an image-level
 system dep. `rmc` ships as a pip package; pin it in requirements.txt and the
-image picks it up. Default `--no-chrome` so neither Chrome nor cairo is
-needed.
+image picks it up. `rmc`'s PDF export shells out to **Inkscape** to rasterize
+its intermediate SVG, so Inkscape must also be present on the host/image (see
+Dockerfile / README prerequisites) — it is the only real system dependency
+`rmc` has for this path; it does not use or need a browser.
 
 The daemon passes `cache_dir=STATE/"rendered"` so a re-extracted-but-byte-
 identical bundle is a cache hit (the key is the source bytes' sha256, NOT
@@ -57,7 +59,7 @@ def iter_inputs(root):
             yield p
 
 
-def render_to_pdf(src, *, cache_dir=None, workdir=None, use_chrome=False):
+def render_to_pdf(src, *, cache_dir=None, workdir=None):
     """Render `src` to a PDF suitable for OCR.
 
     `.pdf` is returned as-is. For `.zip`/`.rmdoc`/`.rm`, `cache_dir` OR
@@ -94,9 +96,9 @@ def render_to_pdf(src, *, cache_dir=None, workdir=None, use_chrome=False):
     with tempfile.TemporaryDirectory(prefix="rm-render-") as scratch:
         scratch_path = pathlib.Path(scratch)
         if suffix in BUNDLE_SUFFIXES:
-            rendered = _render_zip_bundle(src, scratch_path, use_chrome)
+            rendered = _render_zip_bundle(src, scratch_path)
         else:  # loose .rm
-            rendered = _render_loose_rm(src, scratch_path, use_chrome)
+            rendered = _render_loose_rm(src, scratch_path)
         if rendered is None or not rendered.exists():
             raise ValueError(f"no pages rendered from {src.name}")
 
@@ -163,7 +165,7 @@ def _read_visible_name(src):
         return None
 
 
-def _render_zip_bundle(src, workdir, use_chrome):
+def _render_zip_bundle(src, workdir):
     """Extract a `.zip`/`.rmdoc`, render each `.rm` page, return the merged PDF."""
     ex = workdir / "bundle"
     ex.mkdir(parents=True, exist_ok=True)
@@ -180,7 +182,7 @@ def _render_zip_bundle(src, workdir, use_chrome):
     pdfs = []
     for i, rm in enumerate(pages):
         out_pdf = ex / f"page_{i:03d}.pdf"
-        _run_rmc(rm, out_pdf, use_chrome)
+        _run_rmc(rm, out_pdf)
         pdfs.append(out_pdf)
 
     merged = ex / "merged.pdf"
@@ -191,9 +193,9 @@ def _render_zip_bundle(src, workdir, use_chrome):
     return merged
 
 
-def _render_loose_rm(src, workdir, use_chrome):
+def _render_loose_rm(src, workdir):
     out_pdf = workdir / (src.stem + ".pdf")
-    _run_rmc(src, out_pdf, use_chrome)
+    _run_rmc(src, out_pdf)
     return out_pdf
 
 
@@ -215,12 +217,9 @@ def _page_order(content_path, page_dir):
     return [rms[k] for k in sorted(rms)]
 
 
-def _run_rmc(rm_src, out_pdf, use_chrome):
-    """Render one `.rm` to PDF via the `rmc` console script."""
-    cmd = ["rmc"]
-    if not use_chrome:
-        cmd.append("--no-chrome")
-    cmd.extend([str(rm_src), "-o", str(out_pdf)])
+def _run_rmc(rm_src, out_pdf):
+    """Render one `.rm` to PDF via the `rmc` console script (needs Inkscape on PATH)."""
+    cmd = ["rmc", str(rm_src), "-o", str(out_pdf)]
     try:
         subprocess.run(cmd, check=True, capture_output=True)
     except FileNotFoundError as e:
@@ -228,6 +227,16 @@ def _run_rmc(rm_src, out_pdf, use_chrome):
     except subprocess.CalledProcessError as e:
         stderr = (e.stderr or b"").decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"rmc failed on {rm_src.name}: {stderr or e}") from e
+    # rmc's PDF export shells out to Inkscape and swallows a missing-Inkscape
+    # FileNotFoundError internally, exiting 0 with an empty output file rather
+    # than raising — catch that here instead of letting it surface later as a
+    # confusing pdf2image/poppler error on an empty PDF.
+    if not out_pdf.exists() or out_pdf.stat().st_size == 0:
+        raise RuntimeError(
+            f"rmc produced an empty PDF for {rm_src.name} — Inkscape is likely "
+            "missing (rmc's PDF export needs it on PATH; apt install inkscape / "
+            "brew install --cask inkscape)"
+        )
 
 
 def _run_pdfunite(pdfs, out):
