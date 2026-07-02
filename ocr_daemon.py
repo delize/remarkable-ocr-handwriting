@@ -64,6 +64,11 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/"
 MODEL_WAIT_TIMEOUT = int(os.environ.get("MODEL_WAIT_TIMEOUT", "1800"))
 THREADS = int(os.environ.get("THREADS", "14"))
 NO_THINK = _env_bool("NO_THINK", True)
+# Skip the OCR call entirely for a page that's genuinely blank (rm_ocr's cheap
+# pixel-stat pre-check). Small local vision models tend to answer a blank page
+# with refusal-style prose instead of nothing, which pollutes the transcript —
+# on by default since there's nothing useful to lose by skipping.
+SKIP_BLANK_PAGES = _env_bool("SKIP_BLANK_PAGES", True)
 DPI = int(os.environ.get("DPI", "150"))
 MAX_PX = int(os.environ.get("MAX_PX", "1568"))
 TIMEOUT = int(os.environ.get("TIMEOUT", "1800"))
@@ -435,7 +440,7 @@ def process_one(src, result, rel, digest, man, page_regions=None):
     st = src.stat()
     source_modified = _iso_mtime(st)             # last-modified of the source file
     pages = ocr_pdf(result.pdf, MODEL, DPI, MAX_PX, timeout=TIMEOUT, threads=THREADS,
-                    no_think=NO_THINK, page_regions=page_regions)
+                    no_think=NO_THINK, skip_blank=SKIP_BLANK_PAGES, page_regions=page_regions)
     stroke_regions_flagged = sum(
         rm_strokes.summarize(regions)["likely_drawing_regions"] for regions in page_regions
     ) if page_regions else None
