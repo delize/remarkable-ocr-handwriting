@@ -33,6 +33,8 @@ import tempfile
 import zipfile
 from typing import NamedTuple
 
+import rm_strokes
+
 log = logging.getLogger("rm-ocr")
 
 # Suffixes the daemon and CLI both understand. Bundles are structurally
@@ -47,6 +49,9 @@ class RenderResult(NamedTuple):
     title: str                 # visibleName / stem / "untitled"
     rendered: bool             # False = .pdf passthrough; True = we produced it
     source_sha256: str         # hash of the ORIGINAL input bytes (cache key)
+    page_regions: list = None  # per-page stroke region hints (rm_strokes), or
+                               # None: .pdf passthrough (no stroke data exists),
+                               # extraction wasn't requested, or it wasn't cached
 
 
 def iter_inputs(root):
@@ -59,12 +64,21 @@ def iter_inputs(root):
             yield p
 
 
-def render_to_pdf(src, *, cache_dir=None, workdir=None):
+def render_to_pdf(src, *, cache_dir=None, workdir=None, extract_regions=False):
     """Render `src` to a PDF suitable for OCR.
 
     `.pdf` is returned as-is. For `.zip`/`.rmdoc`/`.rm`, `cache_dir` OR
     `workdir` is required (so the returned path outlives this call). When
     both are given, `cache_dir` wins.
+
+    `extract_regions=True` additionally parses each source `.rm` page's
+    stroke geometry (rm_strokes) into `RenderResult.page_regions` — a rough,
+    best-effort "probably a sketch, not text" hint per page. Only possible
+    for `.rm`-family inputs (a `.pdf` never carries stroke data, so it's
+    always `page_regions=None` regardless of this flag). A cache hit reuses
+    the sidecar written alongside the cached PDF the first time it was
+    rendered with this flag on; if that sidecar doesn't exist, `page_regions`
+    is `None` rather than forcing a re-render.
 
     Raises `ValueError` for unsupported suffixes and for bundles that yield
     zero pages, so the caller can record a recognized error instead of a
@@ -87,8 +101,9 @@ def render_to_pdf(src, *, cache_dir=None, workdir=None):
         cached = _cache_path(cache_dir, sha)
         if cached.exists():
             log.info("render: cache hit %s -> %s", src.name, cached.name)
+            page_regions = _read_regions_sidecar(cache_dir, sha) if extract_regions else None
             return RenderResult(pdf=cached, title=title, rendered=True,
-                                source_sha256=sha)
+                                source_sha256=sha, page_regions=page_regions)
 
     if cache_dir is None and workdir is None:
         raise ValueError("render_to_pdf requires cache_dir or workdir for non-PDF input")
@@ -96,9 +111,9 @@ def render_to_pdf(src, *, cache_dir=None, workdir=None):
     with tempfile.TemporaryDirectory(prefix="rm-render-") as scratch:
         scratch_path = pathlib.Path(scratch)
         if suffix in BUNDLE_SUFFIXES:
-            rendered = _render_zip_bundle(src, scratch_path)
+            rendered, page_regions = _render_zip_bundle(src, scratch_path, extract_regions)
         else:  # loose .rm
-            rendered = _render_loose_rm(src, scratch_path)
+            rendered, page_regions = _render_loose_rm(src, scratch_path, extract_regions)
         if rendered is None or not rendered.exists():
             raise ValueError(f"no pages rendered from {src.name}")
 
@@ -112,13 +127,16 @@ def render_to_pdf(src, *, cache_dir=None, workdir=None):
             shutil.copy2(rendered, staging)
             os.replace(staging, out)
             log.info("render: %s -> %s", src.name, out)
+            if extract_regions:
+                _write_regions_sidecar(cache_dir, sha, page_regions)
         else:
             workdir_path = pathlib.Path(workdir)
             workdir_path.mkdir(parents=True, exist_ok=True)
             out = workdir_path / f"{sha[:16]}.pdf"
             shutil.copy2(rendered, out)
 
-    return RenderResult(pdf=out, title=title, rendered=True, source_sha256=sha)
+    return RenderResult(pdf=out, title=title, rendered=True, source_sha256=sha,
+                        page_regions=page_regions)
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +154,33 @@ def _sha256_file(p):
 def _cache_path(cache_dir, sha):
     """Two-level shard: cache_dir/<sha[:2]>/<sha>.pdf."""
     return pathlib.Path(cache_dir) / sha[:2] / f"{sha}.pdf"
+
+
+def _regions_sidecar_path(cache_dir, sha):
+    """Stroke-region sidecar next to the cached PDF: cache_dir/<sha[:2]>/<sha>.regions.json."""
+    return pathlib.Path(cache_dir) / sha[:2] / f"{sha}.regions.json"
+
+
+def _read_regions_sidecar(cache_dir, sha):
+    """Read the cached page_regions, or None if never written for this sha."""
+    p = _regions_sidecar_path(cache_dir, sha)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return None
+
+
+def _write_regions_sidecar(cache_dir, sha, page_regions):
+    """Write page_regions next to the cached PDF (atomic temp+rename, same as the PDF)."""
+    out = _regions_sidecar_path(cache_dir, sha)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    staging_dir = cache_dir / ".tmp"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    staging = staging_dir / f"{sha}.regions.{os.getpid()}.json"
+    staging.write_text(json.dumps(page_regions))
+    os.replace(staging, out)
 
 
 def _title_for(src):
@@ -165,8 +210,8 @@ def _read_visible_name(src):
         return None
 
 
-def _render_zip_bundle(src, workdir):
-    """Extract a `.zip`/`.rmdoc`, render each `.rm` page, return the merged PDF."""
+def _render_zip_bundle(src, workdir, extract_regions=False):
+    """Extract a `.zip`/`.rmdoc`, render each `.rm` page, return (merged PDF, page_regions)."""
     ex = workdir / "bundle"
     ex.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(src) as z:
@@ -177,26 +222,39 @@ def _render_zip_bundle(src, workdir):
         page_dir = next((d for d in ex.iterdir() if d.is_dir()), ex)
     pages = _page_order(content, page_dir) if content else sorted(page_dir.glob("*.rm"))
     if not pages:
-        return None
+        return None, None
 
     pdfs = []
+    page_regions = [] if extract_regions else None
     for i, rm in enumerate(pages):
         out_pdf = ex / f"page_{i:03d}.pdf"
         _run_rmc(rm, out_pdf)
         pdfs.append(out_pdf)
+        if extract_regions:
+            page_regions.append(_page_regions_safe(rm))
 
     merged = ex / "merged.pdf"
     if len(pdfs) == 1:
         shutil.copy(pdfs[0], merged)
     else:
         _run_pdfunite(pdfs, merged)
-    return merged
+    return merged, page_regions
 
 
-def _render_loose_rm(src, workdir):
+def _render_loose_rm(src, workdir, extract_regions=False):
     out_pdf = workdir / (src.stem + ".pdf")
     _run_rmc(src, out_pdf)
-    return out_pdf
+    page_regions = [_page_regions_safe(src)] if extract_regions else None
+    return out_pdf, page_regions
+
+
+def _page_regions_safe(rm_path):
+    """rm_strokes.page_regions(), tolerating a single bad page (never aborts the render)."""
+    try:
+        return rm_strokes.page_regions(rm_path)
+    except Exception as e:
+        log.warning("stroke-region parse failed for %s: %s", rm_path.name, e)
+        return []
 
 
 def _page_order(content_path, page_dir):

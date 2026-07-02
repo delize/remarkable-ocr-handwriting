@@ -33,3 +33,8 @@ inotify_simple>=2.0.1 ; sys_platform == "linux"
 #   macOS         : brew install --cask inkscape
 # pdfunite (poppler-utils, already above) merges the per-page PDFs.
 rmc>=0.3
+
+# rmscene is already pulled in transitively by rmc, but rm_strokes.py now
+# imports it directly (STROKE_CONTEXT=1 — stroke-region hints, see README),
+# so it's declared explicitly here too.
+rmscene>=0.6
