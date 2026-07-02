@@ -26,7 +26,15 @@ Pillow>=12.2.0
 inotify_simple>=2.0.1 ; sys_platform == "linux"
 
 # rmc renders reMarkable .zip / .rmdoc / .rm bundles to PDF. Pulls in rmscene
-# (the .rm parser by the same author) transitively. Invoked with --no-chrome so
-# we don't need Chrome or cairo in the image — pdfunite (poppler-utils, already
-# above) is the only system dep on the bundle path.
+# (the .rm parser by the same author) transitively. Its PDF export shells out
+# to Inkscape (SYSTEM package, NOT pip-installable) to rasterize an
+# intermediate SVG — no Chrome or cairo involved:
+#   Debian/Ubuntu : apt-get install inkscape
+#   macOS         : brew install --cask inkscape
+# pdfunite (poppler-utils, already above) merges the per-page PDFs.
 rmc>=0.3
+
+# rmscene is already pulled in transitively by rmc, but rm_strokes.py now
+# imports it directly (STROKE_CONTEXT=1 — stroke-region hints, see README),
+# so it's declared explicitly here too.
+rmscene>=0.6

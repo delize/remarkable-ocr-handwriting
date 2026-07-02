@@ -55,8 +55,9 @@ def main():
     import rm_render
     RENDER_TITLES = {}
     RENDER_FAILS = set()
+    RENDER_REGIONS = {}  # filename -> page_regions, for STROKE_CONTEXT tests
 
-    def fake_render(src, *, cache_dir=None, workdir=None, use_chrome=False):
+    def fake_render(src, *, cache_dir=None, workdir=None, extract_regions=False):
         src = pathlib.Path(src)
         suffix = src.suffix.lower()
         if suffix not in rm_render.SUPPORTED_INPUT_SUFFIXES:
@@ -68,6 +69,7 @@ def main():
         if src.name in RENDER_FAILS:
             raise RuntimeError("simulated render failure")
         title = RENDER_TITLES.get(src.name, src.stem)
+        page_regions = RENDER_REGIONS.get(src.name) if extract_regions else None
         if cache_dir is not None:
             out = rm_render._cache_path(cache_dir, sha)
             out.parent.mkdir(parents=True, exist_ok=True)
@@ -80,7 +82,7 @@ def main():
         else:
             raise ValueError("need cache_dir or workdir")
         return rm_render.RenderResult(pdf=out, title=title, rendered=True,
-                                      source_sha256=sha)
+                                      source_sha256=sha, page_regions=page_regions)
 
     rm_render.render_to_pdf = fake_render
 
@@ -306,6 +308,69 @@ def main():
     check("render failure error message starts with 'render:'",
           broken["error"].startswith("render:"), True)
     check("render failure retries=1", broken["retries"], 1)
+
+    # --- rm_strokes unit checks (pure logic, no real .rm bytes needed) ---
+    import rm_strokes
+
+    class _FakeTool:
+        def __init__(self, name):
+            self.name = name
+
+    class _FakePoint:
+        def __init__(self, x, y):
+            self.x = x
+            self.y = y
+
+    class _FakeLine:
+        def __init__(self, points, tool):
+            self.points = [_FakePoint(x, y) for x, y in points]
+            self.tool = _FakeTool(tool)
+
+    check("regions_from_lines: no strokes -> no regions",
+          rm_strokes.regions_from_lines([]), [])
+
+    # Two short, adjacent, thin horizontal strokes -> one merged, text-like region.
+    text_lines = [
+        _FakeLine([(0, 0), (40, 2)], "FINELINER_1"),
+        _FakeLine([(45, 1), (90, 3)], "FINELINER_1"),
+    ]
+    text_regions = rm_strokes.regions_from_lines(text_lines)
+    check("regions_from_lines: adjacent thin strokes merge into one region",
+          len(text_regions), 1)
+    check("regions_from_lines: thin horizontal region is not flagged as a drawing",
+          text_regions[0].likely_drawing, False)
+    check("prompt_hint: no drawing regions -> None",
+          rm_strokes.prompt_hint([r.__dict__ for r in text_regions]), None)
+
+    # A tall, roughly-square cluster of strokes -> flagged as a probable drawing.
+    drawing_lines = [
+        _FakeLine([(0, 0), (200, 200)], "PAINTBRUSH_1"),
+        _FakeLine([(0, 200), (200, 0)], "PAINTBRUSH_1"),
+    ]
+    drawing_regions = rm_strokes.regions_from_lines(drawing_lines)
+    check("regions_from_lines: tall/squarish cluster flagged likely_drawing",
+          drawing_regions[0].likely_drawing, True)
+    hint = rm_strokes.prompt_hint([r.__dict__ for r in drawing_regions])
+    check("prompt_hint: names the drawing region count", "1 non-text region" in hint, True)
+
+    summary = rm_strokes.summarize([r.__dict__ for r in drawing_regions])
+    check("summarize: counts the likely-drawing region", summary["likely_drawing_regions"], 1)
+    check("summarize: empty input -> zero counts",
+          rm_strokes.summarize(None), {"regions": 0, "likely_drawing_regions": 0, "tools": []})
+
+    # --- STROKE_CONTEXT: daemon threads page_regions into the OCR prompt hint
+    # and the frontmatter summary (via the fake_render/fake_ocr stubs) ---
+    ocr_daemon.STROKE_CONTEXT = True
+    (tmp / "vault/remarkable/Work/SketchNote.rm").write_bytes(b"rm-bytes-sketch")
+    RENDER_REGIONS["SketchNote.rm"] = [
+        [r.__dict__ for r in drawing_regions],
+    ]
+    check("STROKE_CONTEXT: sketch note processes one file",
+          ocr_daemon.scan_once(ocr_daemon.load_manifest()), 1)
+    sketch_md = (out_base / "Work/SketchNote-handwriting_converted.md").read_text()
+    check("STROKE_CONTEXT: frontmatter records stroke_regions_flagged",
+          "stroke_regions_flagged: 1" in sketch_md, True)
+    ocr_daemon.STROKE_CONTEXT = False
 
     # --- rm_render unit checks (visibleName precedence — exercised w/o the stub) ---
     import zipfile as _zip

@@ -142,6 +142,8 @@ set `OLLAMA_HOST=http://host.docker.internal:11434` and add
 
 ```bash
 pip install -r requirements.txt   # + poppler (brew install poppler / apt install poppler-utils)
+                                   # + Inkscape if processing .zip/.rmdoc/.rm (brew install --cask inkscape /
+                                   #   apt install inkscape) — plain .pdf input doesn't need it
 VAULT_DIR=... OUT_DIR=... STATE_DIR=... python3 ocr_daemon.py --scan   # single incremental pass
 python3 ocr_daemon.py --status                                          # manifest summary + any errors
 ```
@@ -196,6 +198,7 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `SPLIT_MAX_ASPECT` | `2.0` | Page height/width above which a PDF is "too tall" — splits it (AUTO_SPLIT) or holds it (REQUIRE_SPLIT). Match the splitter's `MIN_ASPECT_RATIO` |
 | `SPLIT_MARKER_KEY` | `/RemarkableSplitter` | PDF Info-dict key the splitter stamps |
 | `SPLIT_MARKER_VALUE` | `processed` | Expected marker value |
+| `STROKE_CONTEXT` | `0` | `1` = parse `.rm` stroke geometry into a rough sketch/diagram hint for the OCR prompt + `stroke_regions_flagged` in frontmatter. `.rm`-family sources only; heuristic, not recognition. See [Stroke-assisted OCR context](#stroke-assisted-ocr-context) |
 | `LOG_LEVEL` | `INFO` | Set `DEBUG` to log each file's gate decision (see below) |
 
 ### Where transcripts go (3 modes)
@@ -306,6 +309,44 @@ This gate is **off by default** (the tool works fine without the splitter) and
 requires `pypdf` (already in the image / `requirements.txt`); rm-ocr refuses to
 start with `REQUIRE_SPLIT=1` if `pypdf` is missing.
 
+### Stroke-assisted OCR context
+
+`STROKE_CONTEXT=1` (default off) parses each source `.rm` page's vector stroke
+geometry — the pen-tool and point data `rmscene` exposes for `.rm`/`.rmdoc`/`.zip`
+inputs — and clusters it into a rough "this region is probably a sketch, diagram,
+or drawing" hint. If a page has one, a short sentence is appended to that page's
+OCR prompt (transcribe handwriting normally; describe flagged regions in
+`[brackets]` instead of guessing at exact wording), and the count is recorded in
+the transcript's frontmatter as `stroke_regions_flagged`.
+
+**What this is not:** real handwriting recognition. `rmscene`/`rmc` expose raw
+ink geometry (tool id + per-point x/y/pressure/etc.) with no text/drawing
+label, and neither library does any ink-to-text conversion — confirmed by
+reading `rmc`'s own `markdown` exporter, which only extracts *typed* keyboard
+text and highlighter ranges over already-digital text. The mature engines that
+do turn strokes into text (reMarkable's own "Convert to text", MyScript iink,
+Azure Ink Recognizer) are all proprietary cloud services, which would break
+this project's fully-local guarantee — so `STROKE_CONTEXT` stays a local,
+offline, size/shape heuristic: it will misfire on compact diagrams and on
+effusive handwriting. Treat the hint and the frontmatter count as signals, not facts.
+
+Scope and interactions:
+
+- **`.rm`-family sources only.** A plain `.pdf` input never carries stroke
+  data, so `STROKE_CONTEXT` has no effect on it.
+- **Needs `rmscene`** (normally already present — it's a transitive dep of
+  `rmc`); rm-ocr refuses to start with `STROKE_CONTEXT=1` if it's missing.
+- **`AUTO_SPLIT` interaction:** stroke regions are computed per *original*
+  `.rm` page. If `AUTO_SPLIT` actually re-splits a document's rendered pages,
+  the region-to-page mapping would no longer line up, so rm-ocr drops the
+  hints for that document rather than risk attaching one to the wrong page.
+  `REQUIRE_SPLIT` doesn't change page count, so it has no such interaction.
+- **Render cache:** the region data for a bundle/`.rm` is cached alongside its
+  rendered PDF (`STATE_DIR/rendered/<sha>.regions.json`), so a cache hit
+  doesn't need to re-parse the source.
+
+The CLI has the equivalent `--stroke-context` flag.
+
 ### Not re-doing work: how repeats are prevented
 
 Three independent layers, so the same page is never transcribed twice unless it
@@ -359,8 +400,11 @@ Plain Python with a small set of pip + system deps, all baked into the image:
   (system: `apt-get install poppler-utils` / `brew install poppler`). Poppler also
   provides `pdfunite`, used to merge per-page renders into a single bundle PDF.
 - **`rmc`** (pip; pulls in `rmscene`) — renders `.zip` / `.rmdoc` / `.rm` inputs
-  to PDF. Invoked with `--no-chrome`, so no Chrome or cairo system libs are
-  needed. Pure-PDF workflows ignore it entirely.
+  to PDF. Its PDF export shells out to **Inkscape** (system: `apt-get install
+  inkscape` / `brew install --cask inkscape`) to rasterize an intermediate SVG
+  — no Chrome or cairo involved. Pure-PDF workflows ignore both entirely.
+  `rmscene` is also declared directly (`rm_strokes.py` imports it for
+  `STROKE_CONTEXT`, lazily).
 - **`pypdf` + `numpy`** — used only by `AUTO_SPLIT` (lazy-imported; rm-ocr refuses
   to start with `AUTO_SPLIT=1` if they're missing).
 - **`inotify_simple`** (Linux only) — opt-in wake-up signal layered on top of
@@ -394,6 +438,7 @@ source_modified: 2026-05-30T09:14:02
 processed_at: 2026-05-30T12:00:00
 pages: 3
 chars_per_page: [812, 640, 91]
+stroke_regions_flagged: 1
 status: ok
 ---
 
@@ -405,6 +450,11 @@ Source: [[remarkable/Work/Sample.pdf]]
 
 ...transcription...
 ```
+
+`stroke_regions_flagged` only appears when `STROKE_CONTEXT=1` (see
+[Stroke-assisted OCR context](#stroke-assisted-ocr-context)); it's the total
+count of probable sketch/diagram regions across all pages, not a per-page
+breakdown.
 
 ## State
 
@@ -418,6 +468,9 @@ processed_at, status, retries, render_sha256? }`. Written atomically (temp file
 - `render_sha256` is set for rendered inputs only — the hash of the cached PDF
   under `STATE_DIR/rendered/<sha[:2]>/<sha>.pdf`. Useful for tracing which
   rendered output produced a transcript.
+- With `STROKE_CONTEXT=1`, a sibling `STATE_DIR/rendered/<sha[:2]>/<sha>.regions.json`
+  holds that render's stroke-region data, so a cache hit doesn't need to
+  re-parse the source.
 
 `STATE_DIR/rendered/` is the render cache. Sharded two levels deep
 (`<sha[:2]>/<sha>.pdf`). Keyed by source bytes, so renaming a bundle is a free

@@ -24,6 +24,7 @@ import sys
 import time
 
 import rm_render
+import rm_strokes
 from rm_ocr import _safe, ocr_pdf  # reuse the proven core
 from rm_split import SplitConfig, split_in_place
 
@@ -111,6 +112,15 @@ AUTO_SPLIT = _env_bool("AUTO_SPLIT", False)
 SPLIT_TARGET_PAGE_HEIGHT = int(os.environ.get("SPLIT_TARGET_PAGE_HEIGHT", "700"))
 SPLIT_MIN_GAP_HEIGHT = int(os.environ.get("SPLIT_MIN_GAP_HEIGHT", "25"))
 SPLIT_WHITESPACE_THRESHOLD = int(os.environ.get("SPLIT_WHITESPACE_THRESHOLD", "248"))
+
+# STROKE_CONTEXT (opt-in): parse each source .rm page's stroke geometry
+# (rm_strokes) into a rough "probably a sketch, not text" hint per page, added
+# to the OCR prompt and summarized in the transcript frontmatter. Heuristic
+# (size/shape of stroke clusters), not real handwriting recognition — no open,
+# offline ink-to-text engine exists to pair with the vision model. Only
+# possible for .rm/.rmdoc/.zip sources (a plain .pdf never carries stroke
+# data). Needs rmscene, which is normally already present transitively via rmc.
+STROKE_CONTEXT = _env_bool("STROKE_CONTEXT", False)
 
 # Absolute paths the daemon must NEVER read or write under, no matter what.
 # Comma-separated override via FORBIDDEN_PATHS; default protects the standalone
@@ -363,7 +373,7 @@ def _iso_mtime(st):
     return datetime.datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")
 
 
-def write_md(out_md, title, rel, pages, source_modified=None):
+def write_md(out_md, title, rel, pages, source_modified=None, stroke_regions_flagged=None):
     out_md.parent.mkdir(parents=True, exist_ok=True)
     chars = [len(text) for _, text in pages]
     fm = [
@@ -374,6 +384,7 @@ def write_md(out_md, title, rel, pages, source_modified=None):
         f"processed_at: {datetime.datetime.now().isoformat(timespec='seconds')}",
         f"pages: {len(pages)}",
         f"chars_per_page: {json.dumps(chars)}",
+        f"stroke_regions_flagged: {stroke_regions_flagged}" if stroke_regions_flagged is not None else None,
         "status: ok",
         "---",
         "",
@@ -405,7 +416,7 @@ def in_run_window():
     return now >= start or now <= end  # window wraps midnight
 
 
-def process_one(src, result, rel, digest, man):
+def process_one(src, result, rel, digest, man, page_regions=None):
     """OCR a single (rendered) PDF and write its manifest entry + transcript.
 
     ``src`` is the original input path (.pdf or bundle); ``result`` is the
@@ -413,13 +424,23 @@ def process_one(src, result, rel, digest, man):
     ``result.title`` drives the transcript filename). For bundles, the manifest
     records ``render_sha256`` so we can trace which cached PDF produced this
     transcript (handy for a future --purge-orphans).
+
+    ``page_regions`` is ``scan_once``'s (possibly nulled-out, see the
+    AUTO_SPLIT note there) stroke-region hints — passed explicitly rather than
+    read off ``result`` so the caller's alignment check is the only source of
+    truth.
     """
     out_md = safe_output_path(src, result.title, source_sha256=result.source_sha256)
     log.info("processing %s", rel)
     st = src.stat()
     source_modified = _iso_mtime(st)             # last-modified of the source file
-    pages = ocr_pdf(result.pdf, MODEL, DPI, MAX_PX, timeout=TIMEOUT, threads=THREADS, no_think=NO_THINK)
-    chars = write_md(out_md, result.title, rel, pages, source_modified=source_modified)
+    pages = ocr_pdf(result.pdf, MODEL, DPI, MAX_PX, timeout=TIMEOUT, threads=THREADS,
+                    no_think=NO_THINK, page_regions=page_regions)
+    stroke_regions_flagged = sum(
+        rm_strokes.summarize(regions)["likely_drawing_regions"] for regions in page_regions
+    ) if page_regions else None
+    chars = write_md(out_md, result.title, rel, pages, source_modified=source_modified,
+                     stroke_regions_flagged=stroke_regions_flagged)
     out_rel = str(out_md)
     for base in (OUT, VAULT):                     # prefer a tidy relative path
         try:
@@ -470,7 +491,8 @@ def scan_once(man):
         # Cached under STATE/rendered, keyed by source bytes hash, so a re-
         # extracted-but-byte-identical bundle never re-renders.
         try:
-            result = rm_render.render_to_pdf(src, cache_dir=STATE / "rendered")
+            result = rm_render.render_to_pdf(src, cache_dir=STATE / "rendered",
+                                             extract_regions=STROKE_CONTEXT)
         except Exception as e:
             rec = man.setdefault(rel, {})
             rec["status"] = "error"
@@ -484,6 +506,7 @@ def scan_once(man):
             log.error("err %s: render: %s [attempt %d]%s", rel, e, rec["retries"], capped)
             continue
         pdf_for_ocr = result.pdf
+        page_regions = result.page_regions
         # AUTO_SPLIT: split the (tall) input in place first, then OCR the result.
         # For .pdf passthrough this rewrites the source — re-derive the change
         # token from the post-split bytes. For bundles, the bundle file is in
@@ -497,9 +520,18 @@ def scan_once(man):
                     min_gap_height=SPLIT_MIN_GAP_HEIGHT,
                     whitespace_threshold=SPLIT_WHITESPACE_THRESHOLD,
                 )
-                if split_in_place(pdf_for_ocr, cfg) and not result.rendered:
-                    st = src.stat()
-                    digest = sha256(src) if HASH_CHECK else f"mtime:{st.st_mtime}:{st.st_size}"
+                did_split = split_in_place(pdf_for_ocr, cfg)
+                if did_split:
+                    # The stroke regions were computed per ORIGINAL .rm page; a
+                    # whitespace-band re-split changes the final page count, so
+                    # they'd no longer line up with the right page. Drop them
+                    # rather than risk attaching a hint to the wrong page.
+                    if page_regions is not None:
+                        log.debug("stroke regions dropped for %s: AUTO_SPLIT changed page count", rel)
+                    page_regions = None
+                    if not result.rendered:
+                        st = src.stat()
+                        digest = sha256(src) if HASH_CHECK else f"mtime:{st.st_mtime}:{st.st_size}"
             except Exception as e:  # a split failure must not abort the batch
                 rec = man.setdefault(rel, {})
                 rec["status"] = "error"
@@ -525,7 +557,7 @@ def scan_once(man):
                 log.info("pending-split %s (too tall, awaiting splitter)", rel)
             continue
         try:
-            process_one(src, result, rel, digest, man)
+            process_one(src, result, rel, digest, man, page_regions=page_regions)
             done += 1
         except Exception as e:  # one bad input must not stop the batch
             rec = man.setdefault(rel, {})
@@ -703,6 +735,11 @@ def main():
             import numpy  # noqa: F401
         except ImportError:
             raise SystemExit("AUTO_SPLIT needs Pillow + numpy installed (pip install pillow numpy)")
+    if STROKE_CONTEXT:
+        try:
+            import rmscene  # noqa: F401  normally already present transitively via rmc
+        except ImportError:
+            raise SystemExit("STROKE_CONTEXT needs rmscene installed (pip install rmscene)")
     log.info("rm-ocr starting | model=%s threads=%d no_think=%s dpi=%d max_px=%d max_age=%sh cooldown=%ss",
              MODEL, THREADS, NO_THINK, DPI, MAX_PX, MAX_AGE_HOURS, MIN_REPROCESS_INTERVAL)
     log.info("source=%s  out=%s  state=%s", SRC, OUT, STATE)
@@ -712,6 +749,8 @@ def main():
     if REQUIRE_SPLIT:
         log.info("split gate ON | marker=%s value=%s max_aspect=%.2f",
                  SPLIT_MARKER_KEY, SPLIT_MARKER_VALUE, SPLIT_MAX_ASPECT)
+    if STROKE_CONTEXT:
+        log.info("STROKE_CONTEXT ON | stroke-region hints for .rm-family sources (heuristic, not recognition)")
 
     if MODEL_WAIT_TIMEOUT > 0:
         wait_for_model(OLLAMA_HOST, MODEL, MODEL_WAIT_TIMEOUT)
