@@ -31,6 +31,7 @@ import sys
 import tempfile
 import urllib.request
 from pdf2image import convert_from_path
+from PIL import ImageStat
 
 import rm_render
 
@@ -42,8 +43,26 @@ PROMPT = (
 )
 OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/") + "/api/generate"
 
+# Vision models (esp. smaller local ones) tend to break the "no commentary"
+# instruction on a genuinely blank page, answering with refusal-style prose
+# ("I'm sorry, but there is no handwritten text visible...") instead of
+# nothing — which then pollutes the transcript. Measured on real rendered
+# reMarkable pages: a truly blank page comes back as flat mean=255/stddev=0;
+# every page with actual content (even a single short line) measured
+# stddev >= 18. These thresholds leave a wide margin on both sides.
+BLANK_MEAN_THRESHOLD = 254.5
+BLANK_STDDEV_THRESHOLD = 1.0
+BLANK_PAGE_TEXT = "[blank page]"
 
-def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_think=False):
+
+def _is_blank_page(page):
+    """Cheap pre-OCR check: is this PIL page image blank (or as good as)?"""
+    stat = ImageStat.Stat(page.convert("L"))
+    return stat.mean[0] > BLANK_MEAN_THRESHOLD and stat.stddev[0] < BLANK_STDDEV_THRESHOLD
+
+
+def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_think=False,
+           skip_blank=True):
     results = []
     opts = {"temperature": 0}
     if cpu:
@@ -52,6 +71,10 @@ def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_t
         opts["num_thread"] = threads   # override Ollama's under-detected count (cgroup "max" bug)
     pages = convert_from_path(str(pdf), dpi=dpi)
     for n, page in enumerate(pages, 1):
+        if skip_blank and _is_blank_page(page):
+            print(f"    page {n}/{len(pages)}: blank, OCR skipped", flush=True)
+            results.append((n, BLANK_PAGE_TEXT))
+            continue
         w, h = page.size
         s = min(1.0, max_px / max(w, h))
         if s < 1.0:
@@ -94,7 +117,7 @@ def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_t
 
 
 def transcribe_pdf(pdf, out_md, *, model, dpi=150, max_px=1568, threads=None,
-                   no_think=False, timeout=1800, cpu=False, title=None):
+                   no_think=False, timeout=1800, cpu=False, title=None, skip_blank=True):
     """Transcribe a single PDF to a plain ``# title`` / ``## Page N`` markdown file.
 
     Reusable core extracted from ``main()`` (Phase 0). The daemon does NOT call
@@ -108,7 +131,7 @@ def transcribe_pdf(pdf, out_md, *, model, dpi=150, max_px=1568, threads=None,
     out_md = pathlib.Path(out_md)
     title = title or pdf.stem
     pages = ocr_pdf(pdf, model, dpi, max_px, cpu=cpu, timeout=timeout,
-                    threads=threads, no_think=no_think)
+                    threads=threads, no_think=no_think, skip_blank=skip_blank)
     lines = [f"# {title}\n"]
     for n, text in pages:
         lines.append(f"\n## Page {n}\n\n{text}\n")
@@ -173,6 +196,10 @@ def main():
     ap.add_argument("--no-think", action="store_true", help="Disable thinking/reasoning trace (much faster on CPU for 'thinking' models like qwen3.5)")
     ap.add_argument("--render-cache", default=os.environ.get("RM_OCR_RENDER_CACHE"),
                     help="Persistent render cache dir (default: ephemeral temp). Point at the daemon's STATE/rendered to share it.")
+    ap.add_argument("--no-skip-blank", action="store_false", dest="skip_blank",
+                    help="Send genuinely blank pages to the model instead of skipping them "
+                         "(default: skip — small models tend to answer blank pages with "
+                         "refusal-style commentary instead of nothing)")
     args = ap.parse_args()
 
     input_path = pathlib.Path(args.input).expanduser()
@@ -196,6 +223,7 @@ def main():
                     model=args.model, dpi=args.dpi, max_px=args.max_px,
                     threads=args.threads, no_think=args.no_think,
                     timeout=args.timeout, cpu=args.cpu, title=title,
+                    skip_blank=args.skip_blank,
                 )
                 print(f"        -> {title}.md\n", flush=True)
             except Exception as e:

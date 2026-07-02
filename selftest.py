@@ -38,6 +38,8 @@ def main():
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     import rm_ocr
 
+    _real_ocr_pdf = rm_ocr.ocr_pdf  # keep a handle before stubbing, for the blank-page checks below
+
     def fake_ocr(pdf, *a, **k):
         if pathlib.Path(pdf).stem == "Bad":
             raise RuntimeError("simulated bad PDF")
@@ -306,6 +308,52 @@ def main():
     check("render failure error message starts with 'render:'",
           broken["error"].startswith("render:"), True)
     check("render failure retries=1", broken["retries"], 1)
+
+    # --- blank-page detection (rm_ocr's real ocr_pdf, not the fake_ocr stub) ---
+    from PIL import Image, ImageDraw
+    import json as _json
+    import urllib.request as _urllib_request
+
+    check("_is_blank_page: pure white page is blank",
+          rm_ocr._is_blank_page(Image.new("RGB", (200, 260), "white")), True)
+    content_img = Image.new("RGB", (200, 260), "white")
+    ImageDraw.Draw(content_img).line([(20, 20), (180, 240)], fill="black", width=5)
+    check("_is_blank_page: page with a mark is not blank",
+          rm_ocr._is_blank_page(content_img), False)
+
+    ocr_calls = []
+
+    def fake_urlopen(req, timeout=None):
+        ocr_calls.append(_json.loads(req.data)["prompt"])
+
+        class _FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def __iter__(self):
+                yield _json.dumps({"response": "real-page-text", "done": True}).encode()
+
+        return _FakeResp()
+
+    saved_convert = rm_ocr.convert_from_path
+    saved_urlopen = _urllib_request.urlopen
+    rm_ocr.convert_from_path = lambda *a, **k: [Image.new("RGB", (200, 260), "white"), content_img]
+    _urllib_request.urlopen = fake_urlopen
+    try:
+        blank_pages = _real_ocr_pdf("fake.pdf", "test-model", 150, 1568)
+    finally:
+        rm_ocr.convert_from_path = saved_convert
+        _urllib_request.urlopen = saved_urlopen
+
+    check("skip_blank: OCR call skipped for the blank page (only 1 call made)",
+          len(ocr_calls), 1)
+    check("skip_blank: blank page gets the placeholder text",
+          blank_pages[0], (1, rm_ocr.BLANK_PAGE_TEXT))
+    check("skip_blank: page with real content still goes to the model",
+          blank_pages[1], (2, "real-page-text"))
 
     # --- rm_render unit checks (visibleName precedence — exercised w/o the stub) ---
     import zipfile as _zip
