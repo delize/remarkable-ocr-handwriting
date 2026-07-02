@@ -177,6 +177,7 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `OLLAMA_HOST` | `http://ollama:11434` | |
 | `THREADS` | `14` | cgroup under-detection workaround |
 | `NO_THINK` | `1` | **Required** — thinking ON = unusable |
+| `SKIP_BLANK_PAGES` | `1` | `1` = skip the OCR call for a genuinely blank page (writes `[blank page]` instead). Small vision models tend to answer blank pages with refusal-style prose otherwise |
 | `DPI` | `150` | Raising alone does nothing (downscaled to `MAX_PX`) |
 | `MAX_PX` | `1568` | The real quality/time lever |
 | `TIMEOUT` | `1800` | Per-page socket timeout |
