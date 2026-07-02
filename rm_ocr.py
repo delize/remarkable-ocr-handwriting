@@ -34,6 +34,7 @@ import urllib.request
 from pdf2image import convert_from_path
 
 import rm_render
+import rm_strokes
 
 PROMPT = (
     "Transcribe all handwritten text on this page exactly as written. "
@@ -44,7 +45,8 @@ PROMPT = (
 OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/") + "/api/generate"
 
 
-def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_think=False):
+def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_think=False,
+           page_regions=None):
     results = []
     opts = {"temperature": 0}
     if cpu:
@@ -59,9 +61,14 @@ def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_t
             page = page.resize((int(w * s), int(h * s)))
         buf = io.BytesIO()
         page.save(buf, format="PNG")
+        prompt = PROMPT
+        if page_regions and n - 1 < len(page_regions):
+            hint = rm_strokes.prompt_hint(page_regions[n - 1])
+            if hint:
+                prompt = f"{PROMPT}\n\n{hint}"
         payload = {
             "model": model,
-            "prompt": PROMPT,
+            "prompt": prompt,
             "images": [base64.b64encode(buf.getvalue()).decode()],
             "stream": True,        # stream tokens: live progress + no decode-phase timeout
             "keep_alive": "30m",   # keep the model resident across pages/docs (no reload)
@@ -95,7 +102,8 @@ def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_t
 
 
 def transcribe_pdf(pdf, out_md, *, model, dpi=150, max_px=1568, threads=None,
-                   no_think=False, timeout=1800, cpu=False, title=None):
+                   no_think=False, timeout=1800, cpu=False, title=None,
+                   page_regions=None):
     """Transcribe a single PDF to a plain ``# title`` / ``## Page N`` markdown file.
 
     Reusable core extracted from ``main()`` (Phase 0). The daemon does NOT call
@@ -103,22 +111,29 @@ def transcribe_pdf(pdf, out_md, *, model, dpi=150, max_px=1568, threads=None,
     path and any other caller on one code path, and returns the per-page metadata
     the manifest wants.
 
-    Returns a dict: ``{pages, chars_per_page, out_path}``.
+    ``page_regions`` (optional): rm_strokes per-page region hints from
+    ``rm_render.RenderResult.page_regions`` — see ``ocr_pdf``.
+
+    Returns a dict: ``{pages, chars_per_page, out_path, sketch_regions_total}``.
     """
     pdf = pathlib.Path(pdf)
     out_md = pathlib.Path(out_md)
     title = title or pdf.stem
     pages = ocr_pdf(pdf, model, dpi, max_px, cpu=cpu, timeout=timeout,
-                    threads=threads, no_think=no_think)
+                    threads=threads, no_think=no_think, page_regions=page_regions)
     lines = [f"# {title}\n"]
     for n, text in pages:
         lines.append(f"\n## Page {n}\n\n{text}\n")
     out_md.parent.mkdir(parents=True, exist_ok=True)
     out_md.write_text("\n".join(lines))
+    sketch_regions_total = sum(
+        rm_strokes.summarize(regions)["likely_drawing_regions"] for regions in page_regions
+    ) if page_regions else 0
     return {
         "pages": len(pages),
         "chars_per_page": [len(text) for _, text in pages],
         "out_path": str(out_md),
+        "sketch_regions_total": sketch_regions_total,
     }
 
 
@@ -127,8 +142,8 @@ def _safe(name):
     return s or "untitled"
 
 
-def gather(input_path, work, cache_dir=None):
-    """Return list of (title, pdf_path) for everything to OCR under input_path.
+def gather(input_path, work, cache_dir=None, extract_regions=False):
+    """Return list of (title, pdf_path, page_regions) for everything to OCR under input_path.
 
     Dispatches through rm_render: PDFs pass through, bundles/.rm are rendered.
     Per-file render failures log to stderr and skip the file rather than
@@ -151,11 +166,12 @@ def gather(input_path, work, cache_dir=None):
                 src,
                 cache_dir=cache_dir,
                 workdir=work if cache_dir is None else None,
+                extract_regions=extract_regions,
             )
         except Exception as e:
             print(f"  [skip] {src.name}: {e}", file=sys.stderr)
             continue
-        out.append((result.title, result.pdf))
+        out.append((result.title, result.pdf, result.page_regions))
     return out
 
 
@@ -172,6 +188,10 @@ def main():
     ap.add_argument("--no-think", action="store_true", help="Disable thinking/reasoning trace (much faster on CPU for 'thinking' models like qwen3.5)")
     ap.add_argument("--render-cache", default=os.environ.get("RM_OCR_RENDER_CACHE"),
                     help="Persistent render cache dir (default: ephemeral temp). Point at the daemon's STATE/rendered to share it.")
+    ap.add_argument("--stroke-context", action="store_true",
+                    help="Best-effort: parse .rm stroke geometry (rm_strokes) to hint the OCR "
+                         "prompt about likely sketch/diagram regions. .rm-family inputs only "
+                         "(no effect on plain .pdf); heuristic, not real handwriting recognition.")
     args = ap.parse_args()
 
     input_path = pathlib.Path(args.input).expanduser()
@@ -182,11 +202,12 @@ def main():
     cache_dir = pathlib.Path(args.render_cache).expanduser() if args.render_cache else None
 
     with tempfile.TemporaryDirectory() as tmp:
-        items = gather(input_path, pathlib.Path(tmp), cache_dir=cache_dir)
+        items = gather(input_path, pathlib.Path(tmp), cache_dir=cache_dir,
+                       extract_regions=args.stroke_context)
         if not items:
             sys.exit(f"Nothing to OCR under {input_path} (no .pdf / .zip / .rmdoc / .rm found).")
         print(f"{len(items)} document(s). model={args.model} dpi={args.dpi}\nout: {out}\n")
-        for title, pdf in items:
+        for title, pdf, page_regions in items:
             title = _safe(title)
             print(f"[{title}] OCR...", flush=True)
             try:
@@ -195,6 +216,7 @@ def main():
                     model=args.model, dpi=args.dpi, max_px=args.max_px,
                     threads=args.threads, no_think=args.no_think,
                     timeout=args.timeout, cpu=args.cpu, title=title,
+                    page_regions=page_regions,
                 )
                 print(f"        -> {title}.md\n", flush=True)
             except Exception as e:
