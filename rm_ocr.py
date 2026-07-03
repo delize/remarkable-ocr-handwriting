@@ -32,7 +32,6 @@ import sys
 import tempfile
 import urllib.request
 from pdf2image import convert_from_path
-from PIL import ImageStat
 
 import rm_render
 import rm_strokes
@@ -58,7 +57,13 @@ BLANK_PAGE_TEXT = "[blank page]"
 
 
 def _is_blank_page(page):
-    """Cheap pre-OCR check: is this PIL page image blank (or as good as)?"""
+    """Cheap pre-OCR check: is this PIL page image blank (or as good as)?
+
+    Lazy import: pdf2image already pulls in Pillow for real use, but
+    selftest.py stubs pdf2image out entirely to stay dependency-free, so this
+    must not be a module-level import.
+    """
+    from PIL import ImageStat
     stat = ImageStat.Stat(page.convert("L"))
     return stat.mean[0] > BLANK_MEAN_THRESHOLD and stat.stddev[0] < BLANK_STDDEV_THRESHOLD
 
