@@ -142,6 +142,8 @@ set `OLLAMA_HOST=http://host.docker.internal:11434` and add
 
 ```bash
 pip install -r requirements.txt   # + poppler (brew install poppler / apt install poppler-utils)
+                                   # + Inkscape if processing .zip/.rmdoc/.rm (brew install --cask inkscape /
+                                   #   apt install inkscape) — plain .pdf input doesn't need it
 VAULT_DIR=... OUT_DIR=... STATE_DIR=... python3 ocr_daemon.py --scan   # single incremental pass
 python3 ocr_daemon.py --status                                          # manifest summary + any errors
 ```
@@ -359,8 +361,9 @@ Plain Python with a small set of pip + system deps, all baked into the image:
   (system: `apt-get install poppler-utils` / `brew install poppler`). Poppler also
   provides `pdfunite`, used to merge per-page renders into a single bundle PDF.
 - **`rmc`** (pip; pulls in `rmscene`) — renders `.zip` / `.rmdoc` / `.rm` inputs
-  to PDF. Invoked with `--no-chrome`, so no Chrome or cairo system libs are
-  needed. Pure-PDF workflows ignore it entirely.
+  to PDF. Its PDF export shells out to **Inkscape** (system: `apt-get install
+  inkscape` / `brew install --cask inkscape`) to rasterize an intermediate SVG
+  — no Chrome or cairo involved. Pure-PDF workflows ignore both entirely.
 - **`pypdf` + `numpy`** — used only by `AUTO_SPLIT` (lazy-imported; rm-ocr refuses
   to start with `AUTO_SPLIT=1` if they're missing).
 - **`inotify_simple`** (Linux only) — opt-in wake-up signal layered on top of

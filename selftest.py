@@ -56,7 +56,7 @@ def main():
     RENDER_TITLES = {}
     RENDER_FAILS = set()
 
-    def fake_render(src, *, cache_dir=None, workdir=None, use_chrome=False):
+    def fake_render(src, *, cache_dir=None, workdir=None):
         src = pathlib.Path(src)
         suffix = src.suffix.lower()
         if suffix not in rm_render.SUPPORTED_INPUT_SUFFIXES:
