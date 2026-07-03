@@ -28,6 +28,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import sys
 import tempfile
 import urllib.request
@@ -68,8 +69,58 @@ def _is_blank_page(page):
     return stat.mean[0] > BLANK_MEAN_THRESHOLD and stat.stddev[0] < BLANK_STDDEV_THRESHOLD
 
 
+# A handwritten page wraps lines at the page edge, not at the end of a
+# sentence or thought — asking the *model* to reflow that into paragraphs
+# was tried and rejected: even a carefully-worded "don't paraphrase, just
+# join wrapped lines" prompt measurably pushed a local vision model (minicpm-v)
+# toward fabricating plausible-sounding prose instead of transcribing
+# faithfully. Reflowing is instead a deterministic text transform applied
+# *after* transcription, on text the model already produced — no re-reading
+# of the image, so no new hallucination risk. It relies on the model's
+# existing behavior of leaving a blank line between real paragraphs (already
+# true of every model tried this session) while wrapping within one.
+_STRUCTURAL_LINE = re.compile(r"^(#{1,6}\s|[-*+]\s|\d+\.\s|>\s)")
+
+
+def reflow_paragraphs(text):
+    """Join word-wrapped lines within a paragraph into flowing prose.
+
+    A paragraph is a run of non-blank lines. Blank lines, headings, bullet /
+    numbered list items, blockquotes, and fenced code blocks (``` ... ```,
+    including any blank lines *inside* the fence) are left exactly as-is —
+    only plain prose lines get joined with a space.
+    """
+    out_lines = []
+    buffer = []
+    in_fence = False
+
+    def flush():
+        if buffer:
+            out_lines.append(" ".join(buffer))
+            buffer.clear()
+
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            flush()
+            out_lines.append(line)
+        elif in_fence:
+            out_lines.append(line)
+        elif not stripped:
+            flush()
+            out_lines.append("")
+        elif _STRUCTURAL_LINE.match(stripped):
+            flush()
+            out_lines.append(line)
+        else:
+            buffer.append(stripped)
+    flush()
+    return "\n".join(out_lines)
+
+
 def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_think=False,
-           skip_blank=True, page_regions=None):
+           skip_blank=True, page_regions=None, reflow=True):
     results = []
     opts = {"temperature": 0}
     if cpu:
@@ -124,13 +175,16 @@ def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_t
                 if obj.get("done"):
                     break
         print(f" {len(''.join(parts))} chars", flush=True)
-        results.append((n, "".join(parts).strip()))
+        text = "".join(parts).strip()
+        if reflow:
+            text = reflow_paragraphs(text)
+        results.append((n, text))
     return results
 
 
 def transcribe_pdf(pdf, out_md, *, model, dpi=150, max_px=1568, threads=None,
                    no_think=False, timeout=1800, cpu=False, title=None,
-                   page_regions=None, skip_blank=True):
+                   page_regions=None, skip_blank=True, reflow=True):
     """Transcribe a single PDF to a plain ``# title`` / ``## Page N`` markdown file.
 
     Reusable core extracted from ``main()`` (Phase 0). The daemon does NOT call
@@ -148,7 +202,7 @@ def transcribe_pdf(pdf, out_md, *, model, dpi=150, max_px=1568, threads=None,
     title = title or pdf.stem
     pages = ocr_pdf(pdf, model, dpi, max_px, cpu=cpu, timeout=timeout,
                     threads=threads, no_think=no_think,
-                    skip_blank=skip_blank, page_regions=page_regions)
+                    skip_blank=skip_blank, page_regions=page_regions, reflow=reflow)
     lines = [f"# {title}\n"]
     for n, text in pages:
         lines.append(f"\n## Page {n}\n\n{text}\n")
@@ -224,6 +278,10 @@ def main():
                     help="Send genuinely blank pages to the model instead of skipping them "
                          "(default: skip — small models tend to answer blank pages with "
                          "refusal-style commentary instead of nothing)")
+    ap.add_argument("--no-reflow", action="store_false", dest="reflow",
+                    help="Keep the model's literal per-page-line breaks instead of joining "
+                         "word-wrapped lines into flowing paragraphs (default: reflow). Pure "
+                         "text post-processing on the model's own output, not a re-transcription.")
     args = ap.parse_args()
 
     input_path = pathlib.Path(args.input).expanduser()
@@ -250,6 +308,7 @@ def main():
                     timeout=args.timeout, cpu=args.cpu, title=title,
                     page_regions=page_regions,
                     skip_blank=args.skip_blank,
+                    reflow=args.reflow,
                 )
                 print(f"        -> {title}.md\n", flush=True)
             except Exception as e:
