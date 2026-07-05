@@ -180,6 +180,7 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `THREADS` | `14` | cgroup under-detection workaround |
 | `NO_THINK` | `1` | **Required** — thinking ON = unusable |
 | `SKIP_BLANK_PAGES` | `1` | `1` = skip the OCR call for a genuinely blank page (writes `[blank page]` instead). Small vision models tend to answer blank pages with refusal-style prose otherwise |
+| `REFLOW_PARAGRAPHS` | `1` | `1` = join word-wrapped lines into flowing paragraphs. Post-processing on the model's own transcription, not a re-transcription — see [Paragraph reflow](#paragraph-reflow) |
 | `DPI` | `150` | Raising alone does nothing (downscaled to `MAX_PX`) |
 | `MAX_PX` | `1568` | The real quality/time lever |
 | `TIMEOUT` | `1800` | Per-page socket timeout |
@@ -347,6 +348,30 @@ Scope and interactions:
   doesn't need to re-parse the source.
 
 The CLI has the equivalent `--stroke-context` flag.
+
+### Paragraph reflow
+
+Handwriting wraps at the edge of the page, not at the end of a sentence, so a
+literal transcription reads as one short, choppy line per physical line on the
+page. `REFLOW_PARAGRAPHS=1` (default on) joins those word-wrapped lines back
+into flowing paragraphs, as a **text post-processing step on the model's own
+output** — headings, bullet/numbered lists, blockquotes, and fenced code
+blocks (including any blank line inside one) are left exactly as the model
+wrote them; only plain prose lines get joined with a space. A blank line
+between two blocks of text is treated as a real paragraph break and preserved.
+
+This is deliberately *not* done by asking the model to reflow while
+transcribing. That was tried first and rejected: even a carefully-worded
+prompt ("don't paraphrase, just join wrapped lines") measurably pushed a local
+vision model toward generating plausible-sounding prose instead of
+transcribing faithfully — on one real test page it fabricated several
+paragraphs of generic text with no relationship to the actual handwriting.
+Reflowing after the fact operates only on text the model already produced, so
+it carries no risk of introducing new hallucinated content — at most it can
+badly reflow, never invent.
+
+Set `REFLOW_PARAGRAPHS=0` (or `--no-reflow` on the CLI) to keep the model's
+literal per-page-line output instead.
 
 ### Not re-doing work: how repeats are prevented
 

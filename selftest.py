@@ -429,7 +429,7 @@ def main():
                 return False
 
             def __iter__(self):
-                yield _json.dumps({"response": "real-page-text", "done": True}).encode()
+                yield _json.dumps({"response": "real page\ntext wrapped", "done": True}).encode()
 
         return _FakeResp()
 
@@ -447,8 +447,28 @@ def main():
           len(ocr_calls), 1)
     check("skip_blank: blank page gets the placeholder text",
           blank_pages[0], (1, rm_ocr.BLANK_PAGE_TEXT))
-    check("skip_blank: page with real content still goes to the model",
-          blank_pages[1], (2, "real-page-text"))
+    check("skip_blank + reflow: real page is reflowed by ocr_pdf's default (reflow=True)",
+          blank_pages[1], (2, "real page text wrapped"))
+
+    # --- reflow_paragraphs (pure text transform, no model/PIL involved) ---
+    check("reflow_paragraphs: joins word-wrapped lines within a paragraph",
+          rm_ocr.reflow_paragraphs("It's really difficult to\nput into words\nwhen you find someone."),
+          "It's really difficult to put into words when you find someone.")
+
+    check("reflow_paragraphs: blank line still separates real paragraphs",
+          rm_ocr.reflow_paragraphs("First para\nline two.\n\nSecond para\nline two."),
+          "First para line two.\n\nSecond para line two.")
+
+    check("reflow_paragraphs: headings/bullets/numbered lists/blockquotes untouched",
+          rm_ocr.reflow_paragraphs(
+              "## Page 1\n- a bullet\n1. a numbered item\n> a quote\nplain wrapped\ntext line"),
+          "## Page 1\n- a bullet\n1. a numbered item\n> a quote\nplain wrapped text line")
+
+    check("reflow_paragraphs: fenced code (incl. a blank line inside it) left exactly as-is",
+          rm_ocr.reflow_paragraphs("prose line one\nprose line two\n\n```\nfenced line one\n\nfenced line two\n```"),
+          "prose line one prose line two\n\n```\nfenced line one\n\nfenced line two\n```")
+
+    check("reflow_paragraphs: empty input -> empty output", rm_ocr.reflow_paragraphs(""), "")
 
     # --- rm_render unit checks (visibleName precedence — exercised w/o the stub) ---
     import zipfile as _zip
