@@ -12,13 +12,13 @@ pdf2image>=1.17
 # for the split-readiness gate (REQUIRE_SPLIT=1) and the in-place splitter
 # (AUTO_SPLIT=1). Lazily imported, so only strictly required when a split feature
 # is enabled.
-pypdf>=6.13.0
+pypdf>=6.14.2
 
 # numpy + Pillow are used ONLY by AUTO_SPLIT (rm_split.py: whitespace-band
 # detection on rendered pages). Pillow is already pulled in by pdf2image; numpy is
 # the only addition. Both lazily imported — not needed unless AUTO_SPLIT=1.
-numpy>=2.4.6
-Pillow>=12.2.0
+numpy>=2.5.1
+Pillow>=12.3.0
 
 # inotify_simple powers the optional inotify wake-up signal (INOTIFY=1, on by
 # default). Linux-only — on macOS the import will fail and the daemon falls back
@@ -37,4 +37,4 @@ rmc>=0.3
 # rmscene is already pulled in transitively by rmc, but rm_strokes.py now
 # imports it directly (STROKE_CONTEXT=1 — stroke-region hints, see README),
 # so it's declared explicitly here too.
-rmscene>=0.6
+rmscene>=0.8.0
