@@ -116,12 +116,13 @@ SPLIT_MAX_ASPECT = float(os.environ.get("SPLIT_MAX_ASPECT", "2.0"))
 # AUTO_SPLIT: do the splitting ourselves (one tool, split -> OCR in one pass)
 # instead of waiting on the standalone splitter. Splits the source PDF IN PLACE
 # (so the readable split PDF also persists), then OCRs it. Requires the source
-# dir to be WRITABLE (not the usual :ro vault mount) and pulls in pypdf + Pillow +
+# dir to be WRITABLE (not the usual :ro vault mount) and pulls in PyMuPDF +
 # numpy. Implies split-readiness, so REQUIRE_SPLIT's gate is moot when this is on.
 AUTO_SPLIT = _env_bool("AUTO_SPLIT", False)
 SPLIT_TARGET_PAGE_HEIGHT = int(os.environ.get("SPLIT_TARGET_PAGE_HEIGHT", "700"))
 SPLIT_MIN_GAP_HEIGHT = int(os.environ.get("SPLIT_MIN_GAP_HEIGHT", "25"))
 SPLIT_WHITESPACE_THRESHOLD = int(os.environ.get("SPLIT_WHITESPACE_THRESHOLD", "248"))
+SPLIT_MAX_SEGMENT_FACTOR = float(os.environ.get("SPLIT_MAX_SEGMENT_FACTOR", "2.0"))
 
 # STROKE_CONTEXT (opt-in): parse each source .rm page's stroke geometry
 # (rm_strokes) into a rough "probably a sketch, not text" hint per page, added
@@ -530,6 +531,7 @@ def scan_once(man):
                     target_page_height=SPLIT_TARGET_PAGE_HEIGHT,
                     min_gap_height=SPLIT_MIN_GAP_HEIGHT,
                     whitespace_threshold=SPLIT_WHITESPACE_THRESHOLD,
+                    max_segment_factor=SPLIT_MAX_SEGMENT_FACTOR,
                 )
                 did_split = split_in_place(pdf_for_ocr, cfg)
                 if did_split:
@@ -735,17 +737,17 @@ def main():
         return
 
     assert_safe_paths()
-    if REQUIRE_SPLIT or AUTO_SPLIT:
+    if REQUIRE_SPLIT:
         try:
-            import pypdf  # noqa: F401  fail fast if a split feature is on but pypdf is missing
+            import pypdf  # noqa: F401  fail fast if the split gate is on but pypdf is missing
         except ImportError:
-            raise SystemExit("REQUIRE_SPLIT/AUTO_SPLIT need pypdf installed (pip install pypdf)")
+            raise SystemExit("REQUIRE_SPLIT needs pypdf installed (pip install pypdf)")
     if AUTO_SPLIT:
         try:
-            import PIL  # noqa: F401
+            import fitz  # noqa: F401
             import numpy  # noqa: F401
         except ImportError:
-            raise SystemExit("AUTO_SPLIT needs Pillow + numpy installed (pip install pillow numpy)")
+            raise SystemExit("AUTO_SPLIT needs PyMuPDF + numpy installed (pip install pymupdf numpy)")
     if STROKE_CONTEXT:
         try:
             import rmscene  # noqa: F401  normally already present transitively via rmc
