@@ -32,7 +32,7 @@ import re
 import sys
 import tempfile
 import urllib.request
-from pdf2image import convert_from_path
+from pdf2image import convert_from_path, pdfinfo_from_path
 
 import rm_render
 import rm_strokes
@@ -127,10 +127,17 @@ def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_t
         opts["num_gpu"] = 0   # 0 layers on GPU == CPU-only (num_gpu = #layers, not #GPUs)
     if threads:
         opts["num_thread"] = threads   # override Ollama's under-detected count (cgroup "max" bug)
-    pages = convert_from_path(str(pdf), dpi=dpi)
-    for n, page in enumerate(pages, 1):
+    # Render one page at a time. convert_from_path over the whole document
+    # rasterizes EVERY page into RAM at once (at `dpi`); on a long notebook at a
+    # high DPI that alone can OOM-kill the container before a single page is even
+    # sent to the model — a SIGKILL no try/except can catch, which then wedges
+    # the daemon in a restart loop on that one file. pdfinfo gives the page count
+    # cheaply, then each page is rendered, OCR'd, and freed in turn.
+    num_pages = pdfinfo_from_path(str(pdf))["Pages"]
+    for n in range(1, num_pages + 1):
+        page = convert_from_path(str(pdf), dpi=dpi, first_page=n, last_page=n)[0]
         if skip_blank and _is_blank_page(page):
-            print(f"    page {n}/{len(pages)}: blank, OCR skipped", flush=True)
+            print(f"    page {n}/{num_pages}: blank, OCR skipped", flush=True)
             results.append((n, BLANK_PAGE_TEXT))
             continue
         w, h = page.size
@@ -158,7 +165,7 @@ def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_t
             OLLAMA_URL, data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"},
         )
-        print(f"    page {n}/{len(pages)} (prefill on CPU may take minutes)...", end="", flush=True)
+        print(f"    page {n}/{num_pages} (prefill on CPU may take minutes)...", end="", flush=True)
         parts = []
         # `timeout` is the per-read socket timeout; the first read blocks through
         # the whole prefill, so it must be generous on CPU.
