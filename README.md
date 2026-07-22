@@ -191,6 +191,7 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `INOTIFY` | `1` | `1` = wake immediately on `CLOSE_WRITE` / `MOVED_TO` for `*.pdf` under `SOURCE_SUBDIR` (Linux only; falls back to pure poll if unavailable). See [Inotify wake-up](#inotify-wake-up) |
 | `HASH_CHECK` | `1` | `1` = sha256 content detection (authoritative); `0` = last-modified (mtime) detection — cheaper, but re-OCRs on touch-only changes |
 | `MAX_AGE_HOURS` | `24` | Only consider PDFs modified within this window; `0` = no limit |
+| `MAX_PDF_PAGES` | `0` | Skip documents with more rendered pages than this (`0` = no limit). Counted post-`AUTO_SPLIT`; skipped files show as `SKIPPED` in `--status` and re-queue automatically if the cap is raised |
 | `MAX_RETRIES` | `3` | Stop retrying a broken PDF |
 | `MIN_REPROCESS_INTERVAL` | `0` | Min seconds between reprocesses of the **same** path even if it changed; `0` = off |
 | `RUN_WINDOW` | _(empty)_ | Optional, e.g. `01:00-07:00` |

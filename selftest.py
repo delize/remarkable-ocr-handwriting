@@ -394,6 +394,28 @@ def main():
         check("daily-note embed: DAILY_NOTE_DIR inside SOURCE_SUBDIR is refused", "SystemExit", "SystemExit")
     ocr_daemon.DAILY_NOTE_EMBED, ocr_daemon.DAILY_NOTE_DIR = saved_dne, saved_dnd
 
+    # --- MAX_PDF_PAGES: over-cap documents are skipped, and re-queue when the cap lifts ---
+    saved_cap = ocr_daemon.MAX_PDF_PAGES
+    saved_count = ocr_daemon._pdf_page_count
+    ocr_daemon.MAX_PDF_PAGES = 10
+    ocr_daemon._pdf_page_count = lambda p: 966 if "Tome" in str(p) else 2
+    (tmp / "vault/remarkable/Work/Tome.pdf").write_text("tome-bytes")
+    (tmp / "vault/remarkable/Work/Slim.pdf").write_text("slim-bytes")
+    check("page cap: only the under-cap file is OCR'd",
+          ocr_daemon.scan_once(ocr_daemon.load_manifest()), 1)
+    tome = ocr_daemon.load_manifest()["remarkable/Work/Tome.pdf"]
+    check("page cap: over-cap file recorded as skipped_pages", tome["status"], "skipped_pages")
+    check("page cap: recorded page count", tome["page_count"], 966)
+    check("page cap: skipped file stays skipped next pass (no rework)",
+          ocr_daemon.scan_once(ocr_daemon.load_manifest()), 0)
+    ocr_daemon.MAX_PDF_PAGES = 1000  # cap raised -> re-queues with no touch
+    check("page cap: raising the cap re-queues the skipped file",
+          ocr_daemon.scan_once(ocr_daemon.load_manifest()), 1)
+    check("page cap: re-queued file transcribed ok",
+          ocr_daemon.load_manifest()["remarkable/Work/Tome.pdf"]["status"], "ok")
+    ocr_daemon.MAX_PDF_PAGES = saved_cap
+    ocr_daemon._pdf_page_count = saved_count
+
     # --- rm_strokes unit checks (pure logic, no real .rm bytes needed) ---
     import rm_strokes
 
