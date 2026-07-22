@@ -116,12 +116,13 @@ SPLIT_MAX_ASPECT = float(os.environ.get("SPLIT_MAX_ASPECT", "2.0"))
 # AUTO_SPLIT: do the splitting ourselves (one tool, split -> OCR in one pass)
 # instead of waiting on the standalone splitter. Splits the source PDF IN PLACE
 # (so the readable split PDF also persists), then OCRs it. Requires the source
-# dir to be WRITABLE (not the usual :ro vault mount) and pulls in pypdf + Pillow +
+# dir to be WRITABLE (not the usual :ro vault mount) and pulls in PyMuPDF +
 # numpy. Implies split-readiness, so REQUIRE_SPLIT's gate is moot when this is on.
 AUTO_SPLIT = _env_bool("AUTO_SPLIT", False)
 SPLIT_TARGET_PAGE_HEIGHT = int(os.environ.get("SPLIT_TARGET_PAGE_HEIGHT", "700"))
 SPLIT_MIN_GAP_HEIGHT = int(os.environ.get("SPLIT_MIN_GAP_HEIGHT", "25"))
 SPLIT_WHITESPACE_THRESHOLD = int(os.environ.get("SPLIT_WHITESPACE_THRESHOLD", "248"))
+SPLIT_MAX_SEGMENT_FACTOR = float(os.environ.get("SPLIT_MAX_SEGMENT_FACTOR", "2.0"))
 
 # STROKE_CONTEXT (opt-in): parse each source .rm page's stroke geometry
 # (rm_strokes) into a rough "probably a sketch, not text" hint per page, added
@@ -530,6 +531,7 @@ def scan_once(man):
                     target_page_height=SPLIT_TARGET_PAGE_HEIGHT,
                     min_gap_height=SPLIT_MIN_GAP_HEIGHT,
                     whitespace_threshold=SPLIT_WHITESPACE_THRESHOLD,
+                    max_segment_factor=SPLIT_MAX_SEGMENT_FACTOR,
                 )
                 did_split = split_in_place(pdf_for_ocr, cfg)
                 if did_split:
@@ -567,6 +569,22 @@ def scan_once(man):
             if prev != "pending_split":  # log once on entering the state
                 log.info("pending-split %s (too tall, awaiting splitter)", rel)
             continue
+        # Record the attempt BEFORE OCR runs. ocr_pdf can die by SIGKILL (an OOM
+        # on a big render) or a poppler segfault — a hard crash no try/except can
+        # catch — so a caught exception is NOT the only way this step fails. If we
+        # only bumped retries in the except handler, a hard crash would leave the
+        # manifest untouched, the file would look brand-new on the next restart,
+        # and the daemon would re-attempt the same poison file forever (never
+        # reaching the retry cap, never reaching the files after it). Persisting an
+        # incremented-retry "attempting" marker first makes the crash count, so a
+        # genuinely un-OCR-able file is retry-capped and skipped like any other.
+        st = src.stat()
+        rec = man.setdefault(rel, {})
+        rec.update(mtime=st.st_mtime, size=st.st_size,
+                   sha256=digest if isinstance(digest, str) else rec.get("sha256"),
+                   status="attempting", retries=rec.get("retries", 0) + 1,
+                   attempted_at=datetime.datetime.now().isoformat(timespec="seconds"))
+        save_manifest(man)
         try:
             process_one(src, result, rel, digest, man, page_regions=page_regions)
             done += 1
@@ -575,12 +593,13 @@ def scan_once(man):
             rec["status"] = "error"
             rec["error"] = str(e)
             rec["sha256"] = digest if isinstance(digest, str) else rec.get("sha256")
-            rec["retries"] = rec.get("retries", 0) + 1
+            # retries was already incremented by the pre-attempt marker above;
+            # don't double-count a caught error against the cap.
             st = src.stat()
             rec["mtime"], rec["size"] = st.st_mtime, st.st_size
             save_manifest(man)
-            capped = " (retry cap reached)" if rec["retries"] >= MAX_RETRIES else ""
-            log.error("err %s: %s [attempt %d]%s", rel, e, rec["retries"], capped)
+            capped = " (retry cap reached)" if rec.get("retries", 0) >= MAX_RETRIES else ""
+            log.error("err %s: %s [attempt %d]%s", rel, e, rec.get("retries", 0), capped)
     if skipped_old:
         log.debug("skipped %d file(s) older than %sh", skipped_old, MAX_AGE_HOURS)
     return done
@@ -590,14 +609,21 @@ def print_status(man):
     ok = sum(1 for r in man.values() if r.get("status") == "ok")
     err = sum(1 for r in man.values() if r.get("status") == "error")
     pending = sum(1 for r in man.values() if r.get("status") == "pending_split")
+    # "attempting" persists only when OCR was entered but never finished — i.e. a
+    # hard crash (OOM-kill / segfault) killed the process mid-file. Surfacing it
+    # makes a wedged or retry-capped poison file visible instead of silent.
+    attempting = sum(1 for r in man.values() if r.get("status") == "attempting")
     pages = sum(r.get("pages", 0) for r in man.values() if r.get("status") == "ok")
     print(f"manifest: {MANIFEST}")
-    print(f"  ok={ok}  error={err}  pending_split={pending}  total_pages={pages}")
+    print(f"  ok={ok}  error={err}  pending_split={pending}  attempting={attempting}  total_pages={pages}")
     for rel, r in sorted(man.items()):
         if r.get("status") == "error":
             print(f"  ERROR    {rel}  (retries={r.get('retries', 0)}): {r.get('error', '')}")
         elif r.get("status") == "pending_split":
             print(f"  PENDING  {rel}  (awaiting splitter)")
+        elif r.get("status") == "attempting":
+            capped = " retry-capped" if r.get("retries", 0) >= MAX_RETRIES else ""
+            print(f"  CRASHED  {rel}  (died mid-OCR, retries={r.get('retries', 0)}{capped})")
 
 
 def start_inotify_watcher(src, wake):
@@ -735,17 +761,17 @@ def main():
         return
 
     assert_safe_paths()
-    if REQUIRE_SPLIT or AUTO_SPLIT:
+    if REQUIRE_SPLIT:
         try:
-            import pypdf  # noqa: F401  fail fast if a split feature is on but pypdf is missing
+            import pypdf  # noqa: F401  fail fast if the split gate is on but pypdf is missing
         except ImportError:
-            raise SystemExit("REQUIRE_SPLIT/AUTO_SPLIT need pypdf installed (pip install pypdf)")
+            raise SystemExit("REQUIRE_SPLIT needs pypdf installed (pip install pypdf)")
     if AUTO_SPLIT:
         try:
-            import PIL  # noqa: F401
+            import fitz  # noqa: F401
             import numpy  # noqa: F401
         except ImportError:
-            raise SystemExit("AUTO_SPLIT needs Pillow + numpy installed (pip install pillow numpy)")
+            raise SystemExit("AUTO_SPLIT needs PyMuPDF + numpy installed (pip install pymupdf numpy)")
     if STROKE_CONTEXT:
         try:
             import rmscene  # noqa: F401  normally already present transitively via rmc

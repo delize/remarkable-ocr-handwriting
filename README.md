@@ -194,10 +194,11 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `MAX_RETRIES` | `3` | Stop retrying a broken PDF |
 | `MIN_REPROCESS_INTERVAL` | `0` | Min seconds between reprocesses of the **same** path even if it changed; `0` = off |
 | `RUN_WINDOW` | _(empty)_ | Optional, e.g. `01:00-07:00` |
-| `AUTO_SPLIT` | `0` | `1` = split tall PDFs **in place** then OCR, in one pass (see below). Needs `pypdf`+`numpy`+Pillow and a **writable** source dir |
+| `AUTO_SPLIT` | `0` | `1` = split tall PDFs **in place** then OCR, in one pass (see below). Needs `PyMuPDF`+`numpy` and a **writable** source dir |
 | `SPLIT_TARGET_PAGE_HEIGHT` | `700` | AUTO_SPLIT: desired output page height (px @ 72dpi) |
 | `SPLIT_MIN_GAP_HEIGHT` | `25` | AUTO_SPLIT: smallest whitespace band (px) to cut at |
 | `SPLIT_WHITESPACE_THRESHOLD` | `248` | AUTO_SPLIT: row brightness (0–255) counted as whitespace |
+| `SPLIT_MAX_SEGMENT_FACTOR` | `2.0` | AUTO_SPLIT: force-cut segments taller than target height x this when no whitespace is found (`0` = never force) |
 | `REQUIRE_SPLIT` | `0` | `1` = only OCR PDFs that are split-ready (see below). Needs `pypdf`. For the *external* splitter workflow |
 | `SPLIT_MAX_ASPECT` | `2.0` | Page height/width above which a PDF is "too tall" — splits it (AUTO_SPLIT) or holds it (REQUIRE_SPLIT). Match the splitter's `MIN_ASPECT_RATIO` |
 | `SPLIT_MARKER_KEY` | `/RemarkableSplitter` | PDF Info-dict key the splitter stamps |
@@ -281,8 +282,13 @@ bytes change, normal change-detection then OCRs the new version. No second
 container, no async race.
 
 - Requires the **source dir to be writable** (mount the vault `:rw`, not `:ro`).
-- Adds `pypdf` + `numpy` (+ Pillow, already present); rm-ocr refuses to start with
-  `AUTO_SPLIT=1` if they're missing.
+- Adds `PyMuPDF` + `numpy`; rm-ocr refuses to start with `AUTO_SPLIT=1` if they're
+  missing. Splitting runs on PyMuPDF (each output page references the source page
+  once, instead of re-encoding it per segment), so even a native vector export
+  with dozens of cuts splits in seconds and the file stays roughly input-sized.
+- Content with no detectable whitespace (dark templates, dense sketches) no longer
+  passes through uncut: segments taller than `SPLIT_TARGET_PAGE_HEIGHT` x
+  `SPLIT_MAX_SEGMENT_FACTOR` (default `2.0`, `0` disables) are subdivided evenly.
 - Already-split or short PDFs are left untouched (idempotent via the marker).
 - A split failure is recorded as `error` (capped retries) and never aborts the batch.
 
@@ -433,8 +439,11 @@ Plain Python with a small set of pip + system deps, all baked into the image:
   — no Chrome or cairo involved. Pure-PDF workflows ignore both entirely.
   `rmscene` is also declared directly (`rm_strokes.py` imports it for
   `STROKE_CONTEXT`, lazily).
-- **`pypdf` + `numpy`** — used only by `AUTO_SPLIT` (lazy-imported; rm-ocr refuses
-  to start with `AUTO_SPLIT=1` if they're missing).
+- **`PyMuPDF` + `numpy`** — used only by `AUTO_SPLIT` (lazy-imported; rm-ocr
+  refuses to start with `AUTO_SPLIT=1` if they're missing). PyMuPDF both renders
+  tall pages for the whitespace analysis and assembles the split output; note it
+  is AGPL-3.0 licensed.
+- **`pypdf`** — used only by the `REQUIRE_SPLIT` gate (lazy-imported).
 - **`inotify_simple`** (Linux only) — opt-in wake-up signal layered on top of
   the poll; gracefully no-ops on macOS.
 - **Ollama** running with the model pulled: `ollama pull gemma4:26b`.

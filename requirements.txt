@@ -9,15 +9,21 @@
 pdf2image>=1.17
 
 # pypdf reads the splitter's /RemarkableSplitter metadata marker and page sizes
-# for the split-readiness gate (REQUIRE_SPLIT=1) and the in-place splitter
-# (AUTO_SPLIT=1). Lazily imported, so only strictly required when a split feature
-# is enabled.
+# for the split-readiness gate (REQUIRE_SPLIT=1). Lazily imported, so only
+# strictly required when that gate is enabled.
 pypdf>=6.13.0
 
-# numpy + Pillow are used ONLY by AUTO_SPLIT (rm_split.py: whitespace-band
-# detection on rendered pages). Pillow is already pulled in by pdf2image; numpy is
-# the only addition. Both lazily imported — not needed unless AUTO_SPLIT=1.
+# PyMuPDF + numpy are used ONLY by AUTO_SPLIT (rm_split.py). PyMuPDF renders
+# tall pages in-process for the whitespace-band analysis and assembles the
+# split output by referencing each source page once (form XObject + clip), so
+# a many-cut split of a vector-heavy export stays fast and roughly
+# input-sized. The previous pypdf merge_page assembly re-encoded the full
+# page content once per segment and could OOM on native reMarkable exports.
+# Note PyMuPDF is AGPL-3.0. Both lazily imported, not needed unless AUTO_SPLIT=1.
+PyMuPDF>=1.26
 numpy>=2.4.6
+
+# Pillow is pulled in by pdf2image anyway; pinned for the OCR image pipeline.
 Pillow>=12.2.0
 
 # inotify_simple powers the optional inotify wake-up signal (INOTIFY=1, on by

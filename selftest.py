@@ -33,6 +33,7 @@ def main():
     # stub pdf2image so importing rm_ocr needs no poppler
     m = types.ModuleType("pdf2image")
     m.convert_from_path = lambda *a, **k: []
+    m.pdfinfo_from_path = lambda *a, **k: {"Pages": 0}
     sys.modules["pdf2image"] = m
 
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -311,6 +312,30 @@ def main():
           broken["error"].startswith("render:"), True)
     check("render failure retries=1", broken["retries"], 1)
 
+    # --- crash-guard: a persistently un-OCR-able file is retry-capped, not looped ---
+    # Stands in for the production OOM/segfault case. The pre-attempt "attempting"
+    # marker makes every failed OCR attempt count, so MAX_RETRIES eventually skips
+    # the file instead of re-attempting it on every pass forever; and a good file
+    # that sorts AFTER the failing one must still be transcribed each pass.
+    saved_ocr = ocr_daemon.ocr_pdf
+
+    def crash_ocr(pdf, *a, **k):
+        if pathlib.Path(pdf).stem == "Crashy":
+            raise RuntimeError("simulated hard OCR failure")
+        return [(1, "good text")]
+
+    ocr_daemon.ocr_pdf = crash_ocr
+    (tmp / "vault/remarkable/Work/Crashy.pdf").write_text("crashy-bytes")
+    (tmp / "vault/remarkable/Work/Zzz.pdf").write_text("zzz-good-bytes")  # sorts after Crashy
+    for _ in range(ocr_daemon.MAX_RETRIES + 2):
+        ocr_daemon.scan_once(ocr_daemon.load_manifest())
+    crash_man = ocr_daemon.load_manifest()
+    check("crash-guard: failing file retry-capped exactly at MAX_RETRIES (no runaway)",
+          crash_man["remarkable/Work/Crashy.pdf"]["retries"], ocr_daemon.MAX_RETRIES)
+    check("crash-guard: good file sorted after the failing one is still transcribed",
+          crash_man["remarkable/Work/Zzz.pdf"]["status"], "ok")
+    ocr_daemon.ocr_pdf = saved_ocr
+
     # --- rm_strokes unit checks (pure logic, no real .rm bytes needed) ---
     import rm_strokes
 
@@ -433,14 +458,20 @@ def main():
 
         return _FakeResp()
 
+    # ocr_pdf now renders one page at a time: pdfinfo gives the count, then each
+    # page is fetched with first_page=last_page=n. Mirror that in the stubs.
+    _doc_pages = [blank_page_img, content_page_img]
     saved_convert = rm_ocr.convert_from_path
+    saved_pdfinfo = rm_ocr.pdfinfo_from_path
     saved_urlopen = _urllib_request.urlopen
-    rm_ocr.convert_from_path = lambda *a, **k: [blank_page_img, content_page_img]
+    rm_ocr.convert_from_path = lambda *a, first_page=1, **k: [_doc_pages[first_page - 1]]
+    rm_ocr.pdfinfo_from_path = lambda *a, **k: {"Pages": len(_doc_pages)}
     _urllib_request.urlopen = fake_urlopen
     try:
         blank_pages = _real_ocr_pdf("fake.pdf", "test-model", 150, 1568)
     finally:
         rm_ocr.convert_from_path = saved_convert
+        rm_ocr.pdfinfo_from_path = saved_pdfinfo
         _urllib_request.urlopen = saved_urlopen
 
     check("skip_blank: OCR call skipped for the blank page (only 1 call made)",
