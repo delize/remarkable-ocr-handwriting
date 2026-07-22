@@ -336,6 +336,64 @@ def main():
           crash_man["remarkable/Work/Zzz.pdf"]["status"], "ok")
     ocr_daemon.ocr_pdf = saved_ocr
 
+    # --- DAILY_NOTE_EMBED: transcripts of date-named sources land in daily notes ---
+    saved_dne, saved_out_dne = ocr_daemon.DAILY_NOTE_EMBED, ocr_daemon.OUT
+    ocr_daemon.DAILY_NOTE_EMBED = True
+    ocr_daemon.OUT = tmp / "vault/transcripts"  # embeds require transcripts INSIDE the vault
+    daily_dir = tmp / "vault/Daily Journal"
+    daily_dir.mkdir(parents=True, exist_ok=True)
+
+    # New note: a date-named source creates the daily note with the embed.
+    (tmp / "vault/remarkable/Work/2026-07-20.pdf").write_text("journal-bytes-v1")
+    check("daily-note embed: date-named source is processed",
+          ocr_daemon.scan_once(ocr_daemon.load_manifest()), 1)
+    note = daily_dir / "2026-07-20.md"
+    embed_line = "![[transcripts/Work/2026-07-20-handwriting_converted]]"
+    check("daily-note embed: missing note is created", note.exists(), True)
+    check("daily-note embed: note embeds the transcript by full vault path",
+          embed_line in note.read_text(), True)
+
+    # Existing note: prose is preserved, section appended, exactly once.
+    note2 = daily_dir / "2026-07-21.md"
+    note2.write_text("morning thoughts\n\nmore prose")
+    (tmp / "vault/remarkable/Work/2026-07-21.pdf").write_text("journal-bytes-v1")
+    ocr_daemon.scan_once(ocr_daemon.load_manifest())
+    check("daily-note embed: existing prose preserved",
+          note2.read_text().startswith("morning thoughts\n\nmore prose"), True)
+    check("daily-note embed: section appended to existing note",
+          "## reMarkable journal" in note2.read_text(), True)
+
+    # Idempotent: re-OCR after a byte change must not duplicate the embed.
+    (tmp / "vault/remarkable/Work/2026-07-21.pdf").write_text("journal-bytes-v2")
+    ocr_daemon.scan_once(ocr_daemon.load_manifest())
+    check("daily-note embed: re-OCR does not duplicate the section",
+          note2.read_text().count("2026-07-21-handwriting_converted"), 1)
+
+    # Non-date sources never touch daily notes.
+    (tmp / "vault/remarkable/Work/NotADate.pdf").write_text("misc-bytes")
+    ocr_daemon.scan_once(ocr_daemon.load_manifest())
+    check("daily-note embed: non-date source creates no note",
+          (daily_dir / "NotADate.md").exists(), False)
+
+    # Transcripts outside the vault can't be transcluded: skip, never crash.
+    ocr_daemon.OUT = saved_out_dne  # back to the outside-the-vault OUT_DIR
+    (tmp / "vault/remarkable/Work/2026-07-22.pdf").write_text("journal-bytes-v1")
+    check("daily-note embed: outside-vault OUT still processes the file",
+          ocr_daemon.scan_once(ocr_daemon.load_manifest()), 1)
+    check("daily-note embed: outside-vault OUT writes no note",
+          (daily_dir / "2026-07-22.md").exists(), False)
+    ocr_daemon.DAILY_NOTE_EMBED = saved_dne
+
+    # Config guard: a daily-note dir inside the source tree is refused at startup.
+    saved_dnd = ocr_daemon.DAILY_NOTE_DIR
+    ocr_daemon.DAILY_NOTE_EMBED, ocr_daemon.DAILY_NOTE_DIR = True, "remarkable/Daily Journal"
+    try:
+        ocr_daemon.assert_safe_paths()
+        check("daily-note embed: DAILY_NOTE_DIR inside SOURCE_SUBDIR is refused", "no exit", "SystemExit")
+    except SystemExit:
+        check("daily-note embed: DAILY_NOTE_DIR inside SOURCE_SUBDIR is refused", "SystemExit", "SystemExit")
+    ocr_daemon.DAILY_NOTE_EMBED, ocr_daemon.DAILY_NOTE_DIR = saved_dne, saved_dnd
+
     # --- rm_strokes unit checks (pure logic, no real .rm bytes needed) ---
     import rm_strokes
 

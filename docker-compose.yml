@@ -33,6 +33,9 @@ services:
       OUT_DIR: /out                 # output base — its own volume (see below)
       OUT_SUFFIX: -handwriting_converted   # Sample.pdf -> Sample-handwriting_converted.md
       # OUT_ALONGSIDE: "1"          # write next to each source PDF instead (needs the vault mounted :rw)
+      # DAILY_NOTE_EMBED: "1"       # embed date-named transcripts into Obsidian daily notes (needs :rw vault + transcripts inside it)
+      # DAILY_NOTE_DIR: "Daily Journal"        # relative to VAULT_DIR, must be outside SOURCE_SUBDIR
+      # DAILY_NOTE_HEADING: "## reMarkable journal"
       STATE_DIR: /state
       MODEL: gemma4:26b
       OLLAMA_HOST: http://ollama:11434

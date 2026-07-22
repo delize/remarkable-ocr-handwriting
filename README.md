@@ -204,6 +204,9 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `SPLIT_MARKER_KEY` | `/RemarkableSplitter` | PDF Info-dict key the splitter stamps |
 | `SPLIT_MARKER_VALUE` | `processed` | Expected marker value |
 | `STROKE_CONTEXT` | `0` | `1` = parse `.rm` stroke geometry into a rough sketch/diagram hint for the OCR prompt + `stroke_regions_flagged` in frontmatter. `.rm`-family sources only; heuristic, not recognition. See [Stroke-assisted OCR context](#stroke-assisted-ocr-context) |
+| `DAILY_NOTE_EMBED` | `0` | `1` = after OCR of a date-named source (`YYYY-MM-DD`), ensure the Obsidian daily note embeds the transcript. See [Daily-note embedding](#daily-note-embedding) |
+| `DAILY_NOTE_DIR` | `Daily Journal` | Daily-notes folder, relative to `VAULT_DIR`. Must be **outside** `SOURCE_SUBDIR` (refused at startup otherwise) |
+| `DAILY_NOTE_HEADING` | `## reMarkable journal` | Heading of the appended section |
 | `LOG_LEVEL` | `INFO` | Set `DEBUG` to log each file's gate decision (see below) |
 
 ### Where transcripts go (3 modes)
@@ -356,6 +359,50 @@ Scope and interactions:
   doesn't need to re-parse the source.
 
 The CLI has the equivalent `--stroke-context` flag.
+
+### Daily-note embedding
+
+`DAILY_NOTE_EMBED=1` (default off) closes the loop for daily journals kept on
+the tablet: after a source whose title is a plain date (`2026-07-20.pdf`) is
+transcribed, the daemon ensures the matching Obsidian daily note
+`<vault>/<DAILY_NOTE_DIR>/2026-07-20.md` contains a section embedding the
+transcript:
+
+```markdown
+## reMarkable journal
+
+![[remarkable/Daily Journal/2026-07-20-hwr]]
+```
+
+It is transclusion, not copying — the note gets one embed line pointing at the
+transcript's **full vault-relative path**, and Obsidian renders the current
+transcript content inline. When you update the page on the tablet and it gets
+re-OCR'd, the note is already up to date; no second write happens.
+
+Safety properties, since this is the one feature that touches human-edited
+files:
+
+- **Append-only.** Existing prose is never rewritten; the section is appended
+  once at the end. Writes go through a temp file + atomic rename, so a crash
+  can never truncate a note.
+- **Idempotent.** A note that already references the transcript path — this
+  section, or a link you wrote yourself — is left alone.
+- **Full-path embeds.** `2026-07-20.md` often exists twice in a vault (the
+  daily note and a sync-tool stub next to the PDF); a bare basename embed
+  would be ambiguous, so the full path is always used.
+- **Missing notes are created** with just the section, so a transcript synced
+  before Obsidian first opens that day still lands.
+- **Config guard.** `DAILY_NOTE_DIR` inside `SOURCE_SUBDIR` is refused at
+  startup — date-named `.md` files in the source tree belong to the sync tool
+  and would be clobbered on its next sync.
+- **Scope guard.** Only titles matching `YYYY-MM-DD` participate; everything
+  else is untouched. An embed failure is logged and never fails or retries the
+  completed transcription.
+
+Requirements: the vault mounted **writable** (like `OUT_ALONGSIDE`), and
+transcripts landing **inside** the vault (`OUT_ALONGSIDE=1`, or `OUT_DIR`
+under the vault mount) — Obsidian can't transclude a file outside the vault,
+so with an external `OUT_DIR` the embed is skipped with a warning.
 
 ### Paragraph reflow
 
