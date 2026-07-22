@@ -569,6 +569,22 @@ def scan_once(man):
             if prev != "pending_split":  # log once on entering the state
                 log.info("pending-split %s (too tall, awaiting splitter)", rel)
             continue
+        # Record the attempt BEFORE OCR runs. ocr_pdf can die by SIGKILL (an OOM
+        # on a big render) or a poppler segfault — a hard crash no try/except can
+        # catch — so a caught exception is NOT the only way this step fails. If we
+        # only bumped retries in the except handler, a hard crash would leave the
+        # manifest untouched, the file would look brand-new on the next restart,
+        # and the daemon would re-attempt the same poison file forever (never
+        # reaching the retry cap, never reaching the files after it). Persisting an
+        # incremented-retry "attempting" marker first makes the crash count, so a
+        # genuinely un-OCR-able file is retry-capped and skipped like any other.
+        st = src.stat()
+        rec = man.setdefault(rel, {})
+        rec.update(mtime=st.st_mtime, size=st.st_size,
+                   sha256=digest if isinstance(digest, str) else rec.get("sha256"),
+                   status="attempting", retries=rec.get("retries", 0) + 1,
+                   attempted_at=datetime.datetime.now().isoformat(timespec="seconds"))
+        save_manifest(man)
         try:
             process_one(src, result, rel, digest, man, page_regions=page_regions)
             done += 1
@@ -577,12 +593,13 @@ def scan_once(man):
             rec["status"] = "error"
             rec["error"] = str(e)
             rec["sha256"] = digest if isinstance(digest, str) else rec.get("sha256")
-            rec["retries"] = rec.get("retries", 0) + 1
+            # retries was already incremented by the pre-attempt marker above;
+            # don't double-count a caught error against the cap.
             st = src.stat()
             rec["mtime"], rec["size"] = st.st_mtime, st.st_size
             save_manifest(man)
-            capped = " (retry cap reached)" if rec["retries"] >= MAX_RETRIES else ""
-            log.error("err %s: %s [attempt %d]%s", rel, e, rec["retries"], capped)
+            capped = " (retry cap reached)" if rec.get("retries", 0) >= MAX_RETRIES else ""
+            log.error("err %s: %s [attempt %d]%s", rel, e, rec.get("retries", 0), capped)
     if skipped_old:
         log.debug("skipped %d file(s) older than %sh", skipped_old, MAX_AGE_HOURS)
     return done
@@ -592,14 +609,21 @@ def print_status(man):
     ok = sum(1 for r in man.values() if r.get("status") == "ok")
     err = sum(1 for r in man.values() if r.get("status") == "error")
     pending = sum(1 for r in man.values() if r.get("status") == "pending_split")
+    # "attempting" persists only when OCR was entered but never finished — i.e. a
+    # hard crash (OOM-kill / segfault) killed the process mid-file. Surfacing it
+    # makes a wedged or retry-capped poison file visible instead of silent.
+    attempting = sum(1 for r in man.values() if r.get("status") == "attempting")
     pages = sum(r.get("pages", 0) for r in man.values() if r.get("status") == "ok")
     print(f"manifest: {MANIFEST}")
-    print(f"  ok={ok}  error={err}  pending_split={pending}  total_pages={pages}")
+    print(f"  ok={ok}  error={err}  pending_split={pending}  attempting={attempting}  total_pages={pages}")
     for rel, r in sorted(man.items()):
         if r.get("status") == "error":
             print(f"  ERROR    {rel}  (retries={r.get('retries', 0)}): {r.get('error', '')}")
         elif r.get("status") == "pending_split":
             print(f"  PENDING  {rel}  (awaiting splitter)")
+        elif r.get("status") == "attempting":
+            capped = " retry-capped" if r.get("retries", 0) >= MAX_RETRIES else ""
+            print(f"  CRASHED  {rel}  (died mid-OCR, retries={r.get('retries', 0)}{capped})")
 
 
 def start_inotify_watcher(src, wake):
