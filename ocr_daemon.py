@@ -97,6 +97,14 @@ MAX_AGE_HOURS = float(os.environ.get("MAX_AGE_HOURS", "24"))
 # its bytes changed (0 = off). Safety net against a source that re-renders
 # non-deterministically (new sha256 every sync) and would otherwise loop forever.
 MIN_REPROCESS_INTERVAL = float(os.environ.get("MIN_REPROCESS_INTERVAL", "0"))
+# Skip documents with more pages than this (0 = no limit). A synced store
+# template or imported book can run to hundreds of pages — days of CPU OCR for
+# content that is rarely handwriting. Counted on the rendered, post-AUTO_SPLIT
+# PDF (what OCR would actually see). The manifest records the count under
+# status=skipped_pages, and the gate re-checks the recorded count against the
+# CURRENT cap, so raising or disabling MAX_PDF_PAGES re-queues those files on
+# the next pass with no touch needed.
+MAX_PDF_PAGES = int(os.environ.get("MAX_PDF_PAGES", "0"))
 # Optional politeness window, e.g. "01:00-07:00". Empty = always run.
 RUN_WINDOW = os.environ.get("RUN_WINDOW", "").strip()
 
@@ -380,6 +388,14 @@ def needs_work(pdf, rel, man):
         if rec.get("status") == "pending_split":
             log.debug("gate=still-pending-split %s (unchanged bytes, awaiting split)", rel)
             return False
+        # Same bytes, previously over the page cap: stay skipped while the
+        # RECORDED count still exceeds the CURRENT cap — raising or disabling
+        # MAX_PDF_PAGES makes this fall through and re-queue automatically.
+        if rec.get("status") == "skipped_pages":
+            if MAX_PDF_PAGES > 0 and rec.get("page_count", 0) > MAX_PDF_PAGES:
+                log.debug("gate=skipped-pages %s (%s pages > cap %d, no OCR)",
+                          rel, rec.get("page_count"), MAX_PDF_PAGES)
+                return False
         # Same bytes, but last attempt errored: respect the retry cap.
         if rec.get("retries", 0) >= MAX_RETRIES:
             log.debug("gate=retry-capped %s (errored %d times, no OCR)", rel, rec.get("retries", 0))
@@ -431,6 +447,12 @@ def write_md(out_md, title, rel, pages, source_modified=None, stroke_regions_fla
         body += [f"## Page {n}", "", text, ""]
     out_md.write_text("\n".join(fm + body))
     return chars
+
+
+def _pdf_page_count(pdf):
+    """Page count of a PDF via pdfinfo (cheap — no rasterization)."""
+    from pdf2image import pdfinfo_from_path  # lazy: stubbed out in the offline self-test
+    return int(pdfinfo_from_path(str(pdf))["Pages"])
 
 
 # ---------------------------------------------------------------------------
@@ -635,6 +657,26 @@ def scan_once(man):
                 save_manifest(man)
                 log.error("err %s: auto-split: %s [attempt %d]", rel, e, rec["retries"])
                 continue
+        # Page cap: refuse documents longer than MAX_PDF_PAGES. Applied to the
+        # rendered, post-split PDF (what OCR would actually chew through), and
+        # recorded with the count so the needs_work gate can re-queue it if the
+        # cap is later raised or removed.
+        if MAX_PDF_PAGES > 0:
+            try:
+                n_pages = _pdf_page_count(pdf_for_ocr)
+            except Exception as e:
+                n_pages = None  # count failure must not block OCR — let it try
+                log.warning("page-count check failed for %s: %s (cap not applied)", rel, e)
+            if n_pages is not None and n_pages > MAX_PDF_PAGES:
+                st = src.stat()
+                prev = man.get(rel, {}).get("status")
+                man[rel] = {"mtime": st.st_mtime, "size": st.st_size, "sha256": digest,
+                            "status": "skipped_pages", "page_count": n_pages,
+                            "checked_at": datetime.datetime.now().isoformat(timespec="seconds")}
+                save_manifest(man)
+                if prev != "skipped_pages":  # log once on entering the state
+                    log.info("skip %s: %d pages > MAX_PDF_PAGES=%d", rel, n_pages, MAX_PDF_PAGES)
+                continue
         # Gate: don't OCR a PDF the splitter hasn't made readable yet. Cheap
         # (reads metadata + page boxes), far cheaper than an OCR run, and only
         # reached for new/changed files. Applied to the rendered PDF — what OCR
@@ -693,9 +735,11 @@ def print_status(man):
     # hard crash (OOM-kill / segfault) killed the process mid-file. Surfacing it
     # makes a wedged or retry-capped poison file visible instead of silent.
     attempting = sum(1 for r in man.values() if r.get("status") == "attempting")
+    skipped = sum(1 for r in man.values() if r.get("status") == "skipped_pages")
     pages = sum(r.get("pages", 0) for r in man.values() if r.get("status") == "ok")
     print(f"manifest: {MANIFEST}")
-    print(f"  ok={ok}  error={err}  pending_split={pending}  attempting={attempting}  total_pages={pages}")
+    print(f"  ok={ok}  error={err}  pending_split={pending}  attempting={attempting}  "
+          f"skipped_pages={skipped}  total_pages={pages}")
     for rel, r in sorted(man.items()):
         if r.get("status") == "error":
             print(f"  ERROR    {rel}  (retries={r.get('retries', 0)}): {r.get('error', '')}")
@@ -704,6 +748,9 @@ def print_status(man):
         elif r.get("status") == "attempting":
             capped = " retry-capped" if r.get("retries", 0) >= MAX_RETRIES else ""
             print(f"  CRASHED  {rel}  (died mid-OCR, retries={r.get('retries', 0)}{capped})")
+        elif r.get("status") == "skipped_pages":
+            print(f"  SKIPPED  {rel}  ({r.get('page_count', '?')} pages > MAX_PDF_PAGES; "
+                  f"raise the cap to re-queue)")
 
 
 def start_inotify_watcher(src, wake):
@@ -871,6 +918,15 @@ def main():
     if DAILY_NOTE_EMBED:
         log.info("DAILY_NOTE_EMBED ON | date-named transcripts embedded into %s/<date>.md (heading=%r)",
                  DAILY_NOTE_DIR, DAILY_NOTE_HEADING)
+        if not (VAULT / DAILY_NOTE_DIR).is_dir():
+            # The embed write would mkdir this path and "succeed" even when the
+            # folder isn't a container mount — landing embeds in the ephemeral
+            # layer where Obsidian never sees them. Loud warning, not fatal.
+            log.warning("daily-note dir %s does not exist — in a container this usually means it "
+                        "is not mounted; embeds would land in the ephemeral layer and be lost",
+                        VAULT / DAILY_NOTE_DIR)
+    if MAX_PDF_PAGES > 0:
+        log.info("MAX_PDF_PAGES=%d | longer documents are skipped (visible via --status)", MAX_PDF_PAGES)
 
     if MODEL_WAIT_TIMEOUT > 0:
         wait_for_model(OLLAMA_HOST, MODEL, MODEL_WAIT_TIMEOUT)
