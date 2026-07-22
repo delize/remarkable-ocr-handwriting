@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import sys
 import time
 
@@ -133,6 +134,22 @@ SPLIT_MAX_SEGMENT_FACTOR = float(os.environ.get("SPLIT_MAX_SEGMENT_FACTOR", "2.0
 # data). Needs rmscene, which is normally already present transitively via rmc.
 STROKE_CONTEXT = _env_bool("STROKE_CONTEXT", False)
 
+# DAILY_NOTE_EMBED (opt-in): after successfully transcribing a source whose
+# title is a plain date (YYYY-MM-DD — the shape a daily-journal tool exports),
+# ensure the matching Obsidian daily note `<VAULT>/<DAILY_NOTE_DIR>/<date>.md`
+# contains a section embedding the transcript. Transclusion, not copying: the
+# note gets one `![[<vault-relative transcript path>]]` line, so when a later
+# re-OCR overwrites the transcript the note's rendered content updates with no
+# further write here. Append-only and idempotent — existing prose is never
+# rewritten, and a note that already references the transcript path (our
+# section or a hand-written link) is left alone. Needs the vault mounted
+# writable, and only works when transcripts land INSIDE the vault
+# (OUT_ALONGSIDE, or OUT under VAULT); an outside-the-vault OUT_DIR can't be
+# transcluded by Obsidian, so the embed is skipped with a warning.
+DAILY_NOTE_EMBED = _env_bool("DAILY_NOTE_EMBED", False)
+DAILY_NOTE_DIR = os.environ.get("DAILY_NOTE_DIR", "Daily Journal")
+DAILY_NOTE_HEADING = os.environ.get("DAILY_NOTE_HEADING", "## reMarkable journal")
+
 # Absolute paths the daemon must NEVER read or write under, no matter what.
 # Comma-separated override via FORBIDDEN_PATHS; default protects the standalone
 # Scrybble container's auth-credential storage in case both tools run on the
@@ -213,6 +230,14 @@ def assert_safe_paths():
     # transcript name can't equal a source/stub name.
     if not OUT_ALONGSIDE and OUT.resolve() == SRC.resolve() and not OUT_SUFFIX:
         raise SystemExit("output dir equals source dir with empty OUT_SUFFIX — would overwrite sources")
+    # Daily notes must live OUTSIDE the synced source tree: `<date>.md` files
+    # inside it belong to the sync tool (e.g. Scrybble stubs) and would be
+    # clobbered on the next sync — and our append would fight that writer.
+    if DAILY_NOTE_EMBED:
+        daily_dir = (VAULT / DAILY_NOTE_DIR).resolve()
+        if daily_dir == SRC.resolve() or SRC.resolve() in daily_dir.parents:
+            raise SystemExit("DAILY_NOTE_DIR must be outside SOURCE_SUBDIR "
+                             "(date-named .md files in the source tree belong to the sync tool)")
 
 
 def safe_output_path(src, title=None, *, source_sha256=None):
@@ -409,6 +434,56 @@ def write_md(out_md, title, rel, pages, source_modified=None, stroke_regions_fla
 
 
 # ---------------------------------------------------------------------------
+# Daily-note embed (opt-in, DAILY_NOTE_EMBED)
+# ---------------------------------------------------------------------------
+_DAILY_NOTE_TITLE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def embed_in_daily_note(out_md, title):
+    """Ensure the Obsidian daily note for a date-named source embeds its transcript.
+
+    Returns True if the note was written (created or appended to), False for
+    every no-op or skip. The embed uses the transcript's FULL vault-relative
+    path — a bare basename would be ambiguous in vaults where `<date>.md`
+    exists both as a daily note and as a sync-tool stub. The idempotency check
+    is that same path string, so a hand-written link to the transcript also
+    counts as "already embedded". Writes go through a temp file + os.replace,
+    so a crash mid-write can never truncate a human's daily note.
+    """
+    if not _DAILY_NOTE_TITLE.match(title):
+        return False
+    try:
+        target = str(out_md.resolve().relative_to(VAULT.resolve()))
+    except ValueError:
+        log.warning("daily-note embed: transcript %s is outside the vault — "
+                    "Obsidian can't transclude it, skipping", out_md)
+        return False
+    if target.endswith(".md"):
+        target = target[: -len(".md")]
+    note = (VAULT / DAILY_NOTE_DIR / f"{title}.md").resolve()
+    for forbidden in FORBIDDEN_PREFIXES:
+        if str(note) == forbidden or str(note).startswith(forbidden.rstrip("/") + "/"):
+            log.warning("daily-note embed: %s under forbidden prefix, skipping", note)
+            return False
+    if VAULT.resolve() not in note.parents:
+        log.warning("daily-note embed: %s escapes the vault, skipping", note)
+        return False
+    text = note.read_text() if note.exists() else ""
+    if target in text:
+        return False  # already embedded (or hand-linked) — never duplicate
+    section = f"{DAILY_NOTE_HEADING}\n\n![[{target}]]\n"
+    new_text = (text.rstrip("\n") + "\n\n" if text.strip() else "") + section
+    note.parent.mkdir(parents=True, exist_ok=True)
+    tmp = note.with_name(note.name + ".rm-embed.tmp")
+    tmp.write_text(new_text)
+    tmp.replace(note)
+    # note is resolved; compare against the resolved vault too (macOS tmp dirs
+    # are symlinks, /var -> /private/var, and the unresolved form would throw).
+    log.info("daily-note embed: ![[%s]] -> %s", target, note.relative_to(VAULT.resolve()))
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Scan / process
 # ---------------------------------------------------------------------------
 def in_run_window():
@@ -477,6 +552,11 @@ def process_one(src, result, rel, digest, man, page_regions=None):
     man[rel] = entry
     save_manifest(man)
     log.info("ok %s -> %s (%dp, %d chars)", rel, out_md.name, len(pages), sum(chars))
+    if DAILY_NOTE_EMBED:
+        try:  # an embed failure must never fail (or retry) a completed transcription
+            embed_in_daily_note(out_md, result.title)
+        except Exception as e:
+            log.warning("daily-note embed failed for %s: %s", rel, e)
 
 
 def scan_once(man):
@@ -788,6 +868,9 @@ def main():
                  SPLIT_MARKER_KEY, SPLIT_MARKER_VALUE, SPLIT_MAX_ASPECT)
     if STROKE_CONTEXT:
         log.info("STROKE_CONTEXT ON | stroke-region hints for .rm-family sources (heuristic, not recognition)")
+    if DAILY_NOTE_EMBED:
+        log.info("DAILY_NOTE_EMBED ON | date-named transcripts embedded into %s/<date>.md (heading=%r)",
+                 DAILY_NOTE_DIR, DAILY_NOTE_HEADING)
 
     if MODEL_WAIT_TIMEOUT > 0:
         wait_for_model(OLLAMA_HOST, MODEL, MODEL_WAIT_TIMEOUT)
