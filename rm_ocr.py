@@ -3,11 +3,12 @@
 rm_ocr.py — transcribe handwriting with a local Qwen3-VL via Ollama.
 
 Accepts ANY of:
-  - a single .pdf, .zip, .rmdoc, or .rm file
+  - a single .pdf, .zip, .rmdoc, .rm, .png, .jpg, .jpeg, or .webp file
   - a directory containing any mix of the above (searched recursively)
 
 Bundles (.zip / .rmdoc) and loose pages (.rm) are rendered to PDF via the
-shared rm_render module (which shells out to `rmc`). PDFs are processed as-is.
+shared rm_render module (which shells out to `rmc`). Images are wrapped into a
+one-page PDF by the same module. PDFs are processed as-is.
 
 Setup (macOS, Apple Silicon):
   brew install ollama poppler
@@ -266,7 +267,8 @@ def gather(input_path, work, cache_dir=None, extract_regions=False):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("input", help="A .pdf, .zip, .rmdoc, or .rm file, or a folder containing any mix of those")
+    ap.add_argument("input", help="A .pdf, .zip, .rmdoc, .rm, .png, .jpg, .jpeg or .webp file, "
+                                  "or a folder containing any mix of those")
     ap.add_argument("--out", default=None, help="Output dir (default: ./ocr_out)")
     ap.add_argument("--model", default="qwen3-vl:8b")
     ap.add_argument("--dpi", type=int, default=150)
@@ -302,7 +304,8 @@ def main():
         items = gather(input_path, pathlib.Path(tmp), cache_dir=cache_dir,
                        extract_regions=args.stroke_context)
         if not items:
-            sys.exit(f"Nothing to OCR under {input_path} (no .pdf / .zip / .rmdoc / .rm found).")
+            supported = " / ".join(sorted(rm_render.SUPPORTED_INPUT_SUFFIXES))
+            sys.exit(f"Nothing to OCR under {input_path} (no {supported} found).")
         print(f"{len(items)} document(s). model={args.model} dpi={args.dpi}\nout: {out}\n")
         for title, pdf, page_regions in items:
             title = _safe(title)

@@ -601,7 +601,8 @@ def scan_once(man):
         digest = needs_work(src, rel, man)
         if digest is False:
             continue
-        # Render: passthrough for .pdf; rmc + pdfunite for .zip/.rmdoc/.rm.
+        # Render: passthrough for .pdf; rmc + pdfunite for .zip/.rmdoc/.rm;
+        # a one-page wrap for .png/.jpg/.jpeg/.webp.
         # Cached under STATE/rendered, keyed by source bytes hash, so a re-
         # extracted-but-byte-identical bundle never re-renders.
         try:
@@ -753,6 +754,9 @@ def print_status(man):
                   f"raise the cap to re-queue)")
 
 
+_INPUT_SUFFIX_TUPLE = tuple(sorted(rm_render.SUPPORTED_INPUT_SUFFIXES))
+
+
 def start_inotify_watcher(src, wake):
     """Spawn a daemon thread that sets `wake` when a supported input file event fires under `src`.
 
@@ -810,8 +814,10 @@ def start_inotify_watcher(src, wake):
                 if ev.mask & flags.CREATE and ev.mask & flags.ISDIR and ev.name:
                     add_dir(base / ev.name)
                     continue
-                # File-level event on a *.pdf → fire the wake.
-                if ev.name and ev.name.lower().endswith((".pdf", ".zip", ".rmdoc", ".rm")):
+                # File-level event on a supported input → fire the wake. Derived
+                # from rm_render rather than hardcoded, so a new input type can
+                # never be silently poll-only.
+                if ev.name and ev.name.lower().endswith(_INPUT_SUFFIX_TUPLE):
                     log.debug("inotify wake: %s/%s (mask=0x%x)", base, ev.name, ev.mask)
                     wake.set()
 
