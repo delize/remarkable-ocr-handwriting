@@ -188,6 +188,8 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `DPI` | `150` | Raising alone does nothing (downscaled to `MAX_PX`) |
 | `MAX_PX` | `1568` | The real quality/time lever |
 | `TIMEOUT` | `1800` | Per-page socket timeout |
+| `VISION_CHECK` | `1` | Startup gate: prove the model actually **receives** the images. A runner that drops them makes the model invent a fluent transcript that looks successful. See [The vision gate](#the-vision-gate) |
+| `VISION_CHECK_MIN_TOKENS` | `200` | Minimum extra prompt tokens an attached image must cost. A real image costs ~1000+; a dropped one costs a handful |
 | `NUM_CTX` | `0` | Model context window in tokens (`0` = Ollama's default of 4096). A page image alone costs ~1800, so a model that reasons first can run out and return **nothing**. **Set `16384` for real handwriting** — dense pages exhaust 4096 even with `IMAGE_AUTOCONTRAST` on. Costs VRAM |
 | `MODEL_WAIT_TIMEOUT` | `1800` | Block at startup until the model is loadable on `OLLAMA_HOST`. `0` disables the gate (see [Startup readiness gate](#startup-readiness-gate)) |
 | `INTERVAL` | `600` | Poll seconds — the latency floor; an inotify event short-circuits this |
@@ -333,6 +335,37 @@ and page boxes — far cheaper than an OCR run, and only runs for new/changed fi
 This gate is **off by default** (the tool works fine without the splitter) and
 requires `pypdf` (already in the image / `requirements.txt`); rm-ocr refuses to
 start with `REQUIRE_SPLIT=1` if `pypdf` is missing.
+
+### The vision gate
+
+The daemon refuses to start if the model does not actually **receive** the
+images it is sent. This guards the worst failure the tool can have.
+
+Some Ollama runners accept an `images=` payload, silently discard it, and let
+the model answer from the text prompt alone. Measured on Ollama 0.32.0's MLX
+runner: `gemma4:12b-mlx` was handed a page of handwriting and returned a fluent
+essay about 19th-century American industrialisation, repeated verbatim for
+pages 1 and 2, written out under `status: ok` with 3416 chars. Nothing about
+that transcript looks wrong — which is exactly the problem. **Silent
+fabrication in a journal is far worse than a visible failure**, because you have
+no reason to doubt it.
+
+The check compares prompt token counts with and without an image attached, so
+it tests whether the image *arrives*, not whether the model is any good at
+reading it:
+
+| model | no image | with image | verdict |
+|---|---|---|---|
+| `qwen3-vl:8b` | 24 | **1106** | sees it |
+| `gemma4:12b-mlx` | 30 | **35** | drops it |
+
+It costs two 1-token generations at startup. If it can't run (server
+unreachable, odd response) it warns and continues rather than blocking startup
+on an unrelated fault. `VISION_CHECK=0` disables it, which is not recommended:
+the failure it catches is invisible in the output.
+
+Note this is about the *runner*, not the model family — the same model in GGUF
+form on the llama.cpp runner handles images normally.
 
 ### Image inputs
 
