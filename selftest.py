@@ -602,6 +602,39 @@ def main():
               page_size(rm_render._render_image(webp_src, img_dir)[0])[0],
               round(rm_render.IMAGE_PAGE_WIDTH_PT, 1))
 
+        # Faint ink is stretched toward true black. This is the difference
+        # between a transcript and an empty page: a real reMarkable page whose
+        # darkest pixel was 192 made qwen3-vl:8b reason until it ran out of
+        # context and returned nothing, where the normalized page transcribed
+        # correctly inside the default context.
+        def darkest_in_pdf(pdf_path):
+            return _PdfReader(str(pdf_path)).pages[0].images[0].image.convert("L").getextrema()[0]
+
+        faint_src = img_dir / "faint.png"
+        faint = _Img.new("L", (600, 800), 255)
+        for y in range(100, 700, 40):          # light-grey "ink" on white paper
+            for x in range(60, 540):
+                faint.putpixel((x, y), 205)
+        faint.convert("RGB").save(faint_src)
+        check("faint source really is faint", faint.getextrema()[0], 205)
+        check("autocontrast pushes faint ink toward black",
+              darkest_in_pdf(rm_render._render_image(faint_src, img_dir)[0]) < 60, True)
+
+        saved_ac = rm_render.IMAGE_AUTOCONTRAST
+        rm_render.IMAGE_AUTOCONTRAST = False
+        off_dir = img_dir / "ac_off"
+        off_dir.mkdir()
+        check("IMAGE_AUTOCONTRAST=0 leaves the faint original alone",
+              darkest_in_pdf(rm_render._render_image(faint_src, off_dir)[0]) > 150, True)
+        rm_render.IMAGE_AUTOCONTRAST = saved_ac
+
+        # It must not manufacture ink out of a blank page, or JPEG noise would
+        # become "strokes" and the blank-page skip would stop firing.
+        blank_src = img_dir / "blank.png"
+        _Img.new("RGB", (600, 800), "white").save(blank_src)
+        check("autocontrast leaves a blank page blank",
+              darkest_in_pdf(rm_render._render_image(blank_src, img_dir)[0]) > 250, True)
+
         # A truncated/garbage image is a recognized ValueError, not a crash, so
         # the daemon records status=error and moves on.
         bad_src = img_dir / "corrupt.png"

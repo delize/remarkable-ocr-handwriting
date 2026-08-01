@@ -74,6 +74,18 @@ IMAGE_JPEG_QUALITY = int(os.environ.get("IMAGE_JPEG_QUALITY", "92"))
 # phone photo on a small container. A 445 pt page rasterized at DPI=254 is
 # ~1570 px, so 2000 is already more source detail than OCR can consume.
 IMAGE_MAX_WIDTH_PX = int(os.environ.get("IMAGE_MAX_WIDTH_PX", "2000"))
+# Stretch the tonal range so faint ink reaches true black and paper true white.
+# This is not cosmetic. A real reMarkable page whose darkest pixel was 192 sent
+# qwen3-vl:8b into 18k characters of reasoning about ambiguous strokes until it
+# exhausted the context and returned NOTHING. The same page normalized answered
+# correctly, inside the default 4096 context, with a third of the reasoning and
+# in half the time. Pillow's autocontrast is a no-op on already-crisp scans and
+# leaves a blank page white, so it is safe to leave on.
+IMAGE_AUTOCONTRAST = os.environ.get("IMAGE_AUTOCONTRAST", "1").strip().lower() not in (
+    "0", "false", "no", "off", "")
+# Percent of the histogram clipped at each end before stretching. Too large and
+# genuine light-grey pencil gets crushed to white along with the paper.
+IMAGE_AUTOCONTRAST_CUTOFF = float(os.environ.get("IMAGE_AUTOCONTRAST_CUTOFF", "0.5"))
 
 
 class RenderResult(NamedTuple):
@@ -331,6 +343,13 @@ def _render_image(src, workdir):
             elif im.mode != "RGB":
                 im = im.convert("RGB")   # P, CMYK JPEG, 16-bit PNG, ...
             if im.mode != "1":
+                if IMAGE_AUTOCONTRAST:
+                    # preserve_tone drives the stretch off luminance and applies
+                    # it to every channel alike, so coloured ink keeps its hue
+                    # instead of drifting the way per-channel autocontrast does.
+                    im = ImageOps.autocontrast(
+                        im, cutoff=(IMAGE_AUTOCONTRAST_CUTOFF, IMAGE_AUTOCONTRAST_CUTOFF),
+                        preserve_tone=True)
                 save_kwargs["quality"] = IMAGE_JPEG_QUALITY
             im.save(out_pdf, format="PDF",
                     resolution=im.width * 72.0 / IMAGE_PAGE_WIDTH_PT,
