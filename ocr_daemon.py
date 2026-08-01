@@ -14,6 +14,7 @@ Modes:
 All configuration is via environment variables (see the table in the brief / README).
 """
 import argparse
+import base64
 import datetime
 import hashlib
 import json
@@ -78,6 +79,23 @@ REFLOW_PARAGRAPHS = _env_bool("REFLOW_PARAGRAPHS", True)
 DPI = int(os.environ.get("DPI", "150"))
 MAX_PX = int(os.environ.get("MAX_PX", "1568"))
 TIMEOUT = int(os.environ.get("TIMEOUT", "1800"))
+# Context window for the model, in tokens (0 = leave it to Ollama, which
+# defaults to 4096). A full-page image alone costs roughly 1800 of those, so a
+# model that reasons before answering can burn the rest of the window and get
+# cut off mid-thought, returning NOTHING. Measured on qwen3-vl:8b against a real
+# faint reMarkable page: 4096 -> 0 chars on every page, 16384 -> a correct
+# transcript. Costs VRAM, so it is opt-in rather than defaulted.
+NUM_CTX = int(os.environ.get("NUM_CTX", "0"))
+# Startup gate: prove the model actually RECEIVES the images we send. A runner
+# that drops them silently (Ollama 0.32.0's MLX runner does) makes the model
+# answer from the prompt alone and invent a fluent transcript that looks
+# perfectly successful. Compares prompt token counts across two image SIZES, so
+# it tests delivery rather than OCR skill. Costs three 1-token generates.
+VISION_CHECK = _env_bool("VISION_CHECK", True)
+# Minimum extra prompt tokens a 1024x1024 image must cost over a 64x64 one.
+# Measured growth: qwen3.5:9b 1015, gemma4:26b 207; a runner that drops images
+# shows ~0. 64 sits an order of magnitude clear of the failure case.
+VISION_CHECK_MIN_TOKENS = int(os.environ.get("VISION_CHECK_MIN_TOKENS", "64"))
 INTERVAL = int(os.environ.get("INTERVAL", "600"))
 # Inotify wake-up signal layered on top of the poll. The poll stays as a
 # correctness floor (so a missed event never strands a file forever), but a
@@ -458,11 +476,49 @@ def _pdf_page_count(pdf):
 # ---------------------------------------------------------------------------
 # Daily-note embed (opt-in, DAILY_NOTE_EMBED)
 # ---------------------------------------------------------------------------
-_DAILY_NOTE_TITLE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# A daily-journal source is titled either `YYYY-MM-DD` (one file per day) or
+# `YYYY-MM-DD-P<n>` (one file per PAGE of that day, the shape a multi-page photo
+# or per-page export produces). Both route to the same `<date>.md` daily note;
+# the page suffix only distinguishes the transcripts from each other.
+_DAILY_NOTE_TITLE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:-P\d+)?$", re.IGNORECASE)
+
+
+def _insert_into_section(text, heading, link_line):
+    """Append `link_line` inside `heading`'s existing section, or add the section.
+
+    Multi-page days (`<date>-P001`, `-P002`, ...) embed one link per page into
+    the SAME note, so a plain append would stack a duplicate heading per page.
+    When the heading is already there the link joins that section instead, which
+    also keeps the pages contiguous and in processing order (P001 before P002).
+    Anything the human wrote after the section is left where it is.
+    """
+    if not text.strip() or heading not in text:
+        section = f"{heading}\n\n{link_line}\n"
+        return (text.rstrip("\n") + "\n\n" if text.strip() else "") + section
+
+    lines = text.split("\n")
+    start = next(i for i, ln in enumerate(lines) if ln.strip() == heading.strip())
+    level = len(heading) - len(heading.lstrip("#"))
+    end = len(lines)
+    if level:  # a real markdown heading — its section ends at the next same-or-higher one
+        for i in range(start + 1, len(lines)):
+            stripped = lines[i].lstrip()
+            if stripped.startswith("#"):
+                if len(stripped) - len(stripped.lstrip("#")) <= level:
+                    end = i
+                    break
+    tail = end
+    while tail > start + 1 and not lines[tail - 1].strip():
+        tail -= 1  # step back over blank lines so the link lands with its siblings
+    lines[tail:tail] = [link_line]
+    return "\n".join(lines)
 
 
 def embed_in_daily_note(out_md, title):
     """Ensure the Obsidian daily note for a date-named source embeds its transcript.
+
+    Accepts `YYYY-MM-DD` and `YYYY-MM-DD-P<n>` titles; both target the same
+    `<date>.md` note, so every page of a multi-page day lands in one place.
 
     Returns True if the note was written (created or appended to), False for
     every no-op or skip. The embed uses the transcript's FULL vault-relative
@@ -472,8 +528,10 @@ def embed_in_daily_note(out_md, title):
     counts as "already embedded". Writes go through a temp file + os.replace,
     so a crash mid-write can never truncate a human's daily note.
     """
-    if not _DAILY_NOTE_TITLE.match(title):
+    matched = _DAILY_NOTE_TITLE.match(title)
+    if not matched:
         return False
+    note_date = matched.group(1)
     try:
         target = str(out_md.resolve().relative_to(VAULT.resolve()))
     except ValueError:
@@ -482,7 +540,7 @@ def embed_in_daily_note(out_md, title):
         return False
     if target.endswith(".md"):
         target = target[: -len(".md")]
-    note = (VAULT / DAILY_NOTE_DIR / f"{title}.md").resolve()
+    note = (VAULT / DAILY_NOTE_DIR / f"{note_date}.md").resolve()
     for forbidden in FORBIDDEN_PREFIXES:
         if str(note) == forbidden or str(note).startswith(forbidden.rstrip("/") + "/"):
             log.warning("daily-note embed: %s under forbidden prefix, skipping", note)
@@ -493,8 +551,7 @@ def embed_in_daily_note(out_md, title):
     text = note.read_text() if note.exists() else ""
     if target in text:
         return False  # already embedded (or hand-linked) — never duplicate
-    section = f"{DAILY_NOTE_HEADING}\n\n![[{target}]]\n"
-    new_text = (text.rstrip("\n") + "\n\n" if text.strip() else "") + section
+    new_text = _insert_into_section(text, DAILY_NOTE_HEADING, f"![[{target}]]")
     note.parent.mkdir(parents=True, exist_ok=True)
     tmp = note.with_name(note.name + ".rm-embed.tmp")
     tmp.write_text(new_text)
@@ -544,7 +601,7 @@ def process_one(src, result, rel, digest, man, page_regions=None):
     source_modified = _iso_mtime(st)             # last-modified of the source file
     pages = ocr_pdf(result.pdf, MODEL, DPI, MAX_PX, timeout=TIMEOUT, threads=THREADS,
                     no_think=NO_THINK, skip_blank=SKIP_BLANK_PAGES, page_regions=page_regions,
-                    reflow=REFLOW_PARAGRAPHS)
+                    reflow=REFLOW_PARAGRAPHS, num_ctx=NUM_CTX)
     stroke_regions_flagged = sum(
         rm_strokes.summarize(regions)["likely_drawing_regions"] for regions in page_regions
     ) if page_regions else None
@@ -601,7 +658,8 @@ def scan_once(man):
         digest = needs_work(src, rel, man)
         if digest is False:
             continue
-        # Render: passthrough for .pdf; rmc + pdfunite for .zip/.rmdoc/.rm.
+        # Render: passthrough for .pdf; rmc + pdfunite for .zip/.rmdoc/.rm;
+        # a one-page wrap for .png/.jpg/.jpeg/.webp.
         # Cached under STATE/rendered, keyed by source bytes hash, so a re-
         # extracted-but-byte-identical bundle never re-renders.
         try:
@@ -753,6 +811,9 @@ def print_status(man):
                   f"raise the cap to re-queue)")
 
 
+_INPUT_SUFFIX_TUPLE = tuple(sorted(rm_render.SUPPORTED_INPUT_SUFFIXES))
+
+
 def start_inotify_watcher(src, wake):
     """Spawn a daemon thread that sets `wake` when a supported input file event fires under `src`.
 
@@ -810,14 +871,110 @@ def start_inotify_watcher(src, wake):
                 if ev.mask & flags.CREATE and ev.mask & flags.ISDIR and ev.name:
                     add_dir(base / ev.name)
                     continue
-                # File-level event on a *.pdf → fire the wake.
-                if ev.name and ev.name.lower().endswith((".pdf", ".zip", ".rmdoc", ".rm")):
+                # File-level event on a supported input → fire the wake. Derived
+                # from rm_render rather than hardcoded, so a new input type can
+                # never be silently poll-only.
+                if ev.name and ev.name.lower().endswith(_INPUT_SUFFIX_TUPLE):
                     log.debug("inotify wake: %s/%s (mask=0x%x)", base, ev.name, ev.mask)
                     wake.set()
 
     t = threading.Thread(target=loop, name="rm-ocr-inotify", daemon=True)
     t.start()
     return t
+
+
+def _probe_png(side):
+    """A `side`x`side` PNG as raw bytes, built with the standard library only.
+
+    Deliberately not Pillow. The gate has to be exercisable by selftest.py,
+    which CI runs on a bare interpreter with no third-party packages
+    installed — importing Pillow here is what made the self-test fail to even
+    start. Encoding a solid image is a dozen lines, so the dependency buys
+    nothing.
+
+    A white field under a black bar: some encoders special-case a perfectly
+    uniform image, and a real edge keeps the probe representative of a page.
+    """
+    import struct
+    import zlib
+
+    def chunk(tag, payload):
+        body = tag + payload
+        return (struct.pack(">I", len(payload)) + body
+                + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
+
+    # 8-bit truecolour (colour type 2) — the most broadly accepted PNG flavour.
+    ihdr = struct.pack(">IIBBBBB", side, side, 8, 2, 0, 0, 0)
+    bar = max(1, side // 8)
+    black, white = b"\x00" * (side * 3), b"\xff" * (side * 3)
+    # Each scanline is prefixed with filter type 0 (None).
+    raw = b"".join(b"\x00" + (black if y < bar else white) for y in range(side))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
+def assert_model_sees_images(host, model, min_image_tokens=64):
+    """Refuse to start if `model` silently ignores the images we send it.
+
+    This guards the worst failure this tool can have. Some Ollama runners accept
+    an ``images=`` payload, drop it, and answer from the text prompt alone —
+    measured on gemma4:12b-mlx under Ollama 0.32.0, which served a page of
+    handwriting as a confident, fluent essay about 19th-century America and
+    repeated it verbatim for every page. Nothing about that output looks wrong:
+    it is well-formed prose under ``status: ok``. Silent fabrication in a
+    journal is far worse than a visible failure.
+
+    The signal is how prompt cost GROWS with image area, not the answer, so it
+    does not depend on the model being any good at OCR — only on the image
+    arriving. Comparing two sizes rather than image-vs-no-image matters twice
+    over:
+
+      * Token cost per image is wildly tokenizer-dependent. A 64x64 probe costs
+        qwen3.5:9b 11 tokens and gemma4:26b 51 — both fully vision-capable, both
+        of which an absolute "+200 tokens" threshold rejects as broken. Only
+        qwen3-vl:8b's fixed-tile encoder charges ~1000 for a thumbnail.
+      * Differencing two sizes cancels any constant. A runner that adds a fixed
+        "image mode" preamble without encoding pixels cannot fake growth.
+
+    Measured 64x64 -> 1024x1024 growth: qwen3.5:9b 30 -> 1045 (+1015),
+    gemma4:26b 71 -> 278 (+207). A runner that drops images stays flat.
+    """
+    import urllib.request
+
+    def prompt_tokens(images):
+        body = {"model": model, "prompt": "What text is in this image?",
+                "stream": False, "options": {"num_predict": 1}}
+        if images:
+            body["images"] = images
+        req = urllib.request.Request(
+            host + "/api/generate", data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=300) as r:
+            return json.loads(r.read()).get("prompt_eval_count") or 0
+
+    def b64_png(side):
+        return base64.b64encode(_probe_png(side)).decode()
+
+    try:
+        without = prompt_tokens(None)
+        small = prompt_tokens([b64_png(64)])
+        large = prompt_tokens([b64_png(1024)])
+    except Exception as e:
+        log.warning("vision check could not run (%s) — continuing unguarded", e)
+        return
+    growth = large - small
+    log.info("vision check: %s prompt tokens %d none / %d at 64px / %d at 1024px "
+             "(+%d for area)", model, without, small, large, growth)
+    if growth < min_image_tokens:
+        raise SystemExit(
+            f"model {model!r} on {host} appears to IGNORE images: growing the "
+            f"image from 64x64 to 1024x1024 changed the prompt from {small} to "
+            f"{large} tokens (expected at least +{min_image_tokens}).\n"
+            "It would answer from the prompt alone and write confident, "
+            "entirely FABRICATED transcripts that look successful. Measured on "
+            "gemma4:12b-mlx, whose MLX runner drops images silently.\n"
+            "Use a model served by a vision-capable runner, or set "
+            "VISION_CHECK=0 to skip this gate (not recommended).")
 
 
 def wait_for_model(host, model, timeout):
@@ -932,6 +1089,11 @@ def main():
         wait_for_model(OLLAMA_HOST, MODEL, MODEL_WAIT_TIMEOUT)
     else:
         log.info("MODEL_WAIT_TIMEOUT=0, skipping startup readiness gate")
+    if VISION_CHECK:
+        assert_model_sees_images(OLLAMA_HOST, MODEL, VISION_CHECK_MIN_TOKENS)
+    else:
+        log.warning("VISION_CHECK=0 — not verifying the model actually receives "
+                    "images; a runner that drops them writes fabricated transcripts")
 
     if args.scan:
         n = scan_once(load_manifest())

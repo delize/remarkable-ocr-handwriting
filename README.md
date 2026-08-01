@@ -9,11 +9,13 @@ Automatically transcribes any new or changed reMarkable PDF dropped into a
 watched directory — into searchable Markdown, **fully local on your device**. No
 manual step.
 
-The input side accepts any of **`.pdf`**, **`.zip`**, **`.rmdoc`**, or loose
-**`.rm`** files (any mix, in nested folders). PDFs pass through directly;
-bundles and loose pages are rendered to PDF via `rmc` first and cached under
-`STATE_DIR/rendered/` so a re-extracted-but-byte-identical bundle never re-
-renders. The reference setup uses [Scrybble](https://scrybble.ink) to sync
+The input side accepts any of **`.pdf`**, **`.zip`**, **`.rmdoc`**, loose
+**`.rm`**, or an image (**`.png`**, **`.jpg`**, **`.jpeg`**, **`.webp`**) files
+(any mix, in nested folders). PDFs pass through directly; bundles and loose
+pages are rendered to PDF via `rmc` first, images are wrapped into a one-page
+PDF, and both are cached under `STATE_DIR/rendered/` so a re-extracted-but-
+byte-identical source never re-renders. See [Image inputs](#image-inputs) for
+what a photo or screenshot goes through. The reference setup uses [Scrybble](https://scrybble.ink) to sync
 reMarkable notes into an Obsidian vault, but anything that drops one of those
 formats on disk works just as well — `rmapi`/`rmapy` downloads, the reMarkable
 desktop app's export folder, a `Syncthing`/`rsync`'d directory, or a manual drop.
@@ -25,7 +27,7 @@ because Obsidian indexes the Markdown for search.
 - `ocr_daemon.py` — the automation: scanner, change-detection manifest, transcript
   writer, and the polling loop. Built *around* the core, not a rewrite of it.
 - `rm_render.py` — shared rendering layer: dispatches `.pdf` / `.zip` / `.rmdoc` /
-  `.rm` inputs to a PDF ready for OCR. Used by both the daemon and the CLI.
+  `.rm` / image inputs to a PDF ready for OCR. Used by both the daemon and the CLI.
 - `rm_split.py` — vendored `AUTO_SPLIT` implementation (whitespace-band splitter).
 - `selftest.py` — offline test harness (stubs Ollama + poppler + the renderer; zero deps).
 
@@ -180,15 +182,18 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `MODEL` | `gemma4:26b` | Vision-capable; larger model, expect slower per-page than a 9B |
 | `OLLAMA_HOST` | `http://ollama:11434` | |
 | `THREADS` | `14` | cgroup under-detection workaround |
-| `NO_THINK` | `1` | **Required** — thinking ON = unusable |
+| `NO_THINK` | `1` | Asks the model to skip its reasoning trace. **Some models ignore it** (`qwen3-vl:8b` measured: identical reasoning with and without), so it is a request, not a guarantee — see `NUM_CTX` |
 | `SKIP_BLANK_PAGES` | `1` | `1` = skip the OCR call for a genuinely blank page (writes `[blank page]` instead). Small vision models tend to answer blank pages with refusal-style prose otherwise |
 | `REFLOW_PARAGRAPHS` | `1` | `1` = join word-wrapped lines into flowing paragraphs. Post-processing on the model's own transcription, not a re-transcription — see [Paragraph reflow](#paragraph-reflow) |
 | `DPI` | `150` | Raising alone does nothing (downscaled to `MAX_PX`) |
 | `MAX_PX` | `1568` | The real quality/time lever |
 | `TIMEOUT` | `1800` | Per-page socket timeout |
+| `VISION_CHECK` | `1` | Startup gate: prove the model actually **receives** the images. A runner that drops them makes the model invent a fluent transcript that looks successful. See [The vision gate](#the-vision-gate) |
+| `VISION_CHECK_MIN_TOKENS` | `64` | Minimum extra prompt tokens a 1024×1024 image must cost over a 64×64 one. Measured growth: `qwen3.5:9b` +1015, `gemma4:26b` +207; a runner that drops images stays flat |
+| `NUM_CTX` | `0` | Model context window in tokens (`0` = Ollama's default of 4096). A page image alone costs ~1800, so a model that reasons first can run out and return **nothing**. **Set `16384` for real handwriting** — dense pages exhaust 4096 even with `IMAGE_AUTOCONTRAST` on. Costs VRAM |
 | `MODEL_WAIT_TIMEOUT` | `1800` | Block at startup until the model is loadable on `OLLAMA_HOST`. `0` disables the gate (see [Startup readiness gate](#startup-readiness-gate)) |
 | `INTERVAL` | `600` | Poll seconds — the latency floor; an inotify event short-circuits this |
-| `INOTIFY` | `1` | `1` = wake immediately on `CLOSE_WRITE` / `MOVED_TO` for `*.pdf` under `SOURCE_SUBDIR` (Linux only; falls back to pure poll if unavailable). See [Inotify wake-up](#inotify-wake-up) |
+| `INOTIFY` | `1` | `1` = wake immediately on `CLOSE_WRITE` / `MOVED_TO` for any supported input under `SOURCE_SUBDIR` (Linux only; falls back to pure poll if unavailable). See [Inotify wake-up](#inotify-wake-up) |
 | `HASH_CHECK` | `1` | `1` = sha256 content detection (authoritative); `0` = last-modified (mtime) detection — cheaper, but re-OCRs on touch-only changes |
 | `MAX_AGE_HOURS` | `24` | Only consider PDFs modified within this window; `0` = no limit |
 | `MAX_PDF_PAGES` | `0` | Skip documents with more rendered pages than this (`0` = no limit). Counted post-`AUTO_SPLIT`; skipped files show as `SKIPPED` in `--status` and re-queue automatically if the cap is raised |
@@ -204,8 +209,13 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `SPLIT_MAX_ASPECT` | `2.0` | Page height/width above which a PDF is "too tall" — splits it (AUTO_SPLIT) or holds it (REQUIRE_SPLIT). Match the splitter's `MIN_ASPECT_RATIO` |
 | `SPLIT_MARKER_KEY` | `/RemarkableSplitter` | PDF Info-dict key the splitter stamps |
 | `SPLIT_MARKER_VALUE` | `processed` | Expected marker value |
+| `IMAGE_PAGE_WIDTH_PT` | `445` | Page width, in PDF points, that every image input is normalized to (height follows the aspect ratio). About one reMarkable page, so the `SPLIT_*` tuning applies to photos unchanged. See [Image inputs](#image-inputs) |
+| `IMAGE_JPEG_QUALITY` | `92` | Quality of the JPEG embedded in the wrapper PDF. Ignored for bilevel scans, which stay on lossless CCITT |
+| `IMAGE_MAX_WIDTH_PX` | `2000` | Downscale image inputs wider than this before embedding (aspect preserved). Guards the decode against a 50 MP phone photo |
+| `IMAGE_AUTOCONTRAST` | `1` | Stretch faint ink to true black / paper to true white before embedding. **Not cosmetic** — a faint page can otherwise make a reasoning model transcribe nothing at all. See [Image inputs](#image-inputs) |
+| `IMAGE_AUTOCONTRAST_CUTOFF` | `0.5` | Percent of the histogram clipped at each end before stretching. Raise it and genuine light-grey pencil starts getting crushed to white |
 | `STROKE_CONTEXT` | `0` | `1` = parse `.rm` stroke geometry into a rough sketch/diagram hint for the OCR prompt + `stroke_regions_flagged` in frontmatter. `.rm`-family sources only; heuristic, not recognition. See [Stroke-assisted OCR context](#stroke-assisted-ocr-context) |
-| `DAILY_NOTE_EMBED` | `0` | `1` = after OCR of a date-named source (`YYYY-MM-DD`), ensure the Obsidian daily note embeds the transcript. See [Daily-note embedding](#daily-note-embedding) |
+| `DAILY_NOTE_EMBED` | `0` | `1` = after OCR of a date-named source (`YYYY-MM-DD`, or `YYYY-MM-DD-P<n>` for one file per page), ensure the Obsidian daily note embeds the transcript. See [Daily-note embedding](#daily-note-embedding) |
 | `DAILY_NOTE_DIR` | `Daily Journal` | Daily-notes folder, relative to `VAULT_DIR`. Must be **outside** `SOURCE_SUBDIR` (refused at startup otherwise) |
 | `DAILY_NOTE_HEADING` | `## reMarkable journal` | Heading of the appended section |
 | `LOG_LEVEL` | `INFO` | Set `DEBUG` to log each file's gate decision (see below) |
@@ -285,7 +295,10 @@ rename), so the readable split PDF persists *and* gets transcribed. Because the
 bytes change, normal change-detection then OCRs the new version. No second
 container, no async race.
 
-- Requires the **source dir to be writable** (mount the vault `:rw`, not `:ro`).
+- Requires the **source dir to be writable** (mount the vault `:rw`, not `:ro`)
+  for `.pdf` sources, which are the ones rewritten in place. Bundles and image
+  inputs are split on their *cached* render under `STATE_DIR`, so those never
+  touch the source and work fine with a `:ro` vault.
 - Adds `PyMuPDF` + `numpy`; rm-ocr refuses to start with `AUTO_SPLIT=1` if they're
   missing. Splitting runs on PyMuPDF (each output page references the source page
   once, instead of re-encoding it per segment), so even a native vector export
@@ -322,6 +335,130 @@ and page boxes — far cheaper than an OCR run, and only runs for new/changed fi
 This gate is **off by default** (the tool works fine without the splitter) and
 requires `pypdf` (already in the image / `requirements.txt`); rm-ocr refuses to
 start with `REQUIRE_SPLIT=1` if `pypdf` is missing.
+
+### The vision gate
+
+The daemon refuses to start if the model does not actually **receive** the
+images it is sent. This guards the worst failure the tool can have.
+
+Some Ollama runners accept an `images=` payload, silently discard it, and let
+the model answer from the text prompt alone. Measured on Ollama 0.32.0's MLX
+runner: `gemma4:12b-mlx` was handed a page of handwriting and returned a fluent
+essay about 19th-century American industrialisation, repeated verbatim for
+pages 1 and 2, written out under `status: ok` with 3416 chars. Nothing about
+that transcript looks wrong — which is exactly the problem. **Silent
+fabrication in a journal is far worse than a visible failure**, because you have
+no reason to doubt it.
+
+The check sends the same image at two sizes and compares prompt token counts, so
+it tests whether the image *arrives*, not whether the model is any good at
+reading it:
+
+| model | no image | 64×64 | 1024×1024 | growth | verdict |
+|---|---|---|---|---|---|
+| `qwen3.5:9b` | 17 | 28 | **1043** | +1015 | sees it |
+| `gemma4:26b` | 23 | 74 | **281** | +207 | sees it |
+| `gemma4:12b-mlx` | 30 | 35 | 35 | ~0 | drops it |
+
+Growth with area is the signal, rather than the cost of one image, for two
+reasons. Per-image token cost is heavily tokenizer-dependent — a 64×64 probe
+costs `qwen3.5:9b` 11 tokens and `gemma4:26b` 51, so an absolute "+200 tokens"
+rule rejects both as broken even though both read the image correctly. Only
+`qwen3-vl:8b`'s fixed-tile encoder charges ~1000 for a thumbnail. Differencing
+two sizes also cancels any constant, so a runner that adds a fixed "image mode"
+preamble without encoding pixels cannot fake the signal.
+
+It costs three 1-token generations at startup. If it can't run (server
+unreachable, odd response) it warns and continues rather than blocking startup
+on an unrelated fault. `VISION_CHECK=0` disables it, which is not recommended:
+the failure it catches is invisible in the output.
+
+Note this is about the *runner*, not the model family — the same model in GGUF
+form on the llama.cpp runner handles images normally.
+
+### Image inputs
+
+A `.png`, `.jpg`, `.jpeg` or `.webp` dropped in the source tree is treated as a
+photo or screenshot of handwriting. It is wrapped into a one-page PDF by
+`rm_render` and then follows the exact same path as everything else, so
+`AUTO_SPLIT`, `MAX_PDF_PAGES`, the split gate and the manifest all apply with no
+special cases. The wrap runs on Pillow, which `pdf2image` already pulls in, so
+image support adds no new dependency.
+
+The wrap does four things worth knowing about:
+
+- **Normalizes the page to `IMAGE_PAGE_WIDTH_PT` (445 pt), height following the
+  aspect ratio.** This is the setting that matters. `rm_split` analyses a page at
+  one pixel per point, so embedding a 4000 px photo at 1 px = 1 pt would produce
+  a 4000 pt wide page and `SPLIT_TARGET_PAGE_HEIGHT` would carve it into slivers.
+  445 pt is roughly one reMarkable page (1404 px at 226 dpi), so the existing
+  split tuning carries over: a 4:3 photo lands at 445x593 and is never split, a
+  long stitched screenshot splits every ~700 pt like a tall notebook export.
+- **Applies EXIF rotation.** Phone JPEGs are stored unrotated with an orientation
+  tag, so without this the handwriting would reach the model sideways.
+- **Flattens transparency onto white.** A plain RGB conversion composites
+  transparent pixels onto *black*, which turns a screenshot with a transparent
+  background into an unreadable page. Bilevel scans are left on lossless CCITT
+  rather than re-encoded as JPEG, which would ring around every pen stroke.
+- **Downscales sources wider than `IMAGE_MAX_WIDTH_PX` (2000 px)**, aspect
+  preserved, so a 50 MP photo can't blow up the decode on a small container. Tall
+  stitched screenshots keep their height, since only the width is capped.
+- **Normalizes contrast** (`IMAGE_AUTOCONTRAST`, on by default) so faint pencil
+  reaches true black and the paper true white. See below — this one is not
+  cosmetic.
+
+#### Why contrast normalization matters more than it sounds
+
+Faint ink doesn't just read worse, it changes how the model behaves. A real
+reMarkable page whose darkest pixel was 192 (out of 255) sent `qwen3-vl:8b` into
+18k characters of reasoning about ambiguous strokes until it exhausted its
+context and returned **nothing at all**. Measured on that page, same model, same
+prompt, only the image and context changing:
+
+| image | `num_ctx` | transcript | reasoning | finished? | time |
+|---|---|---|---|---|---|
+| as-is | 4096 (default) | **0 chars** | 11k | no, hit the limit | — |
+| as-is | 16384 | 594 chars | 19k | yes | ~215s |
+| **normalized** | **4096** | **621 chars** | **6k** | **yes** | **101s** |
+| normalized | 16384 | 621 chars | 6k | yes | 100s |
+
+That is the page's *sparse* first section. Its dense middle section still failed
+at 4096 even normalized (9.9k of reasoning, cut off, 0 chars), which is why the
+recommendation below is to set both.
+
+Normalizing attacks the cause (two thirds less reasoning, half the wall clock,
+no extra VRAM) where `NUM_CTX` only widens the budget the model is burning.
+
+**Use both.** Normalizing is not sufficient on its own: on the same real page,
+the sparse first section transcribed fine at the default context, but the dense
+middle section still burned 9,866 characters of reasoning and hit the 4096 wall
+with nothing to show. Denser handwriting costs more reasoning, so for real
+journal pages set **`NUM_CTX=16384`** as well. Contrast lowers the cost; the
+context gives the headroom for pages where the lowered cost is still too high.
+
+Pillow's autocontrast is a no-op on already-crisp scans and provably leaves a
+blank page blank, so it is safe on by default. Set `IMAGE_AUTOCONTRAST=0` to
+keep the original tones.
+
+Note the contrast step applies to **image inputs only** — a faint `.pdf` or
+`.rm` bundle does not pass through the wrap, so those depend on `NUM_CTX` alone.
+Either way the failure is now loud: a page that returns nothing is marked in the
+transcript with the reason, and a document where every page returns nothing is
+recorded as an error rather than a plausible-looking empty file.
+
+Two things to watch for:
+
+- **Resolution.** OCR rasterizes at `DPI` (default `150`), so a 445 pt page
+  becomes only ~927 px wide no matter how sharp the original photo was. For
+  photographed handwriting set **`DPI=254`**, which lands at ~1570 px, right at
+  the `MAX_PX` cap of 1568.
+- **Same-stem collisions.** `note.png` and `note.pdf` in one folder both want
+  `note-handwriting_converted.md`. The second one transcribed gets
+  `-<source_sha256[:8]>` appended, so neither overwrites the other.
+
+Stroke-context hints are never available for images: a photo carries no vector
+ink, so `page_regions` is always empty regardless of `STROKE_CONTEXT`. HEIC is
+not supported (it needs `pillow-heif`); convert to JPEG first.
 
 ### Stroke-assisted OCR context
 
@@ -386,6 +523,10 @@ files:
 - **Append-only.** Existing prose is never rewritten; the section is appended
   once at the end. Writes go through a temp file + atomic rename, so a crash
   can never truncate a note.
+- **Multi-page days.** A day exported one file per page — `2026-07-02-P001`,
+  `-P002`, ... — keeps a separate transcript per page but embeds them all into
+  the single `2026-07-02.md`, under **one** heading, in page order. Anything you
+  wrote after that section stays where it is.
 - **Idempotent.** A note that already references the transcript path — this
   section, or a link you wrote yourself — is left alone.
 - **Full-path embeds.** `2026-07-20.md` often exists twice in a vault (the
@@ -396,8 +537,9 @@ files:
 - **Config guard.** `DAILY_NOTE_DIR` inside `SOURCE_SUBDIR` is refused at
   startup — date-named `.md` files in the source tree belong to the sync tool
   and would be clobbered on its next sync.
-- **Scope guard.** Only titles matching `YYYY-MM-DD` participate; everything
-  else is untouched. An embed failure is logged and never fails or retries the
+- **Scope guard.** Only titles matching `YYYY-MM-DD` or `YYYY-MM-DD-P<n>`
+  participate; everything else is untouched. A stem like `2026-07-23-groceries`
+  is *not* a daily page and never creates a note. An embed failure is logged and never fails or retries the
   completed transcription.
 
 Requirements: the vault mounted **writable** (like `OUT_ALONGSIDE`), and
@@ -481,6 +623,9 @@ Plain Python with a small set of pip + system deps, all baked into the image:
 - **`pdf2image`** (pip — see `requirements.txt`; pulls in Pillow) + **poppler**
   (system: `apt-get install poppler-utils` / `brew install poppler`). Poppler also
   provides `pdfunite`, used to merge per-page renders into a single bundle PDF.
+  Pillow additionally decodes image inputs and writes their one-page wrapper PDF,
+  so `.png`/`.jpg`/`.jpeg`/`.webp` support needs nothing beyond what is already
+  here (in particular, not PyMuPDF).
 - **`rmc`** (pip; pulls in `rmscene`) — renders `.zip` / `.rmdoc` / `.rm` inputs
   to PDF. Its PDF export shells out to **Inkscape** (system: `apt-get install
   inkscape` / `brew install --cask inkscape`) to rasterize an intermediate SVG
@@ -549,7 +694,8 @@ processed_at, status, retries, render_sha256? }`. Written atomically (temp file
 + rename). `STATE_DIR/ocr.log` mirrors stdout.
 
 - `sha256` is always the **source bytes** hash — for `.pdf` that's the PDF, for
-  bundles that's the `.zip`/`.rmdoc`/`.rm`. It's the change-detection token.
+  bundles that's the `.zip`/`.rmdoc`/`.rm`, for an image input that's the
+  original `.png`/`.jpg`/`.jpeg`/`.webp`. It's the change-detection token.
 - `render_sha256` is set for rendered inputs only — the hash of the cached PDF
   under `STATE_DIR/rendered/<sha[:2]>/<sha>.pdf`. Useful for tracing which
   rendered output produced a transcript.
