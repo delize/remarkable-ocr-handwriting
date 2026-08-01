@@ -822,15 +822,26 @@ def main():
     # The worst failure this tool can have. Ollama 0.32.0's MLX runner accepted
     # images=, dropped them, and gemma4:12b-mlx answered from the prompt alone —
     # serving a page of handwriting as a fluent essay about 19th-century America,
-    # repeated verbatim per page, under status=ok. Measured prompt tokens with an
-    # image attached: qwen3-vl 24 -> 1106, gemma4:12b-mlx 30 -> 35. The gate reads
-    # that delta, so it tests image DELIVERY and not the model's OCR skill.
+    # repeated verbatim per page, under status=ok. The gate reads how prompt cost
+    # GROWS from a 64px image to a 1024px one, so it tests image DELIVERY and not
+    # the model's OCR skill — and, unlike an absolute token threshold, it holds
+    # across tokenizers that charge very different rates per image.
+    # Counts below are (no image, 64px, 1024px).
     def fake_generate(counts):
         seen = {"n": 0}
 
         def _fake(req, timeout=None):
             body = _json.loads(req.data)
-            n = counts[1] if body.get("images") else counts[0]
+            imgs = body.get("images")
+            if not imgs:
+                n = counts[0]
+            else:
+                import base64 as _b64
+                import io as _io
+
+                from PIL import Image as _Image
+                w = _Image.open(_io.BytesIO(_b64.b64decode(imgs[0]))).width
+                n = counts[1] if w <= 64 else counts[2]
             seen["n"] += 1
 
             class _R:
@@ -848,8 +859,9 @@ def main():
 
     saved_urlopen2 = _urllib_request.urlopen
     try:
-        _urllib_request.urlopen = fake_generate((24, 1106))   # a model that sees
-        ocr_daemon.assert_model_sees_images("http://x", "good-model", 200)
+        # qwen3.5:9b, measured. Charges per area, ~1000 tokens at 1024px.
+        _urllib_request.urlopen = fake_generate((17, 28, 1043))
+        ocr_daemon.assert_model_sees_images("http://x", "good-model", 64)
         check("vision gate lets a real vision model through", True, True)
     except SystemExit:
         check("vision gate lets a real vision model through", False, True)
@@ -857,12 +869,37 @@ def main():
         _urllib_request.urlopen = saved_urlopen2
 
     try:
-        _urllib_request.urlopen = fake_generate((30, 35))     # a model that doesn't
-        ocr_daemon.assert_model_sees_images("http://x", "blind-model", 200)
+        # gemma4:26b, measured. A far more compressive vision encoder: a 64px
+        # probe costs it only 51 tokens, so the old absolute "+200 with an image
+        # attached" rule called this working model blind and refused to start.
+        _urllib_request.urlopen = fake_generate((23, 74, 281))
+        ocr_daemon.assert_model_sees_images("http://x", "frugal-tokenizer", 64)
+        check("vision gate lets a frugal-tokenizer vision model through", True, True)
+    except SystemExit:
+        check("vision gate lets a frugal-tokenizer vision model through", False, True)
+    finally:
+        _urllib_request.urlopen = saved_urlopen2
+
+    try:
+        # gemma4:12b-mlx, measured: flat regardless of what it is sent.
+        _urllib_request.urlopen = fake_generate((30, 35, 35))
+        ocr_daemon.assert_model_sees_images("http://x", "blind-model", 64)
         check("vision gate refuses a model that drops images", False, True)
     except SystemExit as e:
         check("vision gate refuses a model that drops images", "IGNORE images" in str(e), True)
         check("vision gate names the fabrication risk", "FABRICATED" in str(e), True)
+    finally:
+        _urllib_request.urlopen = saved_urlopen2
+
+    try:
+        # A runner that adds a constant "image mode" preamble but encodes no
+        # pixels: big jump from no-image, zero growth with area. The old rule
+        # passed this; differencing two sizes catches it.
+        _urllib_request.urlopen = fake_generate((30, 900, 900))
+        ocr_daemon.assert_model_sees_images("http://x", "constant-preamble", 64)
+        check("vision gate refuses a constant image-mode preamble", False, True)
+    except SystemExit:
+        check("vision gate refuses a constant image-mode preamble", True, True)
     finally:
         _urllib_request.urlopen = saved_urlopen2
 
@@ -872,7 +909,7 @@ def main():
 
     try:
         _urllib_request.urlopen = _boom
-        ocr_daemon.assert_model_sees_images("http://x", "unreachable", 200)
+        ocr_daemon.assert_model_sees_images("http://x", "unreachable", 64)
         check("vision gate degrades to a warning when it can't run", True, True)
     except SystemExit:
         check("vision gate degrades to a warning when it can't run", False, True)
