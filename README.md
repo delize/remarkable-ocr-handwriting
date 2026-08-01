@@ -9,11 +9,13 @@ Automatically transcribes any new or changed reMarkable PDF dropped into a
 watched directory — into searchable Markdown, **fully local on your device**. No
 manual step.
 
-The input side accepts any of **`.pdf`**, **`.zip`**, **`.rmdoc`**, or loose
-**`.rm`** files (any mix, in nested folders). PDFs pass through directly;
-bundles and loose pages are rendered to PDF via `rmc` first and cached under
-`STATE_DIR/rendered/` so a re-extracted-but-byte-identical bundle never re-
-renders. The reference setup uses [Scrybble](https://scrybble.ink) to sync
+The input side accepts any of **`.pdf`**, **`.zip`**, **`.rmdoc`**, loose
+**`.rm`**, or an image (**`.png`**, **`.jpg`**, **`.jpeg`**, **`.webp`**) files
+(any mix, in nested folders). PDFs pass through directly; bundles and loose
+pages are rendered to PDF via `rmc` first, images are wrapped into a one-page
+PDF, and both are cached under `STATE_DIR/rendered/` so a re-extracted-but-
+byte-identical source never re-renders. See [Image inputs](#image-inputs) for
+what a photo or screenshot goes through. The reference setup uses [Scrybble](https://scrybble.ink) to sync
 reMarkable notes into an Obsidian vault, but anything that drops one of those
 formats on disk works just as well — `rmapi`/`rmapy` downloads, the reMarkable
 desktop app's export folder, a `Syncthing`/`rsync`'d directory, or a manual drop.
@@ -25,7 +27,7 @@ because Obsidian indexes the Markdown for search.
 - `ocr_daemon.py` — the automation: scanner, change-detection manifest, transcript
   writer, and the polling loop. Built *around* the core, not a rewrite of it.
 - `rm_render.py` — shared rendering layer: dispatches `.pdf` / `.zip` / `.rmdoc` /
-  `.rm` inputs to a PDF ready for OCR. Used by both the daemon and the CLI.
+  `.rm` / image inputs to a PDF ready for OCR. Used by both the daemon and the CLI.
 - `rm_split.py` — vendored `AUTO_SPLIT` implementation (whitespace-band splitter).
 - `selftest.py` — offline test harness (stubs Ollama + poppler + the renderer; zero deps).
 
@@ -188,7 +190,7 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `TIMEOUT` | `1800` | Per-page socket timeout |
 | `MODEL_WAIT_TIMEOUT` | `1800` | Block at startup until the model is loadable on `OLLAMA_HOST`. `0` disables the gate (see [Startup readiness gate](#startup-readiness-gate)) |
 | `INTERVAL` | `600` | Poll seconds — the latency floor; an inotify event short-circuits this |
-| `INOTIFY` | `1` | `1` = wake immediately on `CLOSE_WRITE` / `MOVED_TO` for `*.pdf` under `SOURCE_SUBDIR` (Linux only; falls back to pure poll if unavailable). See [Inotify wake-up](#inotify-wake-up) |
+| `INOTIFY` | `1` | `1` = wake immediately on `CLOSE_WRITE` / `MOVED_TO` for any supported input under `SOURCE_SUBDIR` (Linux only; falls back to pure poll if unavailable). See [Inotify wake-up](#inotify-wake-up) |
 | `HASH_CHECK` | `1` | `1` = sha256 content detection (authoritative); `0` = last-modified (mtime) detection — cheaper, but re-OCRs on touch-only changes |
 | `MAX_AGE_HOURS` | `24` | Only consider PDFs modified within this window; `0` = no limit |
 | `MAX_PDF_PAGES` | `0` | Skip documents with more rendered pages than this (`0` = no limit). Counted post-`AUTO_SPLIT`; skipped files show as `SKIPPED` in `--status` and re-queue automatically if the cap is raised |
@@ -204,6 +206,9 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `SPLIT_MAX_ASPECT` | `2.0` | Page height/width above which a PDF is "too tall" — splits it (AUTO_SPLIT) or holds it (REQUIRE_SPLIT). Match the splitter's `MIN_ASPECT_RATIO` |
 | `SPLIT_MARKER_KEY` | `/RemarkableSplitter` | PDF Info-dict key the splitter stamps |
 | `SPLIT_MARKER_VALUE` | `processed` | Expected marker value |
+| `IMAGE_PAGE_WIDTH_PT` | `445` | Page width, in PDF points, that every image input is normalized to (height follows the aspect ratio). About one reMarkable page, so the `SPLIT_*` tuning applies to photos unchanged. See [Image inputs](#image-inputs) |
+| `IMAGE_JPEG_QUALITY` | `92` | Quality of the JPEG embedded in the wrapper PDF. Ignored for bilevel scans, which stay on lossless CCITT |
+| `IMAGE_MAX_WIDTH_PX` | `2000` | Downscale image inputs wider than this before embedding (aspect preserved). Guards the decode against a 50 MP phone photo |
 | `STROKE_CONTEXT` | `0` | `1` = parse `.rm` stroke geometry into a rough sketch/diagram hint for the OCR prompt + `stroke_regions_flagged` in frontmatter. `.rm`-family sources only; heuristic, not recognition. See [Stroke-assisted OCR context](#stroke-assisted-ocr-context) |
 | `DAILY_NOTE_EMBED` | `0` | `1` = after OCR of a date-named source (`YYYY-MM-DD`), ensure the Obsidian daily note embeds the transcript. See [Daily-note embedding](#daily-note-embedding) |
 | `DAILY_NOTE_DIR` | `Daily Journal` | Daily-notes folder, relative to `VAULT_DIR`. Must be **outside** `SOURCE_SUBDIR` (refused at startup otherwise) |
@@ -285,7 +290,10 @@ rename), so the readable split PDF persists *and* gets transcribed. Because the
 bytes change, normal change-detection then OCRs the new version. No second
 container, no async race.
 
-- Requires the **source dir to be writable** (mount the vault `:rw`, not `:ro`).
+- Requires the **source dir to be writable** (mount the vault `:rw`, not `:ro`)
+  for `.pdf` sources, which are the ones rewritten in place. Bundles and image
+  inputs are split on their *cached* render under `STATE_DIR`, so those never
+  touch the source and work fine with a `:ro` vault.
 - Adds `PyMuPDF` + `numpy`; rm-ocr refuses to start with `AUTO_SPLIT=1` if they're
   missing. Splitting runs on PyMuPDF (each output page references the source page
   once, instead of re-encoding it per segment), so even a native vector export
@@ -322,6 +330,48 @@ and page boxes — far cheaper than an OCR run, and only runs for new/changed fi
 This gate is **off by default** (the tool works fine without the splitter) and
 requires `pypdf` (already in the image / `requirements.txt`); rm-ocr refuses to
 start with `REQUIRE_SPLIT=1` if `pypdf` is missing.
+
+### Image inputs
+
+A `.png`, `.jpg`, `.jpeg` or `.webp` dropped in the source tree is treated as a
+photo or screenshot of handwriting. It is wrapped into a one-page PDF by
+`rm_render` and then follows the exact same path as everything else, so
+`AUTO_SPLIT`, `MAX_PDF_PAGES`, the split gate and the manifest all apply with no
+special cases. The wrap runs on Pillow, which `pdf2image` already pulls in, so
+image support adds no new dependency.
+
+The wrap does four things worth knowing about:
+
+- **Normalizes the page to `IMAGE_PAGE_WIDTH_PT` (445 pt), height following the
+  aspect ratio.** This is the setting that matters. `rm_split` analyses a page at
+  one pixel per point, so embedding a 4000 px photo at 1 px = 1 pt would produce
+  a 4000 pt wide page and `SPLIT_TARGET_PAGE_HEIGHT` would carve it into slivers.
+  445 pt is roughly one reMarkable page (1404 px at 226 dpi), so the existing
+  split tuning carries over: a 4:3 photo lands at 445x593 and is never split, a
+  long stitched screenshot splits every ~700 pt like a tall notebook export.
+- **Applies EXIF rotation.** Phone JPEGs are stored unrotated with an orientation
+  tag, so without this the handwriting would reach the model sideways.
+- **Flattens transparency onto white.** A plain RGB conversion composites
+  transparent pixels onto *black*, which turns a screenshot with a transparent
+  background into an unreadable page. Bilevel scans are left on lossless CCITT
+  rather than re-encoded as JPEG, which would ring around every pen stroke.
+- **Downscales sources wider than `IMAGE_MAX_WIDTH_PX` (2000 px)**, aspect
+  preserved, so a 50 MP photo can't blow up the decode on a small container. Tall
+  stitched screenshots keep their height, since only the width is capped.
+
+Two things to watch for:
+
+- **Resolution.** OCR rasterizes at `DPI` (default `150`), so a 445 pt page
+  becomes only ~927 px wide no matter how sharp the original photo was. For
+  photographed handwriting set **`DPI=254`**, which lands at ~1570 px, right at
+  the `MAX_PX` cap of 1568.
+- **Same-stem collisions.** `note.png` and `note.pdf` in one folder both want
+  `note-handwriting_converted.md`. The second one transcribed gets
+  `-<source_sha256[:8]>` appended, so neither overwrites the other.
+
+Stroke-context hints are never available for images: a photo carries no vector
+ink, so `page_regions` is always empty regardless of `STROKE_CONTEXT`. HEIC is
+not supported (it needs `pillow-heif`); convert to JPEG first.
 
 ### Stroke-assisted OCR context
 
@@ -481,6 +531,9 @@ Plain Python with a small set of pip + system deps, all baked into the image:
 - **`pdf2image`** (pip — see `requirements.txt`; pulls in Pillow) + **poppler**
   (system: `apt-get install poppler-utils` / `brew install poppler`). Poppler also
   provides `pdfunite`, used to merge per-page renders into a single bundle PDF.
+  Pillow additionally decodes image inputs and writes their one-page wrapper PDF,
+  so `.png`/`.jpg`/`.jpeg`/`.webp` support needs nothing beyond what is already
+  here (in particular, not PyMuPDF).
 - **`rmc`** (pip; pulls in `rmscene`) — renders `.zip` / `.rmdoc` / `.rm` inputs
   to PDF. Its PDF export shells out to **Inkscape** (system: `apt-get install
   inkscape` / `brew install --cask inkscape`) to rasterize an intermediate SVG
@@ -549,7 +602,8 @@ processed_at, status, retries, render_sha256? }`. Written atomically (temp file
 + rename). `STATE_DIR/ocr.log` mirrors stdout.
 
 - `sha256` is always the **source bytes** hash — for `.pdf` that's the PDF, for
-  bundles that's the `.zip`/`.rmdoc`/`.rm`. It's the change-detection token.
+  bundles that's the `.zip`/`.rmdoc`/`.rm`, for an image input that's the
+  original `.png`/`.jpg`/`.jpeg`/`.webp`. It's the change-detection token.
 - `render_sha256` is set for rendered inputs only — the hash of the cached PDF
   under `STATE_DIR/rendered/<sha[:2]>/<sha>.pdf`. Useful for tracing which
   rendered output produced a transcript.

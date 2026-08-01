@@ -63,6 +63,9 @@ services:
       #
       # To turn it on: uncomment AUTO_SPLIT and drop the ":ro" from the vault
       # mount below — splitting writes in place, so the source dir must be :rw.
+      # That applies to .pdf sources only. Bundles and image inputs are split on
+      # their CACHED render under STATE_DIR, so a vault holding only those can
+      # stay :ro with AUTO_SPLIT on.
       # AUTO_SPLIT: "1"
       # SPLIT_MAX_ASPECT: "2.0"               # was MIN_ASPECT_RATIO
       # SPLIT_TARGET_PAGE_HEIGHT: "700"       # was TARGET_PAGE_HEIGHT (px @ 72dpi)
