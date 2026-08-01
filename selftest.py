@@ -718,6 +718,73 @@ def main():
     check("skip_blank + reflow: real page is reflowed by ocr_pdf's default (reflow=True)",
           blank_pages[1], (2, "real page text wrapped"))
 
+    # --- empty-answer detection (a reasoning model that never answers) ---
+    # Real failure mode: qwen3-vl ignores think=False, reasons past the context
+    # window, and is cut off with done_reason="length" — every token lands in
+    # "thinking", "response" is empty, and the old code wrote a plausible-looking
+    # empty page under status=ok. A page with ink that yields nothing must be
+    # visible, and a document where EVERY page yields nothing must be an error.
+    def make_urlopen(stream_objs):
+        def _fake(req, timeout=None):
+            class _FakeResp:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+                def __iter__(self):
+                    for o in stream_objs:
+                        yield _json.dumps(o).encode()
+
+            return _FakeResp()
+        return _fake
+
+    THINKING_ONLY = [{"thinking": "let me work through this page..." * 20},
+                     {"done": True, "done_reason": "length"}]
+    _doc_pages = [content_page_img]
+    rm_ocr.convert_from_path = lambda *a, first_page=1, **k: [_doc_pages[first_page - 1]]
+    rm_ocr.pdfinfo_from_path = lambda *a, **k: {"Pages": len(_doc_pages)}
+    _urllib_request.urlopen = make_urlopen(THINKING_ONLY)
+    try:
+        _real_ocr_pdf("fake.pdf", "test-model", 150, 1568)
+        check("all-pages-empty raises instead of writing an empty transcript", False, True)
+    except RuntimeError as e:
+        check("all-pages-empty raises instead of writing an empty transcript",
+              "no text for any" in str(e), True)
+    finally:
+        _urllib_request.urlopen = saved_urlopen
+
+    # A partial failure still returns, with the bad page marked in place so the
+    # transcript says what happened rather than looking like a blank page.
+    _doc_pages = [content_page_img, content_page_img]
+    rm_ocr.convert_from_path = lambda *a, first_page=1, **k: [_doc_pages[first_page - 1]]
+    rm_ocr.pdfinfo_from_path = lambda *a, **k: {"Pages": len(_doc_pages)}
+    _calls = {"n": 0}
+
+    def _mixed(req, timeout=None):
+        _calls["n"] += 1
+        objs = THINKING_ONLY if _calls["n"] == 1 else [
+            {"response": "second page is fine"}, {"done": True, "done_reason": "stop"}]
+        return make_urlopen(objs)(req, timeout)
+
+    _urllib_request.urlopen = _mixed
+    try:
+        mixed = _real_ocr_pdf("fake.pdf", "test-model", 150, 1568)
+    finally:
+        rm_ocr.convert_from_path = saved_convert
+        rm_ocr.pdfinfo_from_path = saved_pdfinfo
+        _urllib_request.urlopen = saved_urlopen
+    check("partial failure still returns every page", len(mixed), 2)
+    check("failed page is marked, not left blank",
+          mixed[0][1].startswith(rm_ocr.NO_OUTPUT_TEXT), True)
+    check("failed page records why it was empty",
+          "done_reason='length'" in mixed[0][1] and "reasoning discarded" in mixed[0][1], True)
+    check("failed page is distinguishable from a genuinely blank page",
+          rm_ocr.NO_OUTPUT_TEXT != rm_ocr.BLANK_PAGE_TEXT, True)
+    check("good page in a partially-failed document is untouched",
+          mixed[1][1], "second page is fine")
+
     # --- reflow_paragraphs (pure text transform, no model/PIL involved) ---
     check("reflow_paragraphs: joins word-wrapped lines within a paragraph",
           rm_ocr.reflow_paragraphs("It's really difficult to\nput into words\nwhen you find someone."),

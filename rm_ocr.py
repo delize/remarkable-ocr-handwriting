@@ -56,6 +56,10 @@ OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 BLANK_MEAN_THRESHOLD = 254.5
 BLANK_STDDEV_THRESHOLD = 1.0
 BLANK_PAGE_TEXT = "[blank page]"
+# Written in place of a page the model answered with nothing. Distinct from
+# BLANK_PAGE_TEXT on purpose: "the page was empty" and "the model failed on a
+# page that had ink" must not look the same in a transcript.
+NO_OUTPUT_TEXT = "[no transcription returned]"
 
 
 def _is_blank_page(page):
@@ -123,6 +127,7 @@ def reflow_paragraphs(text):
 def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_think=False,
            skip_blank=True, page_regions=None, reflow=True):
     results = []
+    empty_pages = 0
     opts = {"temperature": 0}
     if cpu:
         opts["num_gpu"] = 0   # 0 layers on GPU == CPU-only (num_gpu = #layers, not #GPUs)
@@ -168,6 +173,8 @@ def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_t
         )
         print(f"    page {n}/{num_pages} (prefill on CPU may take minutes)...", end="", flush=True)
         parts = []
+        think_chars = 0
+        done_reason = None
         # `timeout` is the per-read socket timeout; the first read blocks through
         # the whole prefill, so it must be generous on CPU.
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -180,13 +187,41 @@ def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_t
                     raise RuntimeError(obj["error"])
                 if obj.get("response"):
                     parts.append(obj["response"])
+                # A reasoning model streams its trace here, NOT into "response".
+                # Counted (not kept) purely so an empty answer can be explained.
+                if obj.get("thinking"):
+                    think_chars += len(obj["thinking"])
                 if obj.get("done"):
+                    done_reason = obj.get("done_reason")
                     break
         print(f" {len(''.join(parts))} chars", flush=True)
         text = "".join(parts).strip()
+        if not text:
+            # An empty answer used to be written out as an empty page under
+            # status=ok, which is indistinguishable from a blank page and hides
+            # a real failure. The common cause is a reasoning model that ignores
+            # think=False, reasons past the context window, and is cut off before
+            # emitting anything (done_reason="length", all output in "thinking").
+            why = f"done_reason={done_reason!r}"
+            if think_chars:
+                why += f", {think_chars} chars of reasoning discarded"
+            if done_reason == "length":
+                why += (" — the model ran out of context before answering; raise"
+                        " num_ctx (NUM_CTX) or use a non-reasoning model")
+            print(f"    page {n}/{num_pages}: model returned NO TEXT ({why})", flush=True)
+            text = f"{NO_OUTPUT_TEXT} ({why})"
+            empty_pages += 1
         if reflow:
             text = reflow_paragraphs(text)
         results.append((n, text))
+    # Every page failing is a broken run, not a transcript. Raising here puts it
+    # through the daemon's normal error path (status=error, capped retries) so it
+    # shows up in --status instead of landing as a plausible-looking empty file.
+    # A partial failure still returns, with the bad pages marked in place.
+    if empty_pages and empty_pages == len(results):
+        raise RuntimeError(
+            f"model returned no text for any of the {empty_pages} page(s) — "
+            "see the per-page reasons above")
     return results
 
 
