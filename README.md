@@ -182,12 +182,13 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `MODEL` | `gemma4:26b` | Vision-capable; larger model, expect slower per-page than a 9B |
 | `OLLAMA_HOST` | `http://ollama:11434` | |
 | `THREADS` | `14` | cgroup under-detection workaround |
-| `NO_THINK` | `1` | **Required** — thinking ON = unusable |
+| `NO_THINK` | `1` | Asks the model to skip its reasoning trace. **Some models ignore it** (`qwen3-vl:8b` measured: identical reasoning with and without), so it is a request, not a guarantee — see `NUM_CTX` |
 | `SKIP_BLANK_PAGES` | `1` | `1` = skip the OCR call for a genuinely blank page (writes `[blank page]` instead). Small vision models tend to answer blank pages with refusal-style prose otherwise |
 | `REFLOW_PARAGRAPHS` | `1` | `1` = join word-wrapped lines into flowing paragraphs. Post-processing on the model's own transcription, not a re-transcription — see [Paragraph reflow](#paragraph-reflow) |
 | `DPI` | `150` | Raising alone does nothing (downscaled to `MAX_PX`) |
 | `MAX_PX` | `1568` | The real quality/time lever |
 | `TIMEOUT` | `1800` | Per-page socket timeout |
+| `NUM_CTX` | `0` | Model context window in tokens (`0` = Ollama's default of 4096). A page image alone costs ~1800, so a model that reasons first can run out and return **nothing**. `16384` fixed that on a real page. Costs VRAM. Prefer `IMAGE_AUTOCONTRAST` for image inputs — it fixes the cause and is free |
 | `MODEL_WAIT_TIMEOUT` | `1800` | Block at startup until the model is loadable on `OLLAMA_HOST`. `0` disables the gate (see [Startup readiness gate](#startup-readiness-gate)) |
 | `INTERVAL` | `600` | Poll seconds — the latency floor; an inotify event short-circuits this |
 | `INOTIFY` | `1` | `1` = wake immediately on `CLOSE_WRITE` / `MOVED_TO` for any supported input under `SOURCE_SUBDIR` (Linux only; falls back to pure poll if unavailable). See [Inotify wake-up](#inotify-wake-up) |
@@ -209,8 +210,10 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `IMAGE_PAGE_WIDTH_PT` | `445` | Page width, in PDF points, that every image input is normalized to (height follows the aspect ratio). About one reMarkable page, so the `SPLIT_*` tuning applies to photos unchanged. See [Image inputs](#image-inputs) |
 | `IMAGE_JPEG_QUALITY` | `92` | Quality of the JPEG embedded in the wrapper PDF. Ignored for bilevel scans, which stay on lossless CCITT |
 | `IMAGE_MAX_WIDTH_PX` | `2000` | Downscale image inputs wider than this before embedding (aspect preserved). Guards the decode against a 50 MP phone photo |
+| `IMAGE_AUTOCONTRAST` | `1` | Stretch faint ink to true black / paper to true white before embedding. **Not cosmetic** — a faint page can otherwise make a reasoning model transcribe nothing at all. See [Image inputs](#image-inputs) |
+| `IMAGE_AUTOCONTRAST_CUTOFF` | `0.5` | Percent of the histogram clipped at each end before stretching. Raise it and genuine light-grey pencil starts getting crushed to white |
 | `STROKE_CONTEXT` | `0` | `1` = parse `.rm` stroke geometry into a rough sketch/diagram hint for the OCR prompt + `stroke_regions_flagged` in frontmatter. `.rm`-family sources only; heuristic, not recognition. See [Stroke-assisted OCR context](#stroke-assisted-ocr-context) |
-| `DAILY_NOTE_EMBED` | `0` | `1` = after OCR of a date-named source (`YYYY-MM-DD`), ensure the Obsidian daily note embeds the transcript. See [Daily-note embedding](#daily-note-embedding) |
+| `DAILY_NOTE_EMBED` | `0` | `1` = after OCR of a date-named source (`YYYY-MM-DD`, or `YYYY-MM-DD-P<n>` for one file per page), ensure the Obsidian daily note embeds the transcript. See [Daily-note embedding](#daily-note-embedding) |
 | `DAILY_NOTE_DIR` | `Daily Journal` | Daily-notes folder, relative to `VAULT_DIR`. Must be **outside** `SOURCE_SUBDIR` (refused at startup otherwise) |
 | `DAILY_NOTE_HEADING` | `## reMarkable journal` | Heading of the appended section |
 | `LOG_LEVEL` | `INFO` | Set `DEBUG` to log each file's gate decision (see below) |
@@ -358,6 +361,33 @@ The wrap does four things worth knowing about:
 - **Downscales sources wider than `IMAGE_MAX_WIDTH_PX` (2000 px)**, aspect
   preserved, so a 50 MP photo can't blow up the decode on a small container. Tall
   stitched screenshots keep their height, since only the width is capped.
+- **Normalizes contrast** (`IMAGE_AUTOCONTRAST`, on by default) so faint pencil
+  reaches true black and the paper true white. See below — this one is not
+  cosmetic.
+
+#### Why contrast normalization matters more than it sounds
+
+Faint ink doesn't just read worse, it changes how the model behaves. A real
+reMarkable page whose darkest pixel was 192 (out of 255) sent `qwen3-vl:8b` into
+18k characters of reasoning about ambiguous strokes until it exhausted its
+context and returned **nothing at all**. Measured on that page, same model, same
+prompt, only the image and context changing:
+
+| image | `num_ctx` | transcript | reasoning | finished? | time |
+|---|---|---|---|---|---|
+| as-is | 4096 (default) | **0 chars** | 11k | no, hit the limit | — |
+| as-is | 16384 | 594 chars | 19k | yes | ~215s |
+| **normalized** | **4096** | **621 chars** | **6k** | **yes** | **101s** |
+| normalized | 16384 | 621 chars | 6k | yes | 100s |
+
+Normalizing fixes the cause; raising `NUM_CTX` only widens the budget the model
+was burning. Two thirds less reasoning, half the wall clock, no extra VRAM — and
+once contrast is right, the bigger context earns nothing. Pillow's autocontrast
+is a no-op on already-crisp scans and provably leaves a blank page blank, so it
+is safe on by default. Set `IMAGE_AUTOCONTRAST=0` to keep the original tones.
+
+Note this applies to **image inputs only**. A faint `.pdf` or `.rm` bundle does
+not pass through the wrap, so if those transcribe empty, reach for `NUM_CTX`.
 
 Two things to watch for:
 
@@ -436,6 +466,10 @@ files:
 - **Append-only.** Existing prose is never rewritten; the section is appended
   once at the end. Writes go through a temp file + atomic rename, so a crash
   can never truncate a note.
+- **Multi-page days.** A day exported one file per page — `2026-07-02-P001`,
+  `-P002`, ... — keeps a separate transcript per page but embeds them all into
+  the single `2026-07-02.md`, under **one** heading, in page order. Anything you
+  wrote after that section stays where it is.
 - **Idempotent.** A note that already references the transcript path — this
   section, or a link you wrote yourself — is left alone.
 - **Full-path embeds.** `2026-07-20.md` often exists twice in a vault (the
@@ -446,8 +480,9 @@ files:
 - **Config guard.** `DAILY_NOTE_DIR` inside `SOURCE_SUBDIR` is refused at
   startup — date-named `.md` files in the source tree belong to the sync tool
   and would be clobbered on its next sync.
-- **Scope guard.** Only titles matching `YYYY-MM-DD` participate; everything
-  else is untouched. An embed failure is logged and never fails or retries the
+- **Scope guard.** Only titles matching `YYYY-MM-DD` or `YYYY-MM-DD-P<n>`
+  participate; everything else is untouched. A stem like `2026-07-23-groceries`
+  is *not* a daily page and never creates a note. An embed failure is logged and never fails or retries the
   completed transcription.
 
 Requirements: the vault mounted **writable** (like `OUT_ALONGSIDE`), and
