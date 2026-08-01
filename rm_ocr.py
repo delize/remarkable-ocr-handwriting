@@ -125,10 +125,17 @@ def reflow_paragraphs(text):
 
 
 def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_think=False,
-           skip_blank=True, page_regions=None, reflow=True):
+           skip_blank=True, page_regions=None, reflow=True, num_ctx=0):
     results = []
     empty_pages = 0
     opts = {"temperature": 0}
+    if num_ctx:
+        # Ollama defaults to a 4096 context. A full-page image already costs
+        # ~1800 of those tokens, so a model that reasons before answering can
+        # exhaust the window and be cut off with nothing in "response" (see the
+        # empty-answer handling below). Measured on qwen3-vl:8b against a real
+        # page: 4096 produced 0 chars, 16384 transcribed it correctly.
+        opts["num_ctx"] = num_ctx
     if cpu:
         opts["num_gpu"] = 0   # 0 layers on GPU == CPU-only (num_gpu = #layers, not #GPUs)
     if threads:
@@ -227,7 +234,7 @@ def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_t
 
 def transcribe_pdf(pdf, out_md, *, model, dpi=150, max_px=1568, threads=None,
                    no_think=False, timeout=1800, cpu=False, title=None,
-                   page_regions=None, skip_blank=True, reflow=True):
+                   page_regions=None, skip_blank=True, reflow=True, num_ctx=0):
     """Transcribe a single PDF to a plain ``# title`` / ``## Page N`` markdown file.
 
     Reusable core extracted from ``main()`` (Phase 0). The daemon does NOT call
@@ -244,7 +251,7 @@ def transcribe_pdf(pdf, out_md, *, model, dpi=150, max_px=1568, threads=None,
     out_md = pathlib.Path(out_md)
     title = title or pdf.stem
     pages = ocr_pdf(pdf, model, dpi, max_px, cpu=cpu, timeout=timeout,
-                    threads=threads, no_think=no_think,
+                    threads=threads, no_think=no_think, num_ctx=num_ctx,
                     skip_blank=skip_blank, page_regions=page_regions, reflow=reflow)
     lines = [f"# {title}\n"]
     for n, text in pages:
@@ -311,7 +318,14 @@ def main():
     ap.add_argument("--cpu", action="store_true", help="Force CPU-only (num_gpu=0) — simulates the GPU-less NAS")
     ap.add_argument("--timeout", type=int, default=1800, help="Per-page timeout in seconds (covers slow CPU prefill)")
     ap.add_argument("--threads", type=int, default=None, help="Force CPU thread count (e.g. 14 on a 13600K; works around Ollama's cgroup under-detection)")
-    ap.add_argument("--no-think", action="store_true", help="Disable thinking/reasoning trace (much faster on CPU for 'thinking' models like qwen3.5)")
+    ap.add_argument("--no-think", action="store_true",
+                    help="Ask the model to skip its reasoning trace. NOTE: some models "
+                         "(qwen3-vl:8b measured) ignore this outright and reason anyway — "
+                         "see --num-ctx if pages come back empty")
+    ap.add_argument("--num-ctx", type=int, default=int(os.environ.get("NUM_CTX", "0")),
+                    help="Model context window in tokens (0 = Ollama's default, 4096). A "
+                         "page image costs ~1800, so a reasoning model can run out and "
+                         "return nothing; 16384 fixed that on a real page.")
     ap.add_argument("--render-cache", default=os.environ.get("RM_OCR_RENDER_CACHE"),
                     help="Persistent render cache dir (default: ephemeral temp). Point at the daemon's STATE/rendered to share it.")
     ap.add_argument("--stroke-context", action="store_true",
@@ -354,6 +368,7 @@ def main():
                     page_regions=page_regions,
                     skip_blank=args.skip_blank,
                     reflow=args.reflow,
+                    num_ctx=args.num_ctx,
                 )
                 print(f"        -> {title}.md\n", flush=True)
             except Exception as e:

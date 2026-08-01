@@ -78,6 +78,13 @@ REFLOW_PARAGRAPHS = _env_bool("REFLOW_PARAGRAPHS", True)
 DPI = int(os.environ.get("DPI", "150"))
 MAX_PX = int(os.environ.get("MAX_PX", "1568"))
 TIMEOUT = int(os.environ.get("TIMEOUT", "1800"))
+# Context window for the model, in tokens (0 = leave it to Ollama, which
+# defaults to 4096). A full-page image alone costs roughly 1800 of those, so a
+# model that reasons before answering can burn the rest of the window and get
+# cut off mid-thought, returning NOTHING. Measured on qwen3-vl:8b against a real
+# faint reMarkable page: 4096 -> 0 chars on every page, 16384 -> a correct
+# transcript. Costs VRAM, so it is opt-in rather than defaulted.
+NUM_CTX = int(os.environ.get("NUM_CTX", "0"))
 INTERVAL = int(os.environ.get("INTERVAL", "600"))
 # Inotify wake-up signal layered on top of the poll. The poll stays as a
 # correctness floor (so a missed event never strands a file forever), but a
@@ -583,7 +590,7 @@ def process_one(src, result, rel, digest, man, page_regions=None):
     source_modified = _iso_mtime(st)             # last-modified of the source file
     pages = ocr_pdf(result.pdf, MODEL, DPI, MAX_PX, timeout=TIMEOUT, threads=THREADS,
                     no_think=NO_THINK, skip_blank=SKIP_BLANK_PAGES, page_regions=page_regions,
-                    reflow=REFLOW_PARAGRAPHS)
+                    reflow=REFLOW_PARAGRAPHS, num_ctx=NUM_CTX)
     stroke_regions_flagged = sum(
         rm_strokes.summarize(regions)["likely_drawing_regions"] for regions in page_regions
     ) if page_regions else None
