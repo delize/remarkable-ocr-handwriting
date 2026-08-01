@@ -14,6 +14,7 @@ Modes:
 All configuration is via environment variables (see the table in the brief / README).
 """
 import argparse
+import base64
 import datetime
 import hashlib
 import json
@@ -85,6 +86,13 @@ TIMEOUT = int(os.environ.get("TIMEOUT", "1800"))
 # faint reMarkable page: 4096 -> 0 chars on every page, 16384 -> a correct
 # transcript. Costs VRAM, so it is opt-in rather than defaulted.
 NUM_CTX = int(os.environ.get("NUM_CTX", "0"))
+# Startup gate: prove the model actually RECEIVES the images we send. A runner
+# that drops them silently (Ollama 0.32.0's MLX runner does) makes the model
+# answer from the prompt alone and invent a fluent transcript that looks
+# perfectly successful. Compares prompt token counts with and without an image,
+# so it tests delivery rather than OCR skill. Costs two 1-token generates.
+VISION_CHECK = _env_bool("VISION_CHECK", True)
+VISION_CHECK_MIN_TOKENS = int(os.environ.get("VISION_CHECK_MIN_TOKENS", "200"))
 INTERVAL = int(os.environ.get("INTERVAL", "600"))
 # Inotify wake-up signal layered on top of the poll. The poll stays as a
 # correctness floor (so a missed event never strands a file forever), but a
@@ -872,6 +880,66 @@ def start_inotify_watcher(src, wake):
     return t
 
 
+def assert_model_sees_images(host, model, min_image_tokens=200):
+    """Refuse to start if `model` silently ignores the images we send it.
+
+    This guards the worst failure this tool can have. Some Ollama runners accept
+    an ``images=`` payload, drop it, and answer from the text prompt alone —
+    measured on gemma4:12b-mlx under Ollama 0.32.0, which served a page of
+    handwriting as a confident, fluent essay about 19th-century America and
+    repeated it verbatim for every page. Nothing about that output looks wrong:
+    it is well-formed prose under ``status: ok``. Silent fabrication in a
+    journal is far worse than a visible failure.
+
+    The check is the prompt token count, not the answer, so it does not depend
+    on the model being any good at OCR — only on the image arriving. A real
+    image costs ~1000+ prompt tokens; a dropped one costs a handful. Measured
+    on the same box: qwen3-vl:8b 24 -> 1106 tokens with the image attached,
+    gemma4:12b-mlx 30 -> 35.
+    """
+    import urllib.request
+
+    def prompt_tokens(images):
+        body = {"model": model, "prompt": "What text is in this image?",
+                "stream": False, "options": {"num_predict": 1}}
+        if images:
+            body["images"] = images
+        req = urllib.request.Request(
+            host + "/api/generate", data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=300) as r:
+            return json.loads(r.read()).get("prompt_eval_count") or 0
+
+    # Generate the probe rather than embedding a literal: an invalid PNG would
+    # be dropped by the server and look exactly like the failure we are hunting.
+    # Size is irrelevant to the signal (64x64 and 512x512 both cost ~1043
+    # tokens on qwen3-vl), so keep it small.
+    import io
+
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 64), "white").save(buf, format="PNG")
+    try:
+        with_image = prompt_tokens([base64.b64encode(buf.getvalue()).decode()])
+        without = prompt_tokens(None)
+    except Exception as e:
+        log.warning("vision check could not run (%s) — continuing unguarded", e)
+        return
+    delta = with_image - without
+    log.info("vision check: %s prompt tokens %d -> %d with an image attached",
+             model, without, with_image)
+    if delta < min_image_tokens:
+        raise SystemExit(
+            f"model {model!r} on {host} appears to IGNORE images: attaching one "
+            f"changed the prompt from {without} to {with_image} tokens "
+            f"(expected at least +{min_image_tokens}).\n"
+            "It would answer from the prompt alone and write confident, "
+            "entirely FABRICATED transcripts that look successful. Measured on "
+            "gemma4:12b-mlx, whose MLX runner drops images silently.\n"
+            "Use a model served by a vision-capable runner, or set "
+            "VISION_CHECK=0 to skip this gate (not recommended).")
+
+
 def wait_for_model(host, model, timeout):
     """Block until `model` is loadable on `host`, or raise SystemExit on timeout.
 
@@ -984,6 +1052,11 @@ def main():
         wait_for_model(OLLAMA_HOST, MODEL, MODEL_WAIT_TIMEOUT)
     else:
         log.info("MODEL_WAIT_TIMEOUT=0, skipping startup readiness gate")
+    if VISION_CHECK:
+        assert_model_sees_images(OLLAMA_HOST, MODEL, VISION_CHECK_MIN_TOKENS)
+    else:
+        log.warning("VISION_CHECK=0 — not verifying the model actually receives "
+                    "images; a runner that drops them writes fabricated transcripts")
 
     if args.scan:
         n = scan_once(load_manifest())

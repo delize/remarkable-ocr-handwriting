@@ -818,6 +818,67 @@ def main():
     check("good page in a partially-failed document is untouched",
           mixed[1][1], "second page is fine")
 
+    # --- vision gate: refuse a model that silently drops images ---
+    # The worst failure this tool can have. Ollama 0.32.0's MLX runner accepted
+    # images=, dropped them, and gemma4:12b-mlx answered from the prompt alone —
+    # serving a page of handwriting as a fluent essay about 19th-century America,
+    # repeated verbatim per page, under status=ok. Measured prompt tokens with an
+    # image attached: qwen3-vl 24 -> 1106, gemma4:12b-mlx 30 -> 35. The gate reads
+    # that delta, so it tests image DELIVERY and not the model's OCR skill.
+    def fake_generate(counts):
+        seen = {"n": 0}
+
+        def _fake(req, timeout=None):
+            body = _json.loads(req.data)
+            n = counts[1] if body.get("images") else counts[0]
+            seen["n"] += 1
+
+            class _R:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+                def read(self):
+                    return _json.dumps({"prompt_eval_count": n}).encode()
+
+            return _R()
+        return _fake
+
+    saved_urlopen2 = _urllib_request.urlopen
+    try:
+        _urllib_request.urlopen = fake_generate((24, 1106))   # a model that sees
+        ocr_daemon.assert_model_sees_images("http://x", "good-model", 200)
+        check("vision gate lets a real vision model through", True, True)
+    except SystemExit:
+        check("vision gate lets a real vision model through", False, True)
+    finally:
+        _urllib_request.urlopen = saved_urlopen2
+
+    try:
+        _urllib_request.urlopen = fake_generate((30, 35))     # a model that doesn't
+        ocr_daemon.assert_model_sees_images("http://x", "blind-model", 200)
+        check("vision gate refuses a model that drops images", False, True)
+    except SystemExit as e:
+        check("vision gate refuses a model that drops images", "IGNORE images" in str(e), True)
+        check("vision gate names the fabrication risk", "FABRICATED" in str(e), True)
+    finally:
+        _urllib_request.urlopen = saved_urlopen2
+
+    # An unreachable/odd server must not block startup — warn and continue.
+    def _boom(req, timeout=None):
+        raise OSError("connection refused")
+
+    try:
+        _urllib_request.urlopen = _boom
+        ocr_daemon.assert_model_sees_images("http://x", "unreachable", 200)
+        check("vision gate degrades to a warning when it can't run", True, True)
+    except SystemExit:
+        check("vision gate degrades to a warning when it can't run", False, True)
+    finally:
+        _urllib_request.urlopen = saved_urlopen2
+
     # --- reflow_paragraphs (pure text transform, no model/PIL involved) ---
     check("reflow_paragraphs: joins word-wrapped lines within a paragraph",
           rm_ocr.reflow_paragraphs("It's really difficult to\nput into words\nwhen you find someone."),
