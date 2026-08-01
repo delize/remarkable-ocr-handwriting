@@ -189,7 +189,7 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `MAX_PX` | `1568` | The real quality/time lever |
 | `TIMEOUT` | `1800` | Per-page socket timeout |
 | `VISION_CHECK` | `1` | Startup gate: prove the model actually **receives** the images. A runner that drops them makes the model invent a fluent transcript that looks successful. See [The vision gate](#the-vision-gate) |
-| `VISION_CHECK_MIN_TOKENS` | `200` | Minimum extra prompt tokens an attached image must cost. A real image costs ~1000+; a dropped one costs a handful |
+| `VISION_CHECK_MIN_TOKENS` | `64` | Minimum extra prompt tokens a 1024×1024 image must cost over a 64×64 one. Measured growth: `qwen3.5:9b` +1015, `gemma4:26b` +207; a runner that drops images stays flat |
 | `NUM_CTX` | `0` | Model context window in tokens (`0` = Ollama's default of 4096). A page image alone costs ~1800, so a model that reasons first can run out and return **nothing**. **Set `16384` for real handwriting** — dense pages exhaust 4096 even with `IMAGE_AUTOCONTRAST` on. Costs VRAM |
 | `MODEL_WAIT_TIMEOUT` | `1800` | Block at startup until the model is loadable on `OLLAMA_HOST`. `0` disables the gate (see [Startup readiness gate](#startup-readiness-gate)) |
 | `INTERVAL` | `600` | Poll seconds — the latency floor; an inotify event short-circuits this |
@@ -350,16 +350,25 @@ that transcript looks wrong — which is exactly the problem. **Silent
 fabrication in a journal is far worse than a visible failure**, because you have
 no reason to doubt it.
 
-The check compares prompt token counts with and without an image attached, so
+The check sends the same image at two sizes and compares prompt token counts, so
 it tests whether the image *arrives*, not whether the model is any good at
 reading it:
 
-| model | no image | with image | verdict |
-|---|---|---|---|
-| `qwen3-vl:8b` | 24 | **1106** | sees it |
-| `gemma4:12b-mlx` | 30 | **35** | drops it |
+| model | no image | 64×64 | 1024×1024 | growth | verdict |
+|---|---|---|---|---|---|
+| `qwen3.5:9b` | 17 | 28 | **1043** | +1015 | sees it |
+| `gemma4:26b` | 23 | 74 | **281** | +207 | sees it |
+| `gemma4:12b-mlx` | 30 | 35 | 35 | ~0 | drops it |
 
-It costs two 1-token generations at startup. If it can't run (server
+Growth with area is the signal, rather than the cost of one image, for two
+reasons. Per-image token cost is heavily tokenizer-dependent — a 64×64 probe
+costs `qwen3.5:9b` 11 tokens and `gemma4:26b` 51, so an absolute "+200 tokens"
+rule rejects both as broken even though both read the image correctly. Only
+`qwen3-vl:8b`'s fixed-tile encoder charges ~1000 for a thumbnail. Differencing
+two sizes also cancels any constant, so a runner that adds a fixed "image mode"
+preamble without encoding pixels cannot fake the signal.
+
+It costs three 1-token generations at startup. If it can't run (server
 unreachable, odd response) it warns and continues rather than blocking startup
 on an unrelated fault. `VISION_CHECK=0` disables it, which is not recommended:
 the failure it catches is invisible in the output.

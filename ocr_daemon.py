@@ -89,10 +89,13 @@ NUM_CTX = int(os.environ.get("NUM_CTX", "0"))
 # Startup gate: prove the model actually RECEIVES the images we send. A runner
 # that drops them silently (Ollama 0.32.0's MLX runner does) makes the model
 # answer from the prompt alone and invent a fluent transcript that looks
-# perfectly successful. Compares prompt token counts with and without an image,
-# so it tests delivery rather than OCR skill. Costs two 1-token generates.
+# perfectly successful. Compares prompt token counts across two image SIZES, so
+# it tests delivery rather than OCR skill. Costs three 1-token generates.
 VISION_CHECK = _env_bool("VISION_CHECK", True)
-VISION_CHECK_MIN_TOKENS = int(os.environ.get("VISION_CHECK_MIN_TOKENS", "200"))
+# Minimum extra prompt tokens a 1024x1024 image must cost over a 64x64 one.
+# Measured growth: qwen3.5:9b 1015, gemma4:26b 207; a runner that drops images
+# shows ~0. 64 sits an order of magnitude clear of the failure case.
+VISION_CHECK_MIN_TOKENS = int(os.environ.get("VISION_CHECK_MIN_TOKENS", "64"))
 INTERVAL = int(os.environ.get("INTERVAL", "600"))
 # Inotify wake-up signal layered on top of the poll. The poll stays as a
 # correctness floor (so a missed event never strands a file forever), but a
@@ -880,7 +883,7 @@ def start_inotify_watcher(src, wake):
     return t
 
 
-def assert_model_sees_images(host, model, min_image_tokens=200):
+def assert_model_sees_images(host, model, min_image_tokens=64):
     """Refuse to start if `model` silently ignores the images we send it.
 
     This guards the worst failure this tool can have. Some Ollama runners accept
@@ -891,11 +894,20 @@ def assert_model_sees_images(host, model, min_image_tokens=200):
     it is well-formed prose under ``status: ok``. Silent fabrication in a
     journal is far worse than a visible failure.
 
-    The check is the prompt token count, not the answer, so it does not depend
-    on the model being any good at OCR — only on the image arriving. A real
-    image costs ~1000+ prompt tokens; a dropped one costs a handful. Measured
-    on the same box: qwen3-vl:8b 24 -> 1106 tokens with the image attached,
-    gemma4:12b-mlx 30 -> 35.
+    The signal is how prompt cost GROWS with image area, not the answer, so it
+    does not depend on the model being any good at OCR — only on the image
+    arriving. Comparing two sizes rather than image-vs-no-image matters twice
+    over:
+
+      * Token cost per image is wildly tokenizer-dependent. A 64x64 probe costs
+        qwen3.5:9b 11 tokens and gemma4:26b 51 — both fully vision-capable, both
+        of which an absolute "+200 tokens" threshold rejects as broken. Only
+        qwen3-vl:8b's fixed-tile encoder charges ~1000 for a thumbnail.
+      * Differencing two sizes cancels any constant. A runner that adds a fixed
+        "image mode" preamble without encoding pixels cannot fake growth.
+
+    Measured 64x64 -> 1024x1024 growth: qwen3.5:9b 30 -> 1045 (+1015),
+    gemma4:26b 71 -> 278 (+207). A runner that drops images stays flat.
     """
     import urllib.request
 
@@ -910,29 +922,35 @@ def assert_model_sees_images(host, model, min_image_tokens=200):
         with urllib.request.urlopen(req, timeout=300) as r:
             return json.loads(r.read()).get("prompt_eval_count") or 0
 
-    # Generate the probe rather than embedding a literal: an invalid PNG would
+    # Generate the probes rather than embedding literals: an invalid PNG would
     # be dropped by the server and look exactly like the failure we are hunting.
-    # Size is irrelevant to the signal (64x64 and 512x512 both cost ~1043
-    # tokens on qwen3-vl), so keep it small.
     import io
 
     from PIL import Image
-    buf = io.BytesIO()
-    Image.new("RGB", (64, 64), "white").save(buf, format="PNG")
+
+    def png(side):
+        buf = io.BytesIO()
+        im = Image.new("RGB", (side, side), "white")
+        # Some encoders special-case a uniform image; give it real edges.
+        im.paste((0, 0, 0), (0, 0, side, max(1, side // 8)))
+        im.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode()
+
     try:
-        with_image = prompt_tokens([base64.b64encode(buf.getvalue()).decode()])
         without = prompt_tokens(None)
+        small = prompt_tokens([png(64)])
+        large = prompt_tokens([png(1024)])
     except Exception as e:
         log.warning("vision check could not run (%s) — continuing unguarded", e)
         return
-    delta = with_image - without
-    log.info("vision check: %s prompt tokens %d -> %d with an image attached",
-             model, without, with_image)
-    if delta < min_image_tokens:
+    growth = large - small
+    log.info("vision check: %s prompt tokens %d none / %d at 64px / %d at 1024px "
+             "(+%d for area)", model, without, small, large, growth)
+    if growth < min_image_tokens:
         raise SystemExit(
-            f"model {model!r} on {host} appears to IGNORE images: attaching one "
-            f"changed the prompt from {without} to {with_image} tokens "
-            f"(expected at least +{min_image_tokens}).\n"
+            f"model {model!r} on {host} appears to IGNORE images: growing the "
+            f"image from 64x64 to 1024x1024 changed the prompt from {small} to "
+            f"{large} tokens (expected at least +{min_image_tokens}).\n"
             "It would answer from the prompt alone and write confident, "
             "entirely FABRICATED transcripts that look successful. Measured on "
             "gemma4:12b-mlx, whose MLX runner drops images silently.\n"
