@@ -883,6 +883,36 @@ def start_inotify_watcher(src, wake):
     return t
 
 
+def _probe_png(side):
+    """A `side`x`side` PNG as raw bytes, built with the standard library only.
+
+    Deliberately not Pillow. The gate has to be exercisable by selftest.py,
+    which CI runs on a bare interpreter with no third-party packages
+    installed — importing Pillow here is what made the self-test fail to even
+    start. Encoding a solid image is a dozen lines, so the dependency buys
+    nothing.
+
+    A white field under a black bar: some encoders special-case a perfectly
+    uniform image, and a real edge keeps the probe representative of a page.
+    """
+    import struct
+    import zlib
+
+    def chunk(tag, payload):
+        body = tag + payload
+        return (struct.pack(">I", len(payload)) + body
+                + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
+
+    # 8-bit truecolour (colour type 2) — the most broadly accepted PNG flavour.
+    ihdr = struct.pack(">IIBBBBB", side, side, 8, 2, 0, 0, 0)
+    bar = max(1, side // 8)
+    black, white = b"\x00" * (side * 3), b"\xff" * (side * 3)
+    # Each scanline is prefixed with filter type 0 (None).
+    raw = b"".join(b"\x00" + (black if y < bar else white) for y in range(side))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
 def assert_model_sees_images(host, model, min_image_tokens=64):
     """Refuse to start if `model` silently ignores the images we send it.
 
@@ -922,24 +952,13 @@ def assert_model_sees_images(host, model, min_image_tokens=64):
         with urllib.request.urlopen(req, timeout=300) as r:
             return json.loads(r.read()).get("prompt_eval_count") or 0
 
-    # Generate the probes rather than embedding literals: an invalid PNG would
-    # be dropped by the server and look exactly like the failure we are hunting.
-    import io
-
-    from PIL import Image
-
-    def png(side):
-        buf = io.BytesIO()
-        im = Image.new("RGB", (side, side), "white")
-        # Some encoders special-case a uniform image; give it real edges.
-        im.paste((0, 0, 0), (0, 0, side, max(1, side // 8)))
-        im.save(buf, format="PNG")
-        return base64.b64encode(buf.getvalue()).decode()
+    def b64_png(side):
+        return base64.b64encode(_probe_png(side)).decode()
 
     try:
         without = prompt_tokens(None)
-        small = prompt_tokens([png(64)])
-        large = prompt_tokens([png(1024)])
+        small = prompt_tokens([b64_png(64)])
+        large = prompt_tokens([b64_png(1024)])
     except Exception as e:
         log.warning("vision check could not run (%s) — continuing unguarded", e)
         return
