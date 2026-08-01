@@ -391,6 +391,35 @@ def main():
     check("daily-note embed: re-OCR does not duplicate the section",
           note2.read_text().count("2026-07-21-handwriting_converted"), 1)
 
+    # Multi-page day: <date>-P001 / -P002 are separate transcripts that both embed
+    # into the SAME <date>.md, under ONE heading, in page order.
+    for page_no in ("P001", "P002"):
+        (tmp / f"vault/remarkable/Work/2026-07-25-{page_no}.png").write_bytes(
+            b"journal-page-" + page_no.encode())
+    ocr_daemon.scan_once(ocr_daemon.load_manifest())
+    note3 = daily_dir / "2026-07-25.md"
+    body3 = note3.read_text()
+    check("daily-note embed: -PXXX pages route to the date's note", note3.exists(), True)
+    check("daily-note embed: no -PXXX-named note is created",
+          (daily_dir / "2026-07-25-P001.md").exists(), False)
+    check("daily-note embed: both pages embedded",
+          all(f"2026-07-25-{p}-handwriting_converted" in body3 for p in ("P001", "P002")), True)
+    check("daily-note embed: multi-page day gets exactly one heading",
+          body3.count("## reMarkable journal"), 1)
+    check("daily-note embed: pages embedded in order",
+          body3.index("2026-07-25-P001") < body3.index("2026-07-25-P002"), True)
+    check("daily-note embed: each page keeps its own transcript",
+          all((ocr_daemon.OUT / f"Work/2026-07-25-{p}-handwriting_converted.md").exists()
+              for p in ("P001", "P002")), True)
+    check("daily-note embed: -PXXX re-OCR does not duplicate",
+          body3.count("2026-07-25-P001-handwriting_converted"), 1)
+
+    # A date-ish stem that isn't a page suffix must NOT be treated as a daily page.
+    (tmp / "vault/remarkable/Work/2026-07-23-groceries.pdf").write_text("not-a-journal-page")
+    ocr_daemon.scan_once(ocr_daemon.load_manifest())
+    check("daily-note embed: non-page suffix is not a daily source",
+          (daily_dir / "2026-07-23.md").exists(), False)
+
     # Non-date sources never touch daily notes.
     (tmp / "vault/remarkable/Work/NotADate.pdf").write_text("misc-bytes")
     ocr_daemon.scan_once(ocr_daemon.load_manifest())

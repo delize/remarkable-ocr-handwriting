@@ -458,11 +458,49 @@ def _pdf_page_count(pdf):
 # ---------------------------------------------------------------------------
 # Daily-note embed (opt-in, DAILY_NOTE_EMBED)
 # ---------------------------------------------------------------------------
-_DAILY_NOTE_TITLE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# A daily-journal source is titled either `YYYY-MM-DD` (one file per day) or
+# `YYYY-MM-DD-P<n>` (one file per PAGE of that day, the shape a multi-page photo
+# or per-page export produces). Both route to the same `<date>.md` daily note;
+# the page suffix only distinguishes the transcripts from each other.
+_DAILY_NOTE_TITLE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:-P\d+)?$", re.IGNORECASE)
+
+
+def _insert_into_section(text, heading, link_line):
+    """Append `link_line` inside `heading`'s existing section, or add the section.
+
+    Multi-page days (`<date>-P001`, `-P002`, ...) embed one link per page into
+    the SAME note, so a plain append would stack a duplicate heading per page.
+    When the heading is already there the link joins that section instead, which
+    also keeps the pages contiguous and in processing order (P001 before P002).
+    Anything the human wrote after the section is left where it is.
+    """
+    if not text.strip() or heading not in text:
+        section = f"{heading}\n\n{link_line}\n"
+        return (text.rstrip("\n") + "\n\n" if text.strip() else "") + section
+
+    lines = text.split("\n")
+    start = next(i for i, ln in enumerate(lines) if ln.strip() == heading.strip())
+    level = len(heading) - len(heading.lstrip("#"))
+    end = len(lines)
+    if level:  # a real markdown heading — its section ends at the next same-or-higher one
+        for i in range(start + 1, len(lines)):
+            stripped = lines[i].lstrip()
+            if stripped.startswith("#"):
+                if len(stripped) - len(stripped.lstrip("#")) <= level:
+                    end = i
+                    break
+    tail = end
+    while tail > start + 1 and not lines[tail - 1].strip():
+        tail -= 1  # step back over blank lines so the link lands with its siblings
+    lines[tail:tail] = [link_line]
+    return "\n".join(lines)
 
 
 def embed_in_daily_note(out_md, title):
     """Ensure the Obsidian daily note for a date-named source embeds its transcript.
+
+    Accepts `YYYY-MM-DD` and `YYYY-MM-DD-P<n>` titles; both target the same
+    `<date>.md` note, so every page of a multi-page day lands in one place.
 
     Returns True if the note was written (created or appended to), False for
     every no-op or skip. The embed uses the transcript's FULL vault-relative
@@ -472,8 +510,10 @@ def embed_in_daily_note(out_md, title):
     counts as "already embedded". Writes go through a temp file + os.replace,
     so a crash mid-write can never truncate a human's daily note.
     """
-    if not _DAILY_NOTE_TITLE.match(title):
+    matched = _DAILY_NOTE_TITLE.match(title)
+    if not matched:
         return False
+    note_date = matched.group(1)
     try:
         target = str(out_md.resolve().relative_to(VAULT.resolve()))
     except ValueError:
@@ -482,7 +522,7 @@ def embed_in_daily_note(out_md, title):
         return False
     if target.endswith(".md"):
         target = target[: -len(".md")]
-    note = (VAULT / DAILY_NOTE_DIR / f"{title}.md").resolve()
+    note = (VAULT / DAILY_NOTE_DIR / f"{note_date}.md").resolve()
     for forbidden in FORBIDDEN_PREFIXES:
         if str(note) == forbidden or str(note).startswith(forbidden.rstrip("/") + "/"):
             log.warning("daily-note embed: %s under forbidden prefix, skipping", note)
@@ -493,8 +533,7 @@ def embed_in_daily_note(out_md, title):
     text = note.read_text() if note.exists() else ""
     if target in text:
         return False  # already embedded (or hand-linked) — never duplicate
-    section = f"{DAILY_NOTE_HEADING}\n\n![[{target}]]\n"
-    new_text = (text.rstrip("\n") + "\n\n" if text.strip() else "") + section
+    new_text = _insert_into_section(text, DAILY_NOTE_HEADING, f"![[{target}]]")
     note.parent.mkdir(parents=True, exist_ok=True)
     tmp = note.with_name(note.name + ".rm-embed.tmp")
     tmp.write_text(new_text)
