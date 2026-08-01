@@ -188,7 +188,7 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `DPI` | `150` | Raising alone does nothing (downscaled to `MAX_PX`) |
 | `MAX_PX` | `1568` | The real quality/time lever |
 | `TIMEOUT` | `1800` | Per-page socket timeout |
-| `NUM_CTX` | `0` | Model context window in tokens (`0` = Ollama's default of 4096). A page image alone costs ~1800, so a model that reasons first can run out and return **nothing**. `16384` fixed that on a real page. Costs VRAM. Prefer `IMAGE_AUTOCONTRAST` for image inputs — it fixes the cause and is free |
+| `NUM_CTX` | `0` | Model context window in tokens (`0` = Ollama's default of 4096). A page image alone costs ~1800, so a model that reasons first can run out and return **nothing**. **Set `16384` for real handwriting** — dense pages exhaust 4096 even with `IMAGE_AUTOCONTRAST` on. Costs VRAM |
 | `MODEL_WAIT_TIMEOUT` | `1800` | Block at startup until the model is loadable on `OLLAMA_HOST`. `0` disables the gate (see [Startup readiness gate](#startup-readiness-gate)) |
 | `INTERVAL` | `600` | Poll seconds — the latency floor; an inotify event short-circuits this |
 | `INOTIFY` | `1` | `1` = wake immediately on `CLOSE_WRITE` / `MOVED_TO` for any supported input under `SOURCE_SUBDIR` (Linux only; falls back to pure poll if unavailable). See [Inotify wake-up](#inotify-wake-up) |
@@ -380,14 +380,29 @@ prompt, only the image and context changing:
 | **normalized** | **4096** | **621 chars** | **6k** | **yes** | **101s** |
 | normalized | 16384 | 621 chars | 6k | yes | 100s |
 
-Normalizing fixes the cause; raising `NUM_CTX` only widens the budget the model
-was burning. Two thirds less reasoning, half the wall clock, no extra VRAM — and
-once contrast is right, the bigger context earns nothing. Pillow's autocontrast
-is a no-op on already-crisp scans and provably leaves a blank page blank, so it
-is safe on by default. Set `IMAGE_AUTOCONTRAST=0` to keep the original tones.
+That is the page's *sparse* first section. Its dense middle section still failed
+at 4096 even normalized (9.9k of reasoning, cut off, 0 chars), which is why the
+recommendation below is to set both.
 
-Note this applies to **image inputs only**. A faint `.pdf` or `.rm` bundle does
-not pass through the wrap, so if those transcribe empty, reach for `NUM_CTX`.
+Normalizing attacks the cause (two thirds less reasoning, half the wall clock,
+no extra VRAM) where `NUM_CTX` only widens the budget the model is burning.
+
+**Use both.** Normalizing is not sufficient on its own: on the same real page,
+the sparse first section transcribed fine at the default context, but the dense
+middle section still burned 9,866 characters of reasoning and hit the 4096 wall
+with nothing to show. Denser handwriting costs more reasoning, so for real
+journal pages set **`NUM_CTX=16384`** as well. Contrast lowers the cost; the
+context gives the headroom for pages where the lowered cost is still too high.
+
+Pillow's autocontrast is a no-op on already-crisp scans and provably leaves a
+blank page blank, so it is safe on by default. Set `IMAGE_AUTOCONTRAST=0` to
+keep the original tones.
+
+Note the contrast step applies to **image inputs only** — a faint `.pdf` or
+`.rm` bundle does not pass through the wrap, so those depend on `NUM_CTX` alone.
+Either way the failure is now loud: a page that returns nothing is marked in the
+transcript with the reason, and a document where every page returns nothing is
+recorded as an error rather than a plausible-looking empty file.
 
 Two things to watch for:
 
