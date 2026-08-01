@@ -276,6 +276,28 @@ def main():
     check("loose .rm transcript named from stem",
           (out_base / "Work/Stray-handwriting_converted.md").exists(), True)
 
+    # Image dispatch — .png/.jpeg/.webp reach the scanner and are titled from the
+    # stem. Uses the stubbed renderer, so this needs no Pillow (the real wrap is
+    # exercised in the image-render section further down).
+    for img_name in ("Photo.png", "Snap.jpeg", "Shot.webp"):
+        (tmp / "vault/remarkable/Work" / img_name).write_bytes(b"fake-image-" + img_name.encode())
+    check("image inputs are discovered and processed",
+          ocr_daemon.scan_once(ocr_daemon.load_manifest()), 3)
+    for stem, label in (("Photo", ".png"), ("Snap", ".jpeg"), ("Shot", ".webp")):
+        check(f"{label} transcript named from stem",
+              (out_base / f"Work/{stem}-handwriting_converted.md").exists(), True)
+    check("image pass2 idempotent",
+          ocr_daemon.scan_once(ocr_daemon.load_manifest()), 0)
+    check("inotify wake tuple covers image inputs",
+          all(s in ocr_daemon._INPUT_SUFFIX_TUPLE for s in (".png", ".jpg", ".jpeg", ".webp")), True)
+
+    # A photo sharing a stem with an already-transcribed .pdf must NOT overwrite
+    # that transcript — the source-hash disambiguator kicks in.
+    (tmp / "vault/remarkable/Work/Sample.png").write_bytes(b"photo-of-the-same-note")
+    ocr_daemon.scan_once(ocr_daemon.load_manifest())
+    check("image sharing a stem with a .pdf gets its own disambiguated transcript",
+          len(list((out_base / "Work").glob("Sample*-handwriting_converted.md"))), 2)
+
     # Title precedence: a uuid-named bundle gets the friendly visibleName title.
     uuid_name = "9c4f1234-5678.rmdoc"
     (tmp / "vault/remarkable/Work" / uuid_name).write_bytes(b"PK\x03\x04uuid-bundle")
@@ -478,6 +500,112 @@ def main():
     check("STROKE_CONTEXT: frontmatter records stroke_regions_flagged",
           "stroke_regions_flagged: 1" in sketch_md, True)
     ocr_daemon.STROKE_CONTEXT = False
+
+    # --- image render (the REAL rm_render._render_image, not the stub) ---
+    # Must run BEFORE the blank-page section below, which puts a fake "PIL" into
+    # sys.modules and would shadow the real Pillow from here on. Needs Pillow and
+    # pypdf, which this zero-dependency harness does not install in CI — the
+    # checks are skipped there and run in the Docker image or a dev checkout,
+    # where both are present.
+    try:
+        from PIL import Image as _Img
+        from pypdf import PdfReader as _PdfReader
+    except ImportError:
+        print("  [SKIP] image-render checks (needs Pillow + pypdf)")
+    else:
+        img_dir = tmp / "image-fixtures"
+        img_dir.mkdir()
+
+        def page_size(path):
+            box = _PdfReader(str(path)).pages[0].mediabox
+            return round(float(box.width), 1), round(float(box.height), 1)
+
+        # Every image is normalized to IMAGE_PAGE_WIDTH_PT with the aspect kept,
+        # which is what lets rm_split's point-based tuning apply to photos.
+        src_img = img_dir / "wide.png"
+        _Img.new("RGB", (1200, 900), "white").save(src_img)
+        pdf, regions = rm_render._render_image(src_img, img_dir)
+        w, h = page_size(pdf)
+        check("image page normalized to IMAGE_PAGE_WIDTH_PT",
+              w, round(rm_render.IMAGE_PAGE_WIDTH_PT, 1))
+        check("image page keeps the source aspect ratio", round(h / w, 2), 0.75)
+        check("image render reports no stroke regions", regions, None)
+
+        # A tall source must stay tall in points, so the splitter can cut it.
+        tall_src = img_dir / "tall.png"
+        _Img.new("RGB", (1200, 8000), "white").save(tall_src)
+        tw, th = page_size(rm_render._render_image(tall_src, img_dir)[0])
+        check("tall image stays tall enough to trigger the split gate",
+              th / tw > ocr_daemon.SPLIT_MAX_ASPECT, True)
+
+        # Phone JPEGs store rotation as an EXIF tag, not as pixels. Without
+        # exif_transpose the handwriting reaches the model sideways.
+        rot_src = img_dir / "rotated.jpg"
+        _exif = _Img.Exif()
+        _exif[274] = 6  # Orientation: rotate 90° clockwise
+        _Img.new("RGB", (400, 200), "white").save(rot_src, exif=_exif)
+        rw, rh = page_size(rm_render._render_image(rot_src, img_dir)[0])
+        check("EXIF orientation is applied (landscape source becomes portrait)",
+              rh > rw, True)
+
+        # Oversize sources are downscaled before embedding (aspect preserved), so
+        # a 50 MP photo can't blow up the decode on a small container.
+        big_src = img_dir / "big.jpg"
+        _Img.new("RGB", (rm_render.IMAGE_MAX_WIDTH_PX * 2, 1000), "white").save(big_src)
+        big_pdf = rm_render._render_image(big_src, img_dir)[0]
+        check("oversize image downscaled to IMAGE_MAX_WIDTH_PX",
+              _PdfReader(str(big_pdf)).pages[0].images[0].image.width,
+              rm_render.IMAGE_MAX_WIDTH_PX)
+
+        # Transparency flattens onto WHITE. A plain convert("RGB") composites
+        # onto black and hands the model an unreadable page.
+        alpha_src = img_dir / "alpha.png"
+        _Img.new("RGBA", (300, 300), (0, 0, 0, 0)).save(alpha_src)
+        alpha_pdf = rm_render._render_image(alpha_src, img_dir)[0]
+        check("transparent pixels flattened onto white, not black",
+              _PdfReader(str(alpha_pdf)).pages[0].images[0].image.convert("RGB").getpixel((150, 150)),
+              (255, 255, 255))
+
+        # WebP is decoded like any other raster input.
+        webp_src = img_dir / "shot.webp"
+        _Img.new("RGB", (800, 600), "white").save(webp_src)
+        check("webp renders to a normalized page",
+              page_size(rm_render._render_image(webp_src, img_dir)[0])[0],
+              round(rm_render.IMAGE_PAGE_WIDTH_PT, 1))
+
+        # A truncated/garbage image is a recognized ValueError, not a crash, so
+        # the daemon records status=error and moves on.
+        bad_src = img_dir / "corrupt.png"
+        bad_src.write_bytes(b"\x89PNG\r\n\x1a\n-truncated-garbage")
+        try:
+            rm_render._render_image(bad_src, img_dir)
+            check("corrupt image raises ValueError", False, True)
+        except ValueError as e:
+            check("corrupt image raises ValueError", "image render failed" in str(e), True)
+
+        # AUTO_SPLIT's whole point for images: one tall page becomes several
+        # readable ones. Needs PyMuPDF + numpy on top of the above.
+        try:
+            import numpy  # noqa: F401
+            from rm_split import SplitConfig as _SplitConfig
+            from rm_split import split_in_place as _split_in_place
+            import fitz  # noqa: F401
+        except ImportError:
+            print("  [SKIP] image auto-split check (needs PyMuPDF + numpy)")
+        else:
+            banded = _Img.new("RGB", (1200, 6000), "white")
+            for band in range(6):  # ink bands separated by whitespace gutters
+                for y in range(band * 1000 + 100, band * 1000 + 400):
+                    for x in range(100, 1100, 3):
+                        banded.putpixel((x, y), (0, 0, 0))
+            banded_src = img_dir / "banded.png"
+            banded.save(banded_src)
+            banded_pdf = rm_render._render_image(banded_src, img_dir)[0]
+            check("tall image is one page before splitting",
+                  len(_PdfReader(str(banded_pdf)).pages), 1)
+            _split_in_place(banded_pdf, _SplitConfig())
+            check("AUTO_SPLIT cuts a tall image into multiple readable pages",
+                  len(_PdfReader(str(banded_pdf)).pages) > 1, True)
 
     # --- blank-page detection (rm_ocr's real ocr_pdf, not the fake_ocr stub) ---
     # PIL/Pillow isn't installed in this zero-dependency harness (real
