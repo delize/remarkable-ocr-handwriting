@@ -674,7 +674,9 @@ def main():
     # pdf2image — which pulls it in — is stubbed out above), so fake just
     # enough of PIL.ImageStat's surface for _is_blank_page's real code path
     # (page.convert("L") -> ImageStat.Stat(...).mean/.stddev) to run unmodified.
+    import base64 as _base64
     import json as _json
+    import struct as _struct
     import urllib.request as _urllib_request
 
     class _FakeStat:
@@ -836,11 +838,11 @@ def main():
             if not imgs:
                 n = counts[0]
             else:
-                import base64 as _b64
-                import io as _io
-
-                from PIL import Image as _Image
-                w = _Image.open(_io.BytesIO(_b64.b64decode(imgs[0]))).width
+                # Width straight out of the PNG IHDR: 8-byte signature, then a
+                # 4-byte length and the "IHDR" tag, so width lands at offset 16.
+                # Avoids Pillow — CI runs this file on a bare interpreter.
+                raw = _base64.b64decode(imgs[0])
+                w = _struct.unpack(">I", raw[16:20])[0]
                 n = counts[1] if w <= 64 else counts[2]
             seen["n"] += 1
 
