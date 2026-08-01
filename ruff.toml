@@ -1,0 +1,14 @@
+# Ruff 0.16 broadened its default rule set, which turned CI red repo-wide
+# without a line of code changing: 43 findings on main, none of them a
+# regression. Verified by pinning versions against an unchanged tree —
+# ruff 0.14.0 and 0.15.0 both report "All checks passed", 0.16.1 reports 43.
+#
+# Pin the set the project actually lints against, so a toolchain bump can
+# never silently redefine what "passing" means. This is the same selection
+# ruff applied by default through 0.15, made explicit rather than inherited.
+#
+# Adopting the wider set (blind-except, naive-datetime, import sorting, ...)
+# is a reasonable future call, but it is a codebase-wide cleanup and wants
+# its own change rather than riding along with a release.
+[lint]
+select = ["E4", "E7", "E9", "F"]
