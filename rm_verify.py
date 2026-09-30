@@ -325,13 +325,19 @@ def save_json(path, data):
     tmp.replace(path)
 
 
-def write_sidecar(state_dir, out_rel, source_rel, pages, file_bytes):
-    """Record exactly what the daemon wrote, so a later edit can be told apart from it."""
+def write_sidecar(state_dir, out_rel, source_rel, pages, file_bytes, model_pages=None):
+    """Record what the daemon wrote, so a later edit can be told apart from it.
+
+    ``pages`` is what the file contains. ``model_pages`` is what the model
+    produced, which differs on pages whose edits were carried over. Keeping
+    both is what lets a carried-over edit survive the next re-OCR too.
+    """
     sha = sha256_bytes(file_bytes)
     save_json(sidecar_path(state_dir, out_rel), {
         "out_path": out_rel, "source": source_rel, "written_at": _now(),
         "written_sha": sha, "seen_sha": sha,
         "pages": {str(n): text for n, text in pages},
+        "model_pages": {str(n): text for n, text in (model_pages or pages)},
     })
 
 
@@ -349,18 +355,19 @@ def edited_pages(sidecar, current_pages):
 def carry_over(new_pages, sidecar, current_pages):
     """Keep human edits across a re-OCR.
 
-    For each page the user edited, keep the edit when the model's new output
-    for that page is identical to what it wrote last time (the page itself did
-    not change). Returns ``(pages, kept, superseded)``. A superseded edit is
-    one whose page did change. It has already been harvested, so the
-    correction still counts toward learning and evaluation.
+    A page is the user's when the file's text differs from what the model
+    produced for it last time. Such a page is kept when the model's new output
+    is identical to that last output (the page itself did not change).
+    Returns ``(pages, kept, superseded)``. A superseded edit is one whose page
+    did change. It has already been harvested, so the correction still counts
+    toward learning and evaluation.
     """
-    edits = edited_pages(sidecar, current_pages)
+    model = (sidecar or {}).get("model_pages") or (sidecar or {}).get("pages", {})
     out, kept, superseded = [], 0, 0
     for n, text in new_pages:
-        if n in edits:
-            written, current = edits[n]
-            if _norm_ws(text) == _norm_ws(written):
+        before, current = model.get(str(n)), current_pages.get(n)
+        if before is not None and current is not None and _norm_ws(current) != _norm_ws(before):
+            if _norm_ws(text) == _norm_ws(before):
                 out.append((n, current))
                 kept += 1
                 continue
