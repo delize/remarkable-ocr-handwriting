@@ -68,6 +68,10 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/"
 # (useful for tests / non-ollama setups). The default headroom accommodates a
 # cold pull on a slow link plus the first CPU model-load.
 MODEL_WAIT_TIMEOUT = int(os.environ.get("MODEL_WAIT_TIMEOUT", "1800"))
+# Handwriting never leaves the owner's machines: at startup the model host must
+# resolve only to loopback, private LAN, link-local or 100.64/10 (Tailscale)
+# addresses. ALLOW_REMOTE_MODEL_HOST=1 downgrades the refusal to a warning.
+ALLOW_REMOTE_MODEL_HOST = _env_bool("ALLOW_REMOTE_MODEL_HOST", False)
 THREADS = int(os.environ.get("THREADS", "14"))
 NO_THINK = _env_bool("NO_THINK", True)
 # Skip the OCR call entirely for a page that's genuinely blank (rm_ocr's cheap
@@ -1378,6 +1382,8 @@ def main():
         return
 
     assert_safe_paths()
+    rm_ocr.assert_local_host(rm_ocr.OLLAMA_URL, allow_remote=ALLOW_REMOTE_MODEL_HOST,
+                             wait=max(MODEL_WAIT_TIMEOUT, 60), log=log.warning)
     if REQUIRE_SPLIT:
         try:
             import pypdf  # noqa: F401  fail fast if the split gate is on but pypdf is missing

@@ -124,6 +124,57 @@ def reflow_paragraphs(text):
     return "\n".join(out_lines)
 
 
+def non_local_addresses(url):
+    """Addresses ``url``'s host resolves to that are on the public internet.
+
+    Every page image goes to this host. The project's founding rule is that
+    handwriting never leaves the owner's machines, so only loopback, private
+    LAN, link-local and carrier-grade NAT (100.64.0.0/10, which Tailscale uses)
+    addresses count as local. Raises ``socket.gaierror`` when the name does
+    not resolve.
+    """
+    import ipaddress
+    import socket
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url if "://" in url else f"http://{url}")
+    host, port = parts.hostname, parts.port or 11434
+    addrs = {info[4][0] for info in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)}
+    return sorted(a for a in addrs if ipaddress.ip_address(a.split("%")[0]).is_global)
+
+
+def assert_local_host(url, *, allow_remote=False, wait=0, log=print):
+    """Refuse to send anything to a model server that is not on this machine or LAN.
+
+    ``wait`` retries an unresolvable name for that many seconds (a container
+    whose Ollama sibling is still starting). ``allow_remote`` turns the refusal
+    into a warning, for deployments that knowingly run the model elsewhere.
+    """
+    import socket
+    import time as _time
+
+    deadline = _time.monotonic() + wait
+    while True:
+        try:
+            public = non_local_addresses(url)
+            break
+        except socket.gaierror as e:
+            if _time.monotonic() >= deadline:
+                raise SystemExit(f"cannot resolve model host {url!r} ({e}); refusing to start "
+                                 "without proving it is local")
+            _time.sleep(5)
+    if not public:
+        return
+    msg = (f"model host {url!r} resolves to public address(es) {', '.join(public)}. "
+           "Page images would leave this network.")
+    if allow_remote:
+        log(f"WARNING: {msg} Continuing because ALLOW_REMOTE_MODEL_HOST=1.")
+        return
+    raise SystemExit(f"{msg}\nThis tool only talks to local or LAN model servers. Point "
+                     "OLLAMA_HOST at one, or set ALLOW_REMOTE_MODEL_HOST=1 if sending pages "
+                     "off-network is intended.")
+
+
 def _stream_generate(payload, timeout):
     """POST a streaming /api/generate request; returns ``(text, think_chars, done_reason)``.
 
@@ -426,6 +477,7 @@ def main():
                          "word-wrapped lines into flowing paragraphs (default: reflow). Pure "
                          "text post-processing on the model's own output, not a re-transcription.")
     args = ap.parse_args()
+    assert_local_host(OLLAMA_URL, allow_remote=os.environ.get("ALLOW_REMOTE_MODEL_HOST") == "1")
 
     input_path = pathlib.Path(args.input).expanduser()
     if not input_path.exists():
