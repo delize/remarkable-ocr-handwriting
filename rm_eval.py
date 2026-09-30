@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""
+rm_eval.py — measure transcription quality against a ground-truth page set.
+
+Every change to this pipeline (model, vocabulary, dual read, resolution) is a
+guess until it is scored on pages whose correct text is known. This runs a
+configuration over such a set and reports the numbers that decide it:
+
+  primary_wer / cer   one model, as the daemon writes without verification
+  final_wer / cer     after dual read and resolution, ignoring the flags
+  flag_rate           share of words inside ==A|B== flags (what review costs)
+  error_recall        share of word errors that sit inside a flag
+  review_wer          errors left once every flag is fixed by hand
+
+Ground truth comes from two places. The daemon files every page you correct
+in Obsidian (STATE/goldset, origin "user-edit"), and pages can be imported
+from a PDF plus a transcription you trust (origin "curated").
+
+Examples:
+  python3 rm_eval.py import-pdf note.pdf truth.json --goldset /state/goldset
+  python3 rm_eval.py run --goldset /state/goldset --model gemma4:26b --out base.json
+  python3 rm_eval.py run --goldset /state/goldset --model gemma4:26b \\
+      --verify-model qwen3.6:35b-a3b --resolve --vocab-file /state/vocab.txt --out dual.json
+  python3 rm_eval.py compare base.json dual.json
+"""
+import argparse
+import base64
+import datetime
+import difflib
+import json
+import os
+import pathlib
+import re
+import sys
+import time
+
+import rm_verify
+
+
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
+def norm(text):
+    """Words for scoring: lowercase, flags and [illegible] dropped, punctuation ignored.
+
+    A slash separates words, so "Claude/OpenAI" and "Claude / OpenAI" score
+    the same: spacing around a slash is not a misread.
+    """
+    text = rm_verify.strip_marks(text).lower().replace("’", "'")
+    text = re.sub(r"\[illegible\]", " ", text)
+    return re.sub(r"[^a-z0-9' ]+", " ", text).split()
+
+
+def edits(a, b):
+    """Levenshtein distance between two sequences."""
+    prev = list(range(len(b) + 1))
+    for i, x in enumerate(a, 1):
+        cur = [i]
+        for j, y in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (x != y)))
+        prev = cur
+    return prev[-1]
+
+
+def score(hyp, truth):
+    """``{"words", "word_errors", "chars", "char_errors"}`` for one page."""
+    r, h = norm(truth), norm(hyp)
+    rc, hc = " ".join(r), " ".join(h)
+    return {"words": len(r), "word_errors": edits(h, r), "chars": len(rc), "char_errors": edits(hc, rc)}
+
+
+def flag_score(final, truth):
+    """How well the flags on one page cover its errors.
+
+    Word errors are located with a diff against the truth. An error counts as
+    caught when a flagged word sits in it (or, for a dropped word, right next
+    to it).
+    """
+    r = norm(truth)
+    h, hf = [], []
+    for word, flagged in zip(*rm_verify.flagged_words(final)):
+        for tok in norm(word):
+            h.append(tok)
+            hf.append(flagged)
+    errors = caught = 0
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, r, h, autojunk=False).get_opcodes():
+        if op == "equal":
+            continue
+        n = max(i2 - i1, j2 - j1)
+        near = hf[j1:j2] if j2 > j1 else hf[max(0, j1 - 1):j1 + 1]
+        errors += n
+        caught += n if any(near) else 0
+    return {"flagged_words": sum(hf), "hyp_words": len(h), "diff_errors": errors, "caught": caught}
+
+
+def summarize(cases):
+    """Pooled metrics over per-case results (pooled, so long pages weigh more)."""
+    def total(k):
+        return sum(c.get(k, 0) for c in cases)
+
+    def rate(num, den):
+        return round(num / den, 4) if den else None
+
+    out = {"cases": len(cases), "words": total("words"),
+           "primary_wer": rate(total("primary_word_errors"), total("words")),
+           "primary_cer": rate(total("primary_char_errors"), total("chars")),
+           "seconds_per_page": rate(total("seconds"), len(cases))}
+    if any("final_word_errors" in c for c in cases):
+        out.update(
+            final_wer=rate(total("final_word_errors"), total("words")),
+            final_cer=rate(total("final_char_errors"), total("chars")),
+            flag_rate=rate(total("flagged_words"), total("hyp_words")),
+            error_recall=rate(total("caught"), total("diff_errors")),
+            review_wer=rate(total("diff_errors") - total("caught"), total("words")),
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Ground-truth set
+# ---------------------------------------------------------------------------
+def load_goldset(gold_dir, include_flagged=False, limit=0):
+    """Cases with an image and a truth. Pages that still carry flags are skipped by default."""
+    cases = []
+    for meta in sorted(pathlib.Path(gold_dir).glob("*.json")):
+        info = rm_verify.load_json(meta, None)
+        png = meta.with_suffix(".png")
+        if not info or not png.exists() or not info.get("truth", "").strip():
+            continue
+        if info.get("unresolved_flags") and not include_flagged:
+            continue
+        cases.append({"id": meta.stem, "png": png, **info})
+    return cases[:limit] if limit else cases
+
+
+def import_pdf(pdf, truth_pages, gold_dir, dpi=220, max_px=1568, source=None):
+    """Store each page of ``pdf`` with its trusted transcription as a curated case."""
+    import rm_ocr
+    from pdf2image import pdfinfo_from_path
+
+    n_pages = pdfinfo_from_path(str(pdf))["Pages"]
+    if n_pages != len(truth_pages):
+        raise SystemExit(f"{pdf} has {n_pages} pages but the truth has {len(truth_pages)}")
+    keys = []
+    for n, truth in enumerate(truth_pages, 1):
+        png = base64.b64decode(rm_ocr.render_page_b64(pdf, n, dpi, max_px))
+        keys.append(rm_verify.write_gold_case(gold_dir, source or str(pdf), n, truth, png,
+                                              origin="curated"))
+    return keys
+
+
+# ---------------------------------------------------------------------------
+# Running a configuration
+# ---------------------------------------------------------------------------
+def _transcribe_all(cases, model, prompt_extra, cfg, log):
+    import rm_ocr
+    out = {}
+    for c in cases:
+        t0 = time.time()
+        img = base64.b64encode(c["png"].read_bytes()).decode()
+        out[c["id"]] = (rm_ocr.ocr_image_b64(img, model, timeout=cfg["timeout"], no_think=True,
+                                             num_ctx=cfg["num_ctx"], prompt_extra=prompt_extra),
+                        time.time() - t0)
+        log(f"  {model} {c['id']} {out[c['id']][1]:.0f}s")
+    return out
+
+
+def _unload(model, log):
+    import rm_ocr
+    try:
+        rm_ocr.unload_model(model)
+    except Exception as e:  # an unload failure only costs memory, never the run
+        log(f"  unload {model} failed: {e}")
+
+
+def run(cases, *, model, verify_model="", resolve=False, resolve_model="", terms=(),
+        timeout=1800, num_ctx=16384, max_span_words=6, log=print):
+    """Score one configuration. Models run in stages so a CPU host holds one at a time."""
+    import rm_ocr
+    cfg = {"timeout": timeout, "num_ctx": num_ctx}
+    hint = rm_verify.vocab_hint(list(terms))
+    primary = _transcribe_all(cases, model, hint, cfg, log)
+    secondary = {}
+    if verify_model:
+        _unload(model, log)
+        secondary = _transcribe_all(cases, verify_model, hint, cfg, log)
+    resolver_model = resolve_model or verify_model or model
+    results = []
+    for c in cases:
+        text, secs = primary[c["id"]]
+        row = {"id": c["id"], "source": c.get("source"), "page": c.get("page"),
+               "origin": c.get("origin"), "seconds": secs}
+        s = score(text, c["truth"])
+        row.update(words=s["words"], chars=s["chars"], primary_word_errors=s["word_errors"],
+                   primary_char_errors=s["char_errors"])
+        if verify_model:
+            b_text, b_secs = secondary[c["id"]]
+            row["seconds"] += b_secs
+            resolver = None
+            if resolve:
+                img = base64.b64encode(c["png"].read_bytes()).decode()
+
+                def resolver(spans, img=img):
+                    return rm_ocr.generate_json(
+                        resolver_model, rm_verify.resolve_prompt(spans, hint), img,
+                        rm_verify.RESOLVE_SCHEMA, timeout=timeout, num_ctx=num_ctx)
+            t0 = time.time()
+            final, vstats = rm_verify.verify_page(text, b_text, resolver=resolver,
+                                                  max_span_words=max_span_words)
+            row["seconds"] += time.time() - t0
+            f = score(final, c["truth"])
+            row.update(final_word_errors=f["word_errors"], final_char_errors=f["char_errors"],
+                       **flag_score(final, c["truth"]), verify=vstats, final=final)
+        row["primary"] = text
+        results.append(row)
+    config = {"model": model, "verify_model": verify_model, "resolve": bool(resolve),
+              "resolve_model": resolver_model if resolve else "", "terms": len(terms),
+              "num_ctx": num_ctx, "max_span_words": max_span_words}
+    return {"config": config, "summary": summarize(results), "cases": results,
+            "at": datetime.datetime.now().isoformat(timespec="seconds")}
+
+
+def gate_terms(cases, model, base_terms, candidate_terms, *, tolerance=0.0, timeout=1800,
+               num_ctx=16384, log=print):
+    """Accept new learned terms only if they do not make the primary model worse.
+
+    Runs the primary model over ``cases`` with the current vocabulary and with
+    the candidate one. Returns ``(accepted, base_summary, candidate_summary)``.
+    """
+    base = run(cases, model=model, terms=base_terms, timeout=timeout, num_ctx=num_ctx, log=log)
+    cand = run(cases, model=model, terms=list(base_terms) + list(candidate_terms),
+               timeout=timeout, num_ctx=num_ctx, log=log)
+    b, c = base["summary"]["primary_cer"], cand["summary"]["primary_cer"]
+    accepted = b is not None and c is not None and c <= b + tolerance
+    return accepted, base["summary"], cand["summary"]
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+_COLUMNS = ["primary_wer", "primary_cer", "final_wer", "final_cer", "flag_rate",
+            "error_recall", "review_wer", "seconds_per_page"]
+
+
+def _fmt(k, v):
+    if v is None:
+        return "-"
+    return f"{v:.0f}" if k == "seconds_per_page" else f"{v:.1%}"
+
+
+def compare(paths):
+    runs = [json.loads(pathlib.Path(p).read_text()) for p in paths]
+    width = max(len(pathlib.Path(p).name) for p in paths)
+    print(" " * width + "".join(f"{k:>18}" for k in _COLUMNS))
+    for p, r in zip(paths, runs):
+        s = r["summary"]
+        print(f"{pathlib.Path(p).name:<{width}}" + "".join(f"{_fmt(k, s.get(k)):>18}" for k in _COLUMNS))
+    return runs
+
+
+def _terms_from(args):
+    terms = []
+    if args.vocab_file:
+        terms += rm_verify.parse_terms(pathlib.Path(args.vocab_file).read_text())
+    if args.learned:
+        terms += [t for t in rm_verify.LearnedVocab(args.learned).active() if t not in terms]
+    return terms
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    r = sub.add_parser("run", help="Score a configuration on the ground-truth set")
+    r.add_argument("--goldset", default=os.environ.get("GOLDSET_DIR", "/state/goldset"))
+    r.add_argument("--model", default=os.environ.get("MODEL", "gemma4:26b"))
+    r.add_argument("--verify-model", default="")
+    r.add_argument("--resolve", action="store_true", help="Settle disagreements against the image")
+    r.add_argument("--resolve-model", default="", help="Default: the verify model")
+    r.add_argument("--vocab-file", default="")
+    r.add_argument("--learned", default="", help="learned_vocab.json; its active terms join the hint")
+    r.add_argument("--num-ctx", type=int, default=16384)
+    r.add_argument("--timeout", type=int, default=1800)
+    r.add_argument("--max-span-words", type=int, default=6)
+    r.add_argument("--limit", type=int, default=0, help="Score only the first N pages")
+    r.add_argument("--include-flagged", action="store_true",
+                   help="Also score edited pages that still carry unresolved flags")
+    r.add_argument("--out", required=True)
+    r.add_argument("--history", default="", help="Append the summary to this JSONL file")
+
+    c = sub.add_parser("compare", help="Side-by-side summaries of saved runs")
+    c.add_argument("runs", nargs="+")
+    c.add_argument("--gate", action="store_true",
+                   help="Exit 1 unless the last run's final (or primary) CER beats the first's")
+
+    i = sub.add_parser("import-pdf", help="Add a PDF's pages with a trusted transcription")
+    i.add_argument("pdf")
+    i.add_argument("truth", help="JSON: a list of page texts, or an object holding one")
+    i.add_argument("--key", default="", help="Which entry of a JSON object to use")
+    i.add_argument("--goldset", default=os.environ.get("GOLDSET_DIR", "/state/goldset"))
+    i.add_argument("--dpi", type=int, default=int(os.environ.get("DPI", "220")))
+    i.add_argument("--max-px", type=int, default=int(os.environ.get("MAX_PX", "1568")))
+    i.add_argument("--source", default="", help="Name recorded for the case (default: the path)")
+
+    ls = sub.add_parser("list", help="Show the ground-truth set")
+    ls.add_argument("--goldset", default=os.environ.get("GOLDSET_DIR", "/state/goldset"))
+
+    args = ap.parse_args()
+    if args.cmd == "run":
+        cases = load_goldset(args.goldset, include_flagged=args.include_flagged, limit=args.limit)
+        if not cases:
+            sys.exit(f"no ground-truth pages in {args.goldset}")
+        result = run(cases, model=args.model, verify_model=args.verify_model, resolve=args.resolve,
+                     resolve_model=args.resolve_model, terms=_terms_from(args), timeout=args.timeout,
+                     num_ctx=args.num_ctx, max_span_words=args.max_span_words)
+        rm_verify.save_json(args.out, result)
+        if args.history:
+            with open(args.history, "a") as f:
+                f.write(json.dumps({"at": result["at"], "config": result["config"],
+                                    "summary": result["summary"]}) + "\n")
+        compare([args.out])
+    elif args.cmd == "compare":
+        runs = compare(args.runs)
+        if args.gate and len(runs) > 1:
+            def cer(s):
+                return s.get("final_cer") if s.get("final_cer") is not None else s.get("primary_cer")
+            first, last = cer(runs[0]["summary"]), cer(runs[-1]["summary"])
+            sys.exit(0 if first is not None and last is not None and last < first else 1)
+    elif args.cmd == "import-pdf":
+        data = json.loads(pathlib.Path(args.truth).read_text())
+        pages = data[args.key] if args.key else data
+        if not isinstance(pages, list):
+            sys.exit("truth must be a list of page texts (use --key for an object)")
+        keys = import_pdf(args.pdf, pages, args.goldset, dpi=args.dpi, max_px=args.max_px,
+                          source=args.source or None)
+        print(f"imported {len(keys)} page(s) into {args.goldset}")
+    elif args.cmd == "list":
+        for c in load_goldset(args.goldset, include_flagged=True):
+            flags = f"  ({c['unresolved_flags']} open flags)" if c.get("unresolved_flags") else ""
+            print(f"{c['id']}  {c.get('origin', '?'):9}  {c.get('source')} p{c.get('page')}{flags}")
+
+
+if __name__ == "__main__":
+    main()
