@@ -124,8 +124,119 @@ def reflow_paragraphs(text):
     return "\n".join(out_lines)
 
 
+def _stream_generate(payload, timeout):
+    """POST a streaming /api/generate request; returns ``(text, think_chars, done_reason)``.
+
+    ``timeout`` is the per-read socket timeout. The first read blocks through
+    the whole prefill, so it must be generous on CPU.
+    """
+    req = urllib.request.Request(
+        OLLAMA_URL, data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    parts = []
+    think_chars = 0
+    done_reason = None
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        for raw in resp:
+            raw = raw.strip()
+            if not raw:
+                continue
+            obj = json.loads(raw)
+            if obj.get("error"):
+                raise RuntimeError(obj["error"])
+            if obj.get("response"):
+                parts.append(obj["response"])
+            # A reasoning model streams its trace here, NOT into "response".
+            # Counted (not kept) purely so an empty answer can be explained.
+            if obj.get("thinking"):
+                think_chars += len(obj["thinking"])
+            if obj.get("done"):
+                done_reason = obj.get("done_reason")
+                break
+    return "".join(parts).strip(), think_chars, done_reason
+
+
+def _options(cpu=False, threads=None, num_ctx=0):
+    opts = {"temperature": 0}
+    if num_ctx:
+        opts["num_ctx"] = num_ctx
+    if cpu:
+        opts["num_gpu"] = 0
+    if threads:
+        opts["num_thread"] = threads
+    return opts
+
+
+def image_b64(page, max_px):
+    """Downscale a PIL page so its longest side fits ``max_px``; return it as base64 PNG."""
+    w, h = page.size
+    s = min(1.0, max_px / max(w, h))
+    if s < 1.0:
+        page = page.resize((int(w * s), int(h * s)))
+    buf = io.BytesIO()
+    page.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def render_page_b64(pdf, n, dpi, max_px):
+    """Rasterize page ``n`` (1-based) of ``pdf`` exactly as OCR sees it, as base64 PNG."""
+    page = convert_from_path(str(pdf), dpi=dpi, first_page=n, last_page=n)[0]
+    return image_b64(page, max_px)
+
+
+def ocr_image_b64(img_b64, model, *, timeout=1800, no_think=False, num_ctx=0, threads=None,
+                  prompt_extra="", reflow=True):
+    """Transcribe one already-encoded page image with the standard prompt.
+
+    Used by the evaluation runner, which scores pages from a stored image set
+    rather than from source PDFs.
+    """
+    prompt = f"{PROMPT}\n\n{prompt_extra}" if prompt_extra else PROMPT
+    payload = {"model": model, "prompt": prompt, "images": [img_b64], "stream": True,
+               "keep_alive": "30m", "options": _options(threads=threads, num_ctx=num_ctx)}
+    if no_think:
+        payload["think"] = False
+    text, _, _ = _stream_generate(payload, timeout)
+    return reflow_paragraphs(text) if reflow else text
+
+
+def generate_json(model, prompt, img_b64, schema, *, timeout=1800, num_ctx=0, threads=None):
+    """Ask ``model`` a question about one image and return its answer parsed as JSON.
+
+    ``schema`` is passed as Ollama's ``format`` so the answer is constrained to
+    it. Returns None when the answer does not parse, so a caller can treat the
+    question as unanswered instead of failing the document.
+    """
+    payload = {"model": model, "prompt": prompt, "images": [img_b64], "stream": True,
+               "keep_alive": "30m", "format": schema, "think": False,
+               "options": _options(threads=threads, num_ctx=num_ctx)}
+    text, _, _ = _stream_generate(payload, timeout)
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
+
+
+def unload_model(model, timeout=120):
+    """Ask Ollama to drop ``model`` from memory now instead of after keep_alive.
+
+    A CPU host that cannot hold two large models at once calls this between
+    passes with different models. Failure is logged by the caller, never fatal.
+    """
+    body = json.dumps({"model": model, "keep_alive": 0}).encode()
+    req = urllib.request.Request(OLLAMA_URL, data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        r.read()
+
+
 def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_think=False,
-           skip_blank=True, page_regions=None, reflow=True, num_ctx=0):
+           skip_blank=True, page_regions=None, reflow=True, num_ctx=0, prompt_extra=""):
+    """Transcribe every page of ``pdf``; returns ``[(page_number, text), ...]``.
+
+    ``prompt_extra`` is appended to the prompt for every page (the vocabulary
+    hint, see ``rm_verify.vocab_hint``).
+    """
     results = []
     empty_pages = 0
     opts = {"temperature": 0}
@@ -159,11 +270,11 @@ def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_t
             page = page.resize((int(w * s), int(h * s)))
         buf = io.BytesIO()
         page.save(buf, format="PNG")
-        prompt = PROMPT
+        prompt = f"{PROMPT}\n\n{prompt_extra}" if prompt_extra else PROMPT
         if page_regions and n - 1 < len(page_regions):
             hint = rm_strokes.prompt_hint(page_regions[n - 1])
             if hint:
-                prompt = f"{PROMPT}\n\n{hint}"
+                prompt = f"{prompt}\n\n{hint}"
         payload = {
             "model": model,
             "prompt": prompt,
@@ -174,35 +285,9 @@ def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_t
         }
         if no_think:
             payload["think"] = False   # OCR wants a direct transcription, not a reasoning trace
-        req = urllib.request.Request(
-            OLLAMA_URL, data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-        )
         print(f"    page {n}/{num_pages} (prefill on CPU may take minutes)...", end="", flush=True)
-        parts = []
-        think_chars = 0
-        done_reason = None
-        # `timeout` is the per-read socket timeout; the first read blocks through
-        # the whole prefill, so it must be generous on CPU.
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            for raw in resp:
-                raw = raw.strip()
-                if not raw:
-                    continue
-                obj = json.loads(raw)
-                if obj.get("error"):
-                    raise RuntimeError(obj["error"])
-                if obj.get("response"):
-                    parts.append(obj["response"])
-                # A reasoning model streams its trace here, NOT into "response".
-                # Counted (not kept) purely so an empty answer can be explained.
-                if obj.get("thinking"):
-                    think_chars += len(obj["thinking"])
-                if obj.get("done"):
-                    done_reason = obj.get("done_reason")
-                    break
-        print(f" {len(''.join(parts))} chars", flush=True)
-        text = "".join(parts).strip()
+        text, think_chars, done_reason = _stream_generate(payload, timeout)
+        print(f" {len(text)} chars", flush=True)
         if not text:
             # An empty answer used to be written out as an empty page under
             # status=ok, which is indistinguishable from a blank page and hides
