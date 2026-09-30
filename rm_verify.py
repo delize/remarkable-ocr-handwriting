@@ -35,7 +35,9 @@ from dataclasses import dataclass
 
 MARK = "=={a}|{b}=="
 EMPTY = "?"                       # stands in for "this reading has nothing here"
-MARK_RE = re.compile(r"==([^=|\n]*)\|([^=\n]*)==")
+# Lazy on both sides so a reading that itself contains "=" (gemma once read a
+# time as "#=36-37") still parses as one flag.
+MARK_RE = re.compile(r"==([^|\n]*?)\|([^\n]*?)==")
 _PUNCT = ".,;:!?\"'()[]{}*_`~<>-\u2013\u2014#=+|\\/"
 _PAGE_RE = re.compile(r"^## Page (\d+)\s*$", re.MULTILINE)
 
