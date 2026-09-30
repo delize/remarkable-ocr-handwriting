@@ -197,10 +197,13 @@ VOCAB_FILE = pathlib.Path(os.environ.get("VOCAB_FILE", str(STATE / "vocab.txt"))
 VERIFY_MODEL = os.environ.get("VERIFY_MODEL", "").strip()
 VERIFY_PATHS = tuple(p.strip().strip("/") for p in os.environ.get("VERIFY_PATHS", "").split(",")
                      if p.strip())
-# VERIFY_RESOLVE: put each disagreement back to a model with the page image as a
-# constrained choice (A, B, the exact text, or unsure) before flagging it.
-# RESOLVE_MODEL defaults to VERIFY_MODEL, which is already loaded at that point.
-VERIFY_RESOLVE = _env_bool("VERIFY_RESOLVE", True)
+# VERIFY_RESOLVE (opt-in): put each disagreement back to a model with the page
+# image as a constrained choice (A, B, the exact text, or unsure) instead of
+# flagging it. Measured on 26 pages it answered 88 of 90 questions and was
+# barely better than chance: WER 5.4% -> 5.1% unattended, at ~90 s extra per
+# page, and it removed the flags that let review reach 1.9%. Flags stay the
+# default. RESOLVE_MODEL defaults to VERIFY_MODEL, already loaded at that point.
+VERIFY_RESOLVE = _env_bool("VERIFY_RESOLVE", False)
 RESOLVE_MODEL = os.environ.get("RESOLVE_MODEL", "").strip() or VERIFY_MODEL
 VERIFY_MAX_SPAN_WORDS = int(os.environ.get("VERIFY_MAX_SPAN_WORDS", "6"))
 # VERIFY_UNLOAD: drop one model before loading the other, for a CPU host that

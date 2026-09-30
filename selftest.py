@@ -1055,7 +1055,6 @@ def main():
     # Daemon wiring. Each model returns its own reading; the resolver picks B.
     VDIR = tmp / "vault/remarkable/Verify"
     VDIR.mkdir(parents=True, exist_ok=True)
-    (VDIR / "Roadmap.pdf").write_text("roadmap-v1")
     (tmp / "vault/remarkable/Work/Plain.pdf").write_text("plain-v1")
     READINGS = {"gemma4:26b": "We use Palantir with GH Actions.",
                 "qwen3.6:35b-a3b": "We use Pulumi with GH Actions."}
@@ -1066,7 +1065,7 @@ def main():
         return [(1, READINGS.get(model, "?")), (2, "Second page agrees.")]
 
     saved = {n: getattr(ocr_daemon, n) for n in (
-        "ocr_pdf", "VERIFY_MODEL", "RESOLVE_MODEL", "VERIFY_PATHS", "VOCAB_FILE",
+        "ocr_pdf", "VERIFY_MODEL", "RESOLVE_MODEL", "VERIFY_RESOLVE", "VERIFY_PATHS", "VOCAB_FILE",
         "USE_LEARNED_VOCAB", "LEARN_GATE", "LEARN_MIN_COUNT")}
     saved_rm = {n: getattr(rm_ocr, n) for n in ("render_page_b64", "generate_json", "unload_model")}
     unloaded = []
@@ -1077,6 +1076,15 @@ def main():
         rm_ocr.unload_model = lambda m, **k: unloaded.append(m)
         ocr_daemon.VERIFY_MODEL = ocr_daemon.RESOLVE_MODEL = "qwen3.6:35b-a3b"
         ocr_daemon.VERIFY_PATHS = ("Verify",)
+        check("daemon verify: resolution is off by default (flags only)", ocr_daemon.VERIFY_RESOLVE, False)
+        (VDIR / "Flags.pdf").write_text("flags-v1")
+        ocr_daemon.scan_once(ocr_daemon.load_manifest())
+        frec = ocr_daemon.load_manifest()["remarkable/Verify/Flags.pdf"]
+        check("daemon verify: by default a disagreement is written as a flag",
+              "==Palantir|Pulumi==" in ocr_daemon._out_md_path(frec["out_path"]).read_text(), True)
+        ocr_daemon.VERIFY_RESOLVE = True
+        prompts.clear()
+        (VDIR / "Roadmap.pdf").write_text("roadmap-v1")
         vocab = tmp / "state/vocab.txt"
         vocab.write_text("Pulumi, GH Actions\n")
         ocr_daemon.VOCAB_FILE = vocab

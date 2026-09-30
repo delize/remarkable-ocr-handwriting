@@ -222,9 +222,9 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `DAILY_NOTE_DIR` | `Daily Journal` | Daily-notes folder, relative to `VAULT_DIR`. Must be **outside** `SOURCE_SUBDIR` (refused at startup otherwise) |
 | `DAILY_NOTE_HEADING` | `## reMarkable journal` | Heading of the appended section |
 | `VOCAB_FILE` | `$STATE_DIR/vocab.txt` | Your own terms (comma or newline separated, `#` comments). When the file exists, the prompt asks the model to prefer these spellings for ambiguous words. See [Self-checking transcripts](#self-checking-transcripts) |
-| `VERIFY_MODEL` | _(empty)_ | Second vision model. Each page is read twice and disagreements are resolved or flagged as `==A\|B==`. Roughly doubles OCR time |
+| `VERIFY_MODEL` | _(empty)_ | Second vision model. Each page is read twice and disagreements are flagged as `==A\|B==`. Roughly doubles OCR time |
 | `VERIFY_PATHS` | _(empty)_ | Comma-separated folders under `SOURCE_SUBDIR` to verify (e.g. `Work,Meeting Notes`). Empty = everything |
-| `VERIFY_RESOLVE` | `1` | Ask a model to settle each disagreement against the page image before flagging it |
+| `VERIFY_RESOLVE` | `0` | `1` = ask a model to settle each disagreement against the page image instead of flagging it. Not recommended: measured barely better than chance, ~90 s extra per page, and it removes the flags |
 | `RESOLVE_MODEL` | `$VERIFY_MODEL` | Model that answers the resolution questions |
 | `VERIFY_MAX_SPAN_WORDS` | `6` | Longer disagreements are layout differences (a diagram read in another order), not misreads, and are left alone |
 | `VERIFY_UNLOAD` | `1` | Unload one model before loading the other, for a host that cannot hold both |
@@ -577,13 +577,17 @@ Pulumi, Terraform, LiteLLM, Gartner, Permiso, Verkada
 
 The prompt then asks the model to use those spellings when a word is ambiguous, and to write arrows as plain `->`. Measured on 16 jargon-heavy pages: WER 9.6% to 8.6% (gemma4:26b) and 8.5% to 7.8% (qwen3.6:35b-a3b), no speed cost. It pulls near misses toward listed terms (CIMD became SCIM when only SCIM was listed), so list your full working vocabulary rather than a sample.
 
-**Dual read.** With `VERIFY_MODEL` set, every page (or every page under `VERIFY_PATHS`) is transcribed a second time and the two readings are aligned word by word. Where they agree the text stands. Where they differ, the span is put back to `RESOLVE_MODEL` together with the page image as a constrained question: reading A, reading B, the exact text if neither, or unsure. It is asked what is written, never which reading sounds better, because models misread handwriting mostly by writing the plausible word instead of the written one, and a text-only "clean up" pass makes that worse. Whatever stays unsure is written as a highlight:
+**Dual read.** With `VERIFY_MODEL` set, every page (or every page under `VERIFY_PATHS`) is transcribed a second time and the two readings are aligned word by word. Where they agree the text stands. Where they differ, the span is written as a highlight:
 
 ```markdown
 We moved the ==CIMD|SCIM== metadata into the ==Serval|Several== workflow.
 ```
 
-Obsidian renders `==text==` as a highlight, so reviewing a transcript means reading the highlights. The first reading is the primary model's, the second is the verify model's, and `?` means that reading had nothing there. Frontmatter records `verify_model`, `verify_resolved` and `verify_flagged`. Measured on the same 26 pages with flags alone: about 6% of words flagged, about two thirds of the primary model's errors inside a flag, and WER falls from 6.2% to 2.2% once the flags are fixed.
+Obsidian renders `==text==` as a highlight, so reviewing a transcript means reading the highlights. The first reading is the primary model's, the second is the verify model's, and `?` means that reading had nothing there. Frontmatter records `verify_model` and `verify_flagged`.
+
+Measured on 26 hand-checked pages with gemma4:26b as primary, qwen3.6:35b-a3b as verifier and the vocabulary hint: about 5% of words flagged, and WER falls from 5.4% to 1.9% once the flags are fixed. It costs a second full read, about 140 s per page instead of 66 on a CPU-only host.
+
+`VERIFY_RESOLVE=1` instead puts each disagreement back to `RESOLVE_MODEL` with the page image as a constrained question (reading A, reading B, the exact text if neither, or unsure). On the same pages it answered 88 of 90 questions, choosing unsure only twice, and its choices were barely better than chance: unattended WER went from 5.4% to 5.1%, at about 90 s more per page, while the flags that make review effective disappeared. It stays available for experiments but is off by default.
 
 **Learning from your edits.** With `LEARN_CORRECTIONS` (on by default) the daemon keeps a sidecar of what it wrote to each transcript. When you fix a transcript in Obsidian, the next pass notices, and:
 
@@ -594,7 +598,7 @@ Obsidian renders `==text==` as a highlight, so reviewing a transcript means read
 
 With `USE_LEARNED_VOCAB=1`, a term corrected in `LEARN_MIN_COUNT` different places is tested before it joins the hint: the primary model reads up to `LEARN_GATE_PAGES` ground-truth pages with and without it, and the term is activated only if the character error rate is no worse. A rejected term is not retried. Each decision is appended to `STATE_DIR/eval/history.jsonl`.
 
-`--status` summarizes all of it: disagreements resolved and flagged, corrections harvested, ground-truth pages, and learned terms (active, candidate, rejected).
+`--status` summarizes all of it: disagreements flagged (and resolved, if `VERIFY_RESOLVE` is on), corrections harvested, ground-truth pages, and learned terms (active, candidate, rejected).
 
 **Measuring a change.** `rm_eval.py` scores any configuration against the ground-truth set:
 
