@@ -73,6 +73,7 @@ repeat-prevention design.
 
 ## Safety guarantees (enforced in code)
 
+- Handwriting never leaves your machines. At startup the daemon, the CLI and `rm_eval.py` resolve the model host and refuse to run if any address it resolves to is public. Loopback, private LAN ranges, link-local and `100.64.0.0/10` (Tailscale) count as local. `ALLOW_REMOTE_MODEL_HOST=1` downgrades the refusal to a warning, for a deployment that knowingly runs its model elsewhere.
 - The vault is mounted **fully read-only** (default); transcripts go to a separate
   `OUT_DIR` volume, so nothing is ever written back into the vault.
 - `safe_output_path()` proves every target is a `.md`, never equals the source
@@ -191,6 +192,7 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `VISION_CHECK` | `1` | Startup gate: prove the model actually **receives** the images. A runner that drops them makes the model invent a fluent transcript that looks successful. See [The vision gate](#the-vision-gate) |
 | `VISION_CHECK_MIN_TOKENS` | `64` | Minimum extra prompt tokens a 1024×1024 image must cost over a 64×64 one. Measured growth: `qwen3.5:9b` +1015, `gemma4:26b` +207; a runner that drops images stays flat |
 | `NUM_CTX` | `0` | Model context window in tokens (`0` = Ollama's default of 4096). A page image alone costs ~1800, so a model that reasons first can run out and return **nothing**. **Set `16384` for real handwriting** — dense pages exhaust 4096 even with `IMAGE_AUTOCONTRAST` on. Costs VRAM |
+| `ALLOW_REMOTE_MODEL_HOST` | `0` | `1` = allow a model host that resolves to a public address (warns instead of refusing). Leave off to keep every page on your own network |
 | `MODEL_WAIT_TIMEOUT` | `1800` | Block at startup until the model is loadable on `OLLAMA_HOST`. `0` disables the gate (see [Startup readiness gate](#startup-readiness-gate)) |
 | `INTERVAL` | `600` | Poll seconds — the latency floor; an inotify event short-circuits this |
 | `INOTIFY` | `1` | `1` = wake immediately on `CLOSE_WRITE` / `MOVED_TO` for any supported input under `SOURCE_SUBDIR` (Linux only; falls back to pure poll if unavailable). See [Inotify wake-up](#inotify-wake-up) |
@@ -604,6 +606,8 @@ python3 rm_eval.py run --model gemma4:26b --verify-model qwen3.6:35b-a3b --resol
     --vocab-file /state/vocab.txt --out full.json
 python3 rm_eval.py compare base.json full.json
 ```
+
+To prepare local fine-tuning data from the same set, `python3 rm_eval.py export --out /state/train --holdout 0.25` writes the page images with `train.jsonl` and `holdout.jsonl` (plain image and text pairs plus chat-style `messages`). The split is stable by page, and a tuned model should be scored only on the holdout with `run --ids /state/train/holdout.ids`, otherwise it is graded on pages it memorized.
 
 It reports `primary_wer`/`primary_cer` (one model), `final_wer`/`final_cer` (after resolution, ignoring flags), `flag_rate` (how much there is to review), `error_recall` (share of errors inside a flag) and `review_wer` (errors left once the flags are fixed). Scoring ignores case, punctuation and spacing around a slash. Models run in stages so a CPU host holds one at a time.
 
