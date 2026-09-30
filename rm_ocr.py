@@ -124,23 +124,67 @@ def reflow_paragraphs(text):
     return "\n".join(out_lines)
 
 
-def non_local_addresses(url):
-    """Addresses ``url``'s host resolves to that are on the public internet.
+def on_link_networks(proc="/proc/net"):
+    """Subnets directly attached to this machine (Linux), from the kernel route tables.
+
+    A destination on one of these is reached without passing a router, so it
+    cannot leave the local network even when its address is globally routable.
+    That is the normal case for Docker with IPv6 on a delegated prefix: the
+    Ollama container gets a public-looking address on the same bridge. Other
+    systems return an empty list and rely on LOCAL_MODEL_NETS.
+    """
+    import ipaddress
+    nets = []
+    try:
+        for line in open(f"{proc}/route").read().splitlines()[1:]:
+            f = line.split()
+            dest, gateway, mask = (int(f[i], 16) for i in (1, 2, 7))
+            if gateway == 0 and mask:
+                nets.append(ipaddress.ip_network(
+                    (ipaddress.IPv4Address(dest.to_bytes(4, "little")),
+                     bin(mask).count("1")), strict=False))
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        for line in open(f"{proc}/ipv6_route").read().splitlines():
+            f = line.split()
+            dest, plen, next_hop = f[0], int(f[1], 16), f[4]
+            if 0 < plen < 128 and int(next_hop, 16) == 0 and not dest.startswith("ff"):
+                nets.append(ipaddress.ip_network(
+                    (ipaddress.IPv6Address(bytes.fromhex(dest)), plen), strict=False))
+    except (OSError, ValueError, IndexError):
+        pass
+    return nets
+
+
+def non_local_addresses(url, extra_nets=None):
+    """Addresses ``url``'s host resolves to that would leave the local network.
 
     Every page image goes to this host. The project's founding rule is that
-    handwriting never leaves the owner's machines, so only loopback, private
-    LAN, link-local and carrier-grade NAT (100.64.0.0/10, which Tailscale uses)
-    addresses count as local. Raises ``socket.gaierror`` when the name does
-    not resolve.
+    handwriting never leaves the owner's machines. An address is local when it
+    is not publicly routable (loopback, private LAN, link-local, and
+    100.64.0.0/10, which Tailscale uses), when it sits on a subnet directly
+    attached to this machine, or when it falls in ``extra_nets``
+    (LOCAL_MODEL_NETS, comma-separated CIDRs). Raises ``socket.gaierror``
+    when the name does not resolve.
     """
     import ipaddress
     import socket
     from urllib.parse import urlsplit
 
+    if extra_nets is None:
+        extra_nets = os.environ.get("LOCAL_MODEL_NETS", "")
+    nets = on_link_networks() + [ipaddress.ip_network(n.strip(), strict=False)
+                                 for n in extra_nets.split(",") if n.strip()]
     parts = urlsplit(url if "://" in url else f"http://{url}")
     host, port = parts.hostname, parts.port or 11434
     addrs = {info[4][0] for info in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)}
-    return sorted(a for a in addrs if ipaddress.ip_address(a.split("%")[0]).is_global)
+    out = []
+    for a in sorted(addrs):
+        ip = ipaddress.ip_address(a.split("%")[0])
+        if ip.is_global and not any(ip.version == n.version and ip in n for n in nets):
+            out.append(a)
+    return out
 
 
 def assert_local_host(url, *, allow_remote=False, wait=0, log=print):

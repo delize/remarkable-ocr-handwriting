@@ -73,7 +73,7 @@ repeat-prevention design.
 
 ## Safety guarantees (enforced in code)
 
-- Handwriting never leaves your machines. At startup the daemon, the CLI and `rm_eval.py` resolve the model host and refuse to run if any address it resolves to is public. Loopback, private LAN ranges, link-local and `100.64.0.0/10` (Tailscale) count as local. `ALLOW_REMOTE_MODEL_HOST=1` downgrades the refusal to a warning, for a deployment that knowingly runs its model elsewhere.
+- Handwriting never leaves your machines. At startup the daemon, the CLI and `rm_eval.py` resolve the model host and refuse to run if any address it resolves to is public. Loopback, private LAN ranges, link-local, `100.64.0.0/10` (Tailscale) and any subnet directly attached to the machine count as local. The last one matters for Docker with IPv6 on a delegated prefix, where the Ollama container gets a globally routable address on the same bridge. On systems without Linux's `/proc/net` route tables, list such networks in `LOCAL_MODEL_NETS`. `ALLOW_REMOTE_MODEL_HOST=1` downgrades the refusal to a warning, for a deployment that knowingly runs its model elsewhere.
 - The vault is mounted **fully read-only** (default); transcripts go to a separate
   `OUT_DIR` volume, so nothing is ever written back into the vault.
 - `safe_output_path()` proves every target is a `.md`, never equals the source
@@ -193,6 +193,7 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `VISION_CHECK_MIN_TOKENS` | `64` | Minimum extra prompt tokens a 1024×1024 image must cost over a 64×64 one. Measured growth: `qwen3.5:9b` +1015, `gemma4:26b` +207; a runner that drops images stays flat |
 | `NUM_CTX` | `0` | Model context window in tokens (`0` = Ollama's default of 4096). A page image alone costs ~1800, so a model that reasons first can run out and return **nothing**. **Set `16384` for real handwriting** — dense pages exhaust 4096 even with `IMAGE_AUTOCONTRAST` on. Costs VRAM |
 | `ALLOW_REMOTE_MODEL_HOST` | `0` | `1` = allow a model host that resolves to a public address (warns instead of refusing). Leave off to keep every page on your own network |
+| `LOCAL_MODEL_NETS` | _(empty)_ | Extra CIDRs the local-only guard treats as local, comma separated. Linux reads directly attached subnets from the kernel, so this is rarely needed there |
 | `MODEL_WAIT_TIMEOUT` | `1800` | Block at startup until the model is loadable on `OLLAMA_HOST`. `0` disables the gate (see [Startup readiness gate](#startup-readiness-gate)) |
 | `INTERVAL` | `600` | Poll seconds — the latency floor; an inotify event short-circuits this |
 | `INOTIFY` | `1` | `1` = wake immediately on `CLOSE_WRITE` / `MOVED_TO` for any supported input under `SOURCE_SUBDIR` (Linux only; falls back to pure poll if unavailable). See [Inotify wake-up](#inotify-wake-up) |

@@ -1171,6 +1171,26 @@ def main():
           len(warned) == 1 and "WARNING" in warned[0], True)
     rm_ocr.assert_local_host("http://192.168.50.2:11434")
     check("local guard: a LAN host passes silently", True, True)
+    # Docker with IPv6 on a delegated prefix gives the Ollama container a
+    # globally routable address on the same bridge (seen in production). The
+    # kernel's on-link routes are what make it local.
+    procdir = tmp / "proc-net"
+    procdir.mkdir()
+    (procdir / "route").write_text(
+        "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n"
+        "eth0\t00000000\t010013AC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n"
+        "eth0\t000013AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n")
+    (procdir / "ipv6_route").write_text(
+        "200120423419a6040000000000000000 40 " + "0" * 32 + " 00 " + "0" * 32
+        + " 00000100 0000000a 00000000 00000001 eth0\n"
+        + "0" * 32 + " 00 " + "0" * 32 + " 00 200120423419a6040000000000000001"
+        + " 00000400 00000001 00000000 00000003 eth0\n")
+    check("local guard: on-link subnets come from the kernel route tables, not the default route",
+          [str(n) for n in rm_ocr.on_link_networks(str(procdir))],
+          ["172.19.0.0/16", "2001:2042:3419:a604::/64"])
+    check("local guard: LOCAL_MODEL_NETS makes a listed global prefix local",
+          rm_ocr.non_local_addresses("http://[2001:2042:3419:a604::34]:11434",
+                                     extra_nets="2001:2042:3419:a604::/64"), [])
 
     # --- export: local fine-tuning data with a stable holdout ---
     for i in range(12):
