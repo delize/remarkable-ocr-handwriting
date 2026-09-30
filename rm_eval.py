@@ -113,6 +113,12 @@ def summarize(cases):
             error_recall=rate(total("caught"), total("diff_errors")),
             review_wer=rate(total("diff_errors") - total("caught"), total("words")),
         )
+    fo = [c["flags_only"] for c in cases if "flags_only" in c]
+    if fo:
+        out.update(
+            flags_only_flag_rate=rate(sum(x["flagged_words"] for x in fo), sum(x["hyp_words"] for x in fo)),
+            flags_only_review_wer=rate(sum(x["diff_errors"] - x["caught"] for x in fo), total("words")),
+        )
     return out
 
 
@@ -211,6 +217,11 @@ def run(cases, *, model, verify_model="", resolve=False, resolve_model="", terms
             f = score(final, c["truth"])
             row.update(final_word_errors=f["word_errors"], final_char_errors=f["char_errors"],
                        **flag_score(final, c["truth"]), verify=vstats, final=final)
+            if resolve:
+                # The same two readings with flags only, so one run shows what
+                # resolution adds over flagging.
+                flagged_only, _ = rm_verify.verify_page(text, b_text, max_span_words=max_span_words)
+                row["flags_only"] = flag_score(flagged_only, c["truth"])
         row["primary"] = text
         results.append(row)
     config = {"model": model, "verify_model": verify_model, "resolve": bool(resolve),
