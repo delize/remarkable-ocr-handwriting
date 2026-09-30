@@ -1154,6 +1154,39 @@ def main():
         for n, v in saved_rm.items():
             setattr(rm_ocr, n, v)
 
+    # --- local-only guard: page images never go to a public host ---
+    for url in ("http://127.0.0.1:11434", "http://192.168.50.2:11434", "http://10.0.0.5",
+                "http://172.18.0.3:11434", "http://100.101.102.103:11434", "http://[::1]:11434"):
+        check(f"local guard: {url} is local", rm_ocr.non_local_addresses(url), [])
+    check("local guard: a public address is caught",
+          rm_ocr.non_local_addresses("http://8.8.8.8:11434"), ["8.8.8.8"])
+    try:
+        rm_ocr.assert_local_host("http://8.8.8.8:11434")
+        check("local guard: a public host is refused", False, True)
+    except SystemExit as e:
+        check("local guard: a public host is refused", "public address" in str(e), True)
+    warned = []
+    rm_ocr.assert_local_host("http://8.8.8.8:11434", allow_remote=True, log=warned.append)
+    check("local guard: ALLOW_REMOTE_MODEL_HOST turns the refusal into a warning",
+          len(warned) == 1 and "WARNING" in warned[0], True)
+    rm_ocr.assert_local_host("http://192.168.50.2:11434")
+    check("local guard: a LAN host passes silently", True, True)
+
+    # --- export: local fine-tuning data with a stable holdout ---
+    for i in range(12):
+        rm_verify.write_gold_case(gdir, f"doc{i}.pdf", 1, f"page text {i}", b"png")
+    xcases = rm_eval.load_goldset(gdir)
+    counts = rm_eval.export(xcases, tmp / "export-test", holdout=0.25, prompt="P")
+    check("export: every page lands in train or holdout",
+          counts["train"] + counts["holdout"], len(xcases))
+    first = _json2.loads((tmp / "export-test/train.jsonl").read_text().splitlines()[0])
+    check("export: lines carry the image, text and chat messages",
+          (first["image"].startswith("images/"), first["messages"][1]["content"][0]["text"] == first["text"],
+           (tmp / "export-test" / first["image"]).read_bytes()), (True, True, b"png"))
+    held = set((tmp / "export-test/holdout.ids").read_text().split())
+    check("export: holdout ids are never in train",
+          held & set((tmp / "export-test/train.ids").read_text().split()), set())
+
     print(f"\n--- sample transcript ---\n{md}")
     if failures:
         print(f"\n{len(failures)} FAILURE(S): {failures}")

@@ -22,11 +22,13 @@ Examples:
   python3 rm_eval.py run --goldset /state/goldset --model gemma4:26b \\
       --verify-model qwen3.6:35b-a3b --resolve --vocab-file /state/vocab.txt --out dual.json
   python3 rm_eval.py compare base.json dual.json
+  python3 rm_eval.py export --goldset /state/goldset --out /state/train --holdout 0.25
 """
 import argparse
 import base64
 import datetime
 import difflib
+import hashlib
 import json
 import os
 import pathlib
@@ -153,6 +155,52 @@ def import_pdf(pdf, truth_pages, gold_dir, dpi=220, max_px=1568, source=None):
         keys.append(rm_verify.write_gold_case(gold_dir, source or str(pdf), n, truth, png,
                                               origin="curated"))
     return keys
+
+
+def is_holdout(case_id, fraction):
+    """Stable train/holdout split by id, so a page never moves between the two."""
+    return int(hashlib.sha1(case_id.encode()).hexdigest()[:8], 16) / 0xFFFFFFFF < fraction
+
+
+def export(cases, out_dir, holdout=0.25, prompt=None):
+    """Write the ground-truth set as local fine-tuning data.
+
+    ``out_dir/images/<id>.png`` plus ``train.jsonl`` and ``holdout.jsonl``.
+    Each line carries the plain pair (``image``, ``text``) and the same pair
+    as a chat ``messages`` list, the shape vision fine-tuning tools read. The
+    holdout pages must stay out of training: score a tuned model on them with
+    ``run --ids holdout.ids`` or its gain is measured on pages it memorized.
+    """
+    import shutil
+    import rm_ocr
+    prompt = prompt or rm_ocr.PROMPT
+    out = pathlib.Path(out_dir)
+    (out / "images").mkdir(parents=True, exist_ok=True)
+    counts = {"train": 0, "holdout": 0}
+    files = {k: open(out / f"{k}.jsonl", "w") for k in counts}
+    ids = {k: [] for k in counts}
+    try:
+        for c in cases:
+            split = "holdout" if is_holdout(c["id"], holdout) else "train"
+            image = f"images/{c['id']}.png"
+            shutil.copyfile(c["png"], out / image)
+            files[split].write(json.dumps({
+                "id": c["id"], "image": image, "text": c["truth"],
+                "source": c.get("source"), "page": c.get("page"), "origin": c.get("origin"),
+                "messages": [
+                    {"role": "user", "content": [{"type": "image", "image": image},
+                                                 {"type": "text", "text": prompt}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": c["truth"]}]},
+                ],
+            }, ensure_ascii=False) + "\n")
+            counts[split] += 1
+            ids[split].append(c["id"])
+    finally:
+        for f in files.values():
+            f.close()
+    for k, v in ids.items():
+        (out / f"{k}.ids").write_text("\n".join(v) + ("\n" if v else ""))
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +344,8 @@ def main():
     r.add_argument("--limit", type=int, default=0, help="Score only the first N pages")
     r.add_argument("--include-flagged", action="store_true",
                    help="Also score edited pages that still carry unresolved flags")
+    r.add_argument("--ids", default="", help="Score only the case ids listed in this file "
+                                              "(e.g. holdout.ids from export)")
     r.add_argument("--out", required=True)
     r.add_argument("--history", default="", help="Append the summary to this JSONL file")
 
@@ -313,12 +363,25 @@ def main():
     i.add_argument("--max-px", type=int, default=int(os.environ.get("MAX_PX", "1568")))
     i.add_argument("--source", default="", help="Name recorded for the case (default: the path)")
 
+    x = sub.add_parser("export", help="Write the ground-truth set as local fine-tuning data")
+    x.add_argument("--goldset", default=os.environ.get("GOLDSET_DIR", "/state/goldset"))
+    x.add_argument("--out", required=True)
+    x.add_argument("--holdout", type=float, default=0.25,
+                   help="Share of pages kept out of training for evaluation")
+    x.add_argument("--include-flagged", action="store_true")
+
     ls = sub.add_parser("list", help="Show the ground-truth set")
     ls.add_argument("--goldset", default=os.environ.get("GOLDSET_DIR", "/state/goldset"))
 
     args = ap.parse_args()
     if args.cmd == "run":
+        import rm_ocr
+        rm_ocr.assert_local_host(rm_ocr.OLLAMA_URL,
+                                 allow_remote=os.environ.get("ALLOW_REMOTE_MODEL_HOST") == "1")
         cases = load_goldset(args.goldset, include_flagged=args.include_flagged, limit=args.limit)
+        if args.ids:
+            wanted = set(pathlib.Path(args.ids).read_text().split())
+            cases = [c for c in cases if c["id"] in wanted]
         if not cases:
             sys.exit(f"no ground-truth pages in {args.goldset}")
         result = run(cases, model=args.model, verify_model=args.verify_model, resolve=args.resolve,
@@ -345,6 +408,11 @@ def main():
         keys = import_pdf(args.pdf, pages, args.goldset, dpi=args.dpi, max_px=args.max_px,
                           source=args.source or None)
         print(f"imported {len(keys)} page(s) into {args.goldset}")
+    elif args.cmd == "export":
+        cases = load_goldset(args.goldset, include_flagged=args.include_flagged)
+        counts = export(cases, args.out, holdout=args.holdout)
+        print(f"exported {counts['train']} training and {counts['holdout']} holdout page(s) "
+              f"to {args.out}")
     elif args.cmd == "list":
         for c in load_goldset(args.goldset, include_flagged=True):
             flags = f"  ({c['unresolved_flags']} open flags)" if c.get("unresolved_flags") else ""
