@@ -972,6 +972,188 @@ def main():
     finally:
         ocr_daemon.OUT = saved
 
+    # --- self-checking transcripts: rm_verify, rm_eval and their daemon wiring ---
+    import json as _json2
+
+    import rm_eval
+    import rm_verify
+
+    a = "We use Palantir with GH Actions and the Gartner guide to track CIMD work."
+    b = "We use Pulumi with GH Actions and the gather guide to track CIMD work."
+    text, st = rm_verify.verify_page(a, b)
+    check("verify: disagreements are flagged as ==A|B==",
+          ("==Palantir|Pulumi==" in text, "==Gartner|gather==" in text), (True, True))
+    check("verify: agreed words are untouched", text.startswith("We use ") and "CIMD work." in text, True)
+    check("verify: stats count spans and flags", (st["spans"], st["flagged"]), (2, 2))
+    check("verify: formatting-only differences are not flagged",
+          rm_verify.verify_page("see Claude/OpenAI docs", "see Claude / Open AI docs")[1]["spans"], 0)
+    check("verify: a span never crosses a paragraph break",
+          rm_verify.verify_page("tool -\n\nThick: A policy", "tool Third: A policy")[1]["flagged"] <= 1
+          and "\n\n" not in "".join(m.group(0) for m in rm_verify.MARK_RE.finditer(
+              rm_verify.verify_page("tool -\n\nThick: A policy", "tool Third: A policy")[0])), True)
+    fixed, st = rm_verify.verify_page(a, b, resolver=lambda spans: {"answers": [
+        {"id": 1, "choice": "B"}, {"id": 2, "choice": "A"}]})
+    check("verify: resolver choices are applied",
+          fixed, "We use Pulumi with GH Actions and the Gartner guide to track CIMD work.")
+    check("verify: resolved counts", (st["resolved_a"], st["resolved_b"], st["flagged"]), (1, 1, 0))
+    ins, _ = rm_verify.verify_page("engine. At the very least", "engine. Or at the very least",
+                                   resolver=lambda s: {"answers": [{"id": 1, "choice": "B"}]})
+    check("verify: an inserted word gets its own space", ins, "engine. Or At the very least")
+    _, st = rm_verify.verify_page(a, b, resolver=lambda s: {"answers": [
+        {"id": 1, "choice": "OTHER", "text": "a whole invented sentence that goes on and on"}]})
+    check("verify: an overlong OTHER answer stays flagged", st["flagged"], 2)
+    _, st = rm_verify.verify_page(a, b, resolver=lambda s: None)
+    check("verify: an unparseable resolver reply flags everything", st["flagged"], 2)
+    check("verify: a flag whose reading contains '=' still parses",
+          rm_verify.strip_marks("Phot at ==#=36-37|11:36-37== ok"), "Phot at #=36-37 ok")
+    check("verify: strip_marks can keep the second reading",
+          rm_verify.strip_marks("x ==?|Or== at", side="b"), "x Or at")
+
+    corr = rm_verify.diff_corrections(
+        "Look at the ==CIMD|SCIM== data. We use Palantir daily.",
+        "Look at the CIMD data. We use Pulumi daily.")
+    check("harvest: corrections pair what was written with the edit",
+          [(c["before"], c["after"]) for c in corr], [("==CIMD|SCIM==", "CIMD"), ("Palantir", "Pulumi")])
+    check("harvest: term-like words are extracted", [c["terms"] for c in corr], [["CIMD"], ["Pulumi"]])
+    check("harvest: a sentence-start capital is not a term",
+          rm_verify.diff_corrections("Lustly there is", "Lastly there is")[0]["terms"], [])
+    check("harvest: a case-only change is not a correction",
+          rm_verify.diff_corrections("with GH actions", "with GH Actions"), [])
+
+    lv = rm_verify.LearnedVocab(tmp / "lv-test.json", min_count=2)
+    lv.record("Pulumi", "a#1")
+    lv.record("Pulumi", "a#1")
+    check("learned vocab: the same place counts once", lv.candidates(), [])
+    lv.record("Pulumi", "b#2")
+    check("learned vocab: two places make a candidate", lv.candidates(), ["Pulumi"])
+    lv.reject(["Pulumi"])
+    check("learned vocab: a rejected term is not retried", lv.candidates(), [])
+
+    check("vocab: parse_terms splits commas, newlines and drops comments and duplicates",
+          rm_verify.parse_terms("Okta, ISPM  # identity\nPulumi,okta\n"), ["Okta", "ISPM", "Pulumi"])
+    check("vocab: the hint lists the terms", "Okta, ISPM." in rm_verify.vocab_hint(["Okta", "ISPM"]), True)
+    check("vocab: no terms means no hint", rm_verify.vocab_hint([]), "")
+
+    s = rm_eval.score("We use Pulumi daily", "We use Pulumi daily.")
+    check("eval: a perfect page scores zero errors", (s["word_errors"], s["char_errors"]), (0, 0))
+    check("eval: slash spacing is not an error",
+          rm_eval.score("Claude/OpenAI", "Claude / OpenAI")["word_errors"], 0)
+    fs = rm_eval.flag_score("We use ==Palantir|Pulumi== with the gather guide", "We use Pulumi with the Gartner guide")
+    check("eval: flag_score finds one caught and one missed error", (fs["caught"], fs["diff_errors"]), (1, 2))
+    summ = rm_eval.summarize([{"words": 10, "chars": 50, "primary_word_errors": 2, "primary_char_errors": 5,
+                               "final_word_errors": 1, "final_char_errors": 2, "seconds": 4,
+                               "flagged_words": 1, "hyp_words": 10, "diff_errors": 2, "caught": 1}])
+    check("eval: summary rates", (summ["primary_wer"], summ["final_wer"], summ["error_recall"],
+                                  summ["review_wer"]), (0.2, 0.1, 0.5, 0.1))
+    gdir = tmp / "gold-test"
+    rm_verify.write_gold_case(gdir, "x.pdf", 1, "clean page", b"png")
+    rm_verify.write_gold_case(gdir, "x.pdf", 2, "still ==a|b== open", b"png")
+    check("eval: pages with open flags are skipped by default",
+          [c["page"] for c in rm_eval.load_goldset(gdir)], [1])
+    check("eval: ...unless asked for", len(rm_eval.load_goldset(gdir, include_flagged=True)), 2)
+
+    # Daemon wiring. Each model returns its own reading; the resolver picks B.
+    VDIR = tmp / "vault/remarkable/Verify"
+    VDIR.mkdir(parents=True, exist_ok=True)
+    (VDIR / "Roadmap.pdf").write_text("roadmap-v1")
+    (tmp / "vault/remarkable/Work/Plain.pdf").write_text("plain-v1")
+    READINGS = {"gemma4:26b": "We use Palantir with GH Actions.",
+                "qwen3.6:35b-a3b": "We use Pulumi with GH Actions."}
+    prompts = []
+
+    def fake_dual(pdf, model, *a, **k):
+        prompts.append(k.get("prompt_extra", ""))
+        return [(1, READINGS.get(model, "?")), (2, "Second page agrees.")]
+
+    saved = {n: getattr(ocr_daemon, n) for n in (
+        "ocr_pdf", "VERIFY_MODEL", "RESOLVE_MODEL", "VERIFY_PATHS", "VOCAB_FILE",
+        "USE_LEARNED_VOCAB", "LEARN_GATE", "LEARN_MIN_COUNT")}
+    saved_rm = {n: getattr(rm_ocr, n) for n in ("render_page_b64", "generate_json", "unload_model")}
+    unloaded = []
+    try:
+        ocr_daemon.ocr_pdf = fake_dual
+        rm_ocr.render_page_b64 = lambda *a, **k: "cG5n"          # base64 of b"png"
+        rm_ocr.generate_json = lambda *a, **k: {"answers": [{"id": 1, "choice": "B"}]}
+        rm_ocr.unload_model = lambda m, **k: unloaded.append(m)
+        ocr_daemon.VERIFY_MODEL = ocr_daemon.RESOLVE_MODEL = "qwen3.6:35b-a3b"
+        ocr_daemon.VERIFY_PATHS = ("Verify",)
+        vocab = tmp / "state/vocab.txt"
+        vocab.write_text("Pulumi, GH Actions\n")
+        ocr_daemon.VOCAB_FILE = vocab
+
+        ocr_daemon.scan_once(ocr_daemon.load_manifest())
+        man = ocr_daemon.load_manifest()
+        rec = man["remarkable/Verify/Roadmap.pdf"]
+        out_md = ocr_daemon._out_md_path(rec["out_path"])
+        md_v = out_md.read_text()
+        check("daemon verify: the resolver's choice lands in the transcript",
+              "We use Pulumi with GH Actions." in md_v, True)
+        check("daemon verify: frontmatter records the verification",
+              ("verify_model: qwen3.6:35b-a3b" in md_v, "verify_resolved: 1" in md_v,
+               "verify_flagged: 0" in md_v), (True, True, True))
+        check("daemon verify: manifest keeps the stats", rec["verify"]["resolved_b"], 1)
+        check("daemon verify: models are unloaded between readings", "gemma4:26b" in unloaded, True)
+        check("daemon verify: VERIFY_PATHS leaves other folders single-read",
+              "verify" in man["remarkable/Work/Plain.pdf"], False)
+        check("daemon vocab: the hint reaches every OCR call",
+              all("Pulumi, GH Actions." in p for p in prompts), True)
+        check("daemon learn: a sidecar records what was written",
+              rm_verify.sidecar_path(ocr_daemon.STATE, rec["out_path"]).exists(), True)
+
+        # The user fixes page 2 in Obsidian; the next pass harvests it.
+        edited = md_v.replace("Second page agrees.", "Second page agrees with Kontext.")
+        out_md.write_text(edited)
+        n_h = ocr_daemon.harvest_edits(ocr_daemon.load_manifest())
+        check("daemon learn: an edited page is harvested", n_h, 1)
+        log_lines = [_json2.loads(x) for x in ocr_daemon.CORRECTIONS_LOG.read_text().splitlines()]
+        check("daemon learn: the correction is logged",
+              (log_lines[-1]["page"], log_lines[-1]["after"]), (2, "agrees with Kontext."))
+        gold = rm_eval.load_goldset(ocr_daemon.GOLDSET_DIR)
+        check("daemon learn: the edited page becomes ground truth with its image",
+              [(c["page"], c["truth"], c["png"].read_bytes()) for c in gold],
+              [(2, "Second page agrees with Kontext.", b"png")])
+        check("daemon learn: an unchanged file is not harvested twice",
+              ocr_daemon.harvest_edits(ocr_daemon.load_manifest()), 0)
+
+        # The source changes, but page 2 reads the same: the edit must survive.
+        (VDIR / "Roadmap.pdf").write_text("roadmap-v2")
+        ocr_daemon.scan_once(ocr_daemon.load_manifest())
+        md_v2 = out_md.read_text()
+        check("daemon learn: a re-OCR keeps edits on unchanged pages",
+              "Second page agrees with Kontext." in md_v2, True)
+        check("daemon learn: kept edits are recorded", "kept_edits: 1" in md_v2, True)
+        (VDIR / "Roadmap.pdf").write_text("roadmap-v3")
+        ocr_daemon.scan_once(ocr_daemon.load_manifest())
+        check("daemon learn: ...and keeps them on the re-OCR after that too",
+              "Second page agrees with Kontext." in out_md.read_text(), True)
+
+        # A learned term becomes active only through the gate.
+        lv = rm_verify.LearnedVocab(ocr_daemon.LEARNED_VOCAB)
+        lv.record("Kontext", "other.pdf#1")
+        lv.save()
+        ocr_daemon.USE_LEARNED_VOCAB = True
+        ocr_daemon.LEARN_MIN_COUNT = 2
+        saved_gate = rm_eval.gate_terms
+        rm_eval.gate_terms = lambda *a, **k: (False, {"primary_cer": 0.02}, {"primary_cer": 0.03})
+        ocr_daemon.gate_learned_terms()
+        rm_eval.gate_terms = saved_gate
+        lv = rm_verify.LearnedVocab(ocr_daemon.LEARNED_VOCAB)
+        check("daemon gate: a term that makes the eval worse is rejected",
+              (lv.active(), lv.data["rejected"]), ([], ["Kontext"]))
+        lv.data["rejected"] = []
+        lv.save()
+        ocr_daemon.LEARN_GATE = False
+        ocr_daemon.gate_learned_terms()
+        check("daemon gate: LEARN_GATE=0 activates candidates directly",
+              rm_verify.LearnedVocab(ocr_daemon.LEARNED_VOCAB).active(), ["Kontext"])
+        check("daemon gate: active learned terms join the hint",
+              "Kontext" in ocr_daemon.current_terms(), True)
+    finally:
+        for n, v in saved.items():
+            setattr(ocr_daemon, n, v)
+        for n, v in saved_rm.items():
+            setattr(rm_ocr, n, v)
+
     print(f"\n--- sample transcript ---\n{md}")
     if failures:
         print(f"\n{len(failures)} FAILURE(S): {failures}")
