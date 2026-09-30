@@ -218,6 +218,19 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `DAILY_NOTE_EMBED` | `0` | `1` = after OCR of a date-named source (`YYYY-MM-DD`, or `YYYY-MM-DD-P<n>` for one file per page), ensure the Obsidian daily note embeds the transcript. See [Daily-note embedding](#daily-note-embedding) |
 | `DAILY_NOTE_DIR` | `Daily Journal` | Daily-notes folder, relative to `VAULT_DIR`. Must be **outside** `SOURCE_SUBDIR` (refused at startup otherwise) |
 | `DAILY_NOTE_HEADING` | `## reMarkable journal` | Heading of the appended section |
+| `VOCAB_FILE` | `$STATE_DIR/vocab.txt` | Your own terms (comma or newline separated, `#` comments). When the file exists, the prompt asks the model to prefer these spellings for ambiguous words. See [Self-checking transcripts](#self-checking-transcripts) |
+| `VERIFY_MODEL` | _(empty)_ | Second vision model. Each page is read twice and disagreements are resolved or flagged as `==A\|B==`. Roughly doubles OCR time |
+| `VERIFY_PATHS` | _(empty)_ | Comma-separated folders under `SOURCE_SUBDIR` to verify (e.g. `Work,Meeting Notes`). Empty = everything |
+| `VERIFY_RESOLVE` | `1` | Ask a model to settle each disagreement against the page image before flagging it |
+| `RESOLVE_MODEL` | `$VERIFY_MODEL` | Model that answers the resolution questions |
+| `VERIFY_MAX_SPAN_WORDS` | `6` | Longer disagreements are layout differences (a diagram read in another order), not misreads, and are left alone |
+| `VERIFY_UNLOAD` | `1` | Unload one model before loading the other, for a host that cannot hold both |
+| `LEARN_CORRECTIONS` | `1` | Notice edits you make to transcripts, log them, keep edited pages as ground truth, and keep your edits across a re-OCR. Reads transcripts and writes only under `STATE_DIR` |
+| `GOLDSET_DIR` | `$STATE_DIR/goldset` | Ground-truth pages (image plus trusted text) for `rm_eval.py` and the learned-vocab gate |
+| `USE_LEARNED_VOCAB` | `0` | Add terms learned from your corrections to the vocabulary hint |
+| `LEARN_MIN_COUNT` | `2` | Corrections, in different places, before a term becomes a candidate |
+| `LEARN_GATE` | `1` | Activate a candidate term only when an eval on ground-truth pages shows the model is no worse with it |
+| `LEARN_GATE_PAGES` | `10` | Ground-truth pages the gate evaluates (pages containing the new terms first) |
 | `LOG_LEVEL` | `INFO` | Set `DEBUG` to log each file's gate decision (see below) |
 
 ### Where transcripts go (3 modes)
@@ -547,6 +560,53 @@ transcripts landing **inside** the vault (`OUT_ALONGSIDE=1`, or `OUT_DIR`
 under the vault mount) — Obsidian can't transclude a file outside the vault,
 so with an external `OUT_DIR` the embed is skipped with a warning.
 
+### Self-checking transcripts
+
+Handwriting OCR fails on the words that matter most: acronyms, product names and people. Over 26 hand-checked pages of real notes, gemma4:26b and qwen3.6:35b-a3b both land around 6% word error rate, 1 to 5% on flowing prose and 10 to 13% on jargon-heavy work notes. Neither model was clearly better, and each made errors that flip meaning ("can't" read as "can", "understand" as "misunderstood"). This pipeline does not try to find a perfect model. It makes the transcript tell you where it is unsure, and it learns from the corrections you make.
+
+**Vocabulary hint.** Put the terms you actually write in `VOCAB_FILE`:
+
+```text
+# one per line or comma separated
+Okta, Oktane, ISPM, ITDR, OIG, OPA, CIMD, XAA, ID-JAG
+Pulumi, Terraform, LiteLLM, Gartner, Permiso, Verkada
+```
+
+The prompt then asks the model to use those spellings when a word is ambiguous, and to write arrows as plain `->`. Measured on 16 jargon-heavy pages: WER 9.6% to 8.6% (gemma4:26b) and 8.5% to 7.8% (qwen3.6:35b-a3b), no speed cost. It pulls near misses toward listed terms (CIMD became SCIM when only SCIM was listed), so list your full working vocabulary rather than a sample.
+
+**Dual read.** With `VERIFY_MODEL` set, every page (or every page under `VERIFY_PATHS`) is transcribed a second time and the two readings are aligned word by word. Where they agree the text stands. Where they differ, the span is put back to `RESOLVE_MODEL` together with the page image as a constrained question: reading A, reading B, the exact text if neither, or unsure. It is asked what is written, never which reading sounds better, because models misread handwriting mostly by writing the plausible word instead of the written one, and a text-only "clean up" pass makes that worse. Whatever stays unsure is written as a highlight:
+
+```markdown
+We moved the ==CIMD|SCIM== metadata into the ==Serval|Several== workflow.
+```
+
+Obsidian renders `==text==` as a highlight, so reviewing a transcript means reading the highlights. The first reading is the primary model's, the second is the verify model's, and `?` means that reading had nothing there. Frontmatter records `verify_model`, `verify_resolved` and `verify_flagged`. Measured on the same 26 pages with flags alone: about 6% of words flagged, about two thirds of the primary model's errors inside a flag, and WER falls from 6.2% to 2.2% once the flags are fixed.
+
+**Learning from your edits.** With `LEARN_CORRECTIONS` (on by default) the daemon keeps a sidecar of what it wrote to each transcript. When you fix a transcript in Obsidian, the next pass notices, and:
+
+- logs each correction to `STATE_DIR/corrections.jsonl`,
+- stores the edited page, with the page image OCR saw, as ground truth under `GOLDSET_DIR`,
+- counts term-like corrections (acronyms, names, words with digits or an inner hyphen or slash) toward a learned vocabulary,
+- and keeps your edit when the source changes later, for every page whose new model output is the same as before. A page that really changed is re-transcribed, and the edited file is saved under `STATE_DIR/superseded/`.
+
+With `USE_LEARNED_VOCAB=1`, a term corrected in `LEARN_MIN_COUNT` different places is tested before it joins the hint: the primary model reads up to `LEARN_GATE_PAGES` ground-truth pages with and without it, and the term is activated only if the character error rate is no worse. A rejected term is not retried. Each decision is appended to `STATE_DIR/eval/history.jsonl`.
+
+`--status` summarizes all of it: disagreements resolved and flagged, corrections harvested, ground-truth pages, and learned terms (active, candidate, rejected).
+
+**Measuring a change.** `rm_eval.py` scores any configuration against the ground-truth set:
+
+```bash
+# add pages whose correct text you trust (a list of page texts in JSON)
+python3 rm_eval.py import-pdf note.pdf truth.json --goldset /state/goldset
+# baseline, then the full pipeline
+python3 rm_eval.py run --model gemma4:26b --out base.json
+python3 rm_eval.py run --model gemma4:26b --verify-model qwen3.6:35b-a3b --resolve \
+    --vocab-file /state/vocab.txt --out full.json
+python3 rm_eval.py compare base.json full.json
+```
+
+It reports `primary_wer`/`primary_cer` (one model), `final_wer`/`final_cer` (after resolution, ignoring flags), `flag_rate` (how much there is to review), `error_recall` (share of errors inside a flag) and `review_wer` (errors left once the flags are fixed). Scoring ignores case, punctuation and spacing around a slash. Models run in stages so a CPU host holds one at a time.
+
 ### Paragraph reflow
 
 Handwriting wraps at the edge of the page, not at the end of a sentence, so a
@@ -702,6 +762,8 @@ processed_at, status, retries, render_sha256? }`. Written atomically (temp file
 - With `STROKE_CONTEXT=1`, a sibling `STATE_DIR/rendered/<sha[:2]>/<sha>.regions.json`
   holds that render's stroke-region data, so a cache hit doesn't need to
   re-parse the source.
+
+With `LEARN_CORRECTIONS` on, `STATE_DIR` also holds `transcripts/` (one sidecar per transcript: what was written and what the model produced), `corrections.jsonl`, `learned_vocab.json`, `goldset/` (`<key>.png` plus `<key>.json` per ground-truth page), `superseded/` and `eval/history.jsonl`. With `VERIFY_MODEL` set, each manifest entry also carries a `verify` block (words, spans, resolved and flagged counts).
 
 `STATE_DIR/rendered/` is the render cache. Sharded two levels deep
 (`<sha[:2]>/<sha>.pdf`). Keyed by source bytes, so renaming a bundle is a free

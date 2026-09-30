@@ -37,6 +37,11 @@ services:
       # DAILY_NOTE_EMBED: "1"       # embed date-named transcripts into Obsidian daily notes (needs :rw vault + transcripts inside it)
       # DAILY_NOTE_DIR: "Daily Journal"        # relative to VAULT_DIR, must be outside SOURCE_SUBDIR
       # DAILY_NOTE_HEADING: "## reMarkable journal"
+      # --- self-checking transcripts (see README) ---
+      # VOCAB_FILE: /state/vocab.txt            # your terms, used when the file exists
+      # VERIFY_MODEL: qwen3.6:35b-a3b           # second reader, flags disagreements as ==A|B==
+      # VERIFY_PATHS: "Work,Meeting Notes"      # limit dual read to these folders (empty = all)
+      # USE_LEARNED_VOCAB: "1"                  # learn terms from your edits, eval-gated
       STATE_DIR: /state
       MODEL: gemma4:26b
       OLLAMA_HOST: http://ollama:11434
