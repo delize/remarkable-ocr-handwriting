@@ -134,26 +134,33 @@ def on_link_networks(proc="/proc/net"):
     systems return an empty list and rely on LOCAL_MODEL_NETS.
     """
     import ipaddress
+
+    def lines(name):
+        try:
+            return pathlib.Path(proc, name).read_text().splitlines()
+        except OSError:
+            return []        # not Linux, or /proc is not mounted
+
     nets = []
-    try:
-        for line in open(f"{proc}/route").read().splitlines()[1:]:
-            f = line.split()
+    for line in lines("route")[1:]:
+        f = line.split()
+        try:
             dest, gateway, mask = (int(f[i], 16) for i in (1, 2, 7))
-            if gateway == 0 and mask:
-                nets.append(ipaddress.ip_network(
-                    (ipaddress.IPv4Address(dest.to_bytes(4, "little")),
-                     bin(mask).count("1")), strict=False))
-    except (OSError, ValueError, IndexError):
-        pass
-    try:
-        for line in open(f"{proc}/ipv6_route").read().splitlines():
-            f = line.split()
-            dest, plen, next_hop = f[0], int(f[1], 16), f[4]
-            if 0 < plen < 128 and int(next_hop, 16) == 0 and not dest.startswith("ff"):
-                nets.append(ipaddress.ip_network(
-                    (ipaddress.IPv6Address(bytes.fromhex(dest)), plen), strict=False))
-    except (OSError, ValueError, IndexError):
-        pass
+        except (ValueError, IndexError):
+            continue         # a malformed row says nothing about locality
+        if gateway == 0 and mask:
+            nets.append(ipaddress.ip_network(
+                (ipaddress.IPv4Address(dest.to_bytes(4, "little")),
+                 bin(mask).count("1")), strict=False))
+    for line in lines("ipv6_route"):
+        f = line.split()
+        try:
+            dest, plen, next_hop = f[0], int(f[1], 16), int(f[4], 16)
+        except (ValueError, IndexError):
+            continue
+        if 0 < plen < 128 and next_hop == 0 and not dest.startswith("ff"):
+            nets.append(ipaddress.ip_network(
+                (ipaddress.IPv6Address(bytes.fromhex(dest)), plen), strict=False))
     return nets
 
 

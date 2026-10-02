@@ -31,8 +31,12 @@ import rm_ocr
 import rm_render
 import rm_strokes
 import rm_verify
-from rm_ocr import BLANK_PAGE_TEXT, NO_OUTPUT_TEXT, _safe, ocr_pdf  # reuse the proven core
 from rm_split import SplitConfig, split_in_place
+
+# Reuse the proven core. Bound as module names (not `from rm_ocr import`) so the
+# offline self-test can swap ocr_pdf here without touching rm_ocr itself.
+ocr_pdf = rm_ocr.ocr_pdf
+_safe = rm_ocr._safe
 
 
 # ---------------------------------------------------------------------------
@@ -711,8 +715,9 @@ def dual_read(pdf, pages, hint):
     out = []
     for n, text in pages:
         other = second.get(n)
-        if (other is None or text == BLANK_PAGE_TEXT or text.startswith(NO_OUTPUT_TEXT)
-                or other.startswith(NO_OUTPUT_TEXT)):
+        if (other is None or text == rm_ocr.BLANK_PAGE_TEXT
+                or text.startswith(rm_ocr.NO_OUTPUT_TEXT)
+                or other.startswith(rm_ocr.NO_OUTPUT_TEXT)):
             out.append((n, text))
             continue
         resolver = None
@@ -1211,7 +1216,8 @@ def print_learning_status(man):
               f"{resolved} resolved (A {v['resolved_a']}, B {v['resolved_b']}, "
               f"other {v['resolved_other']}), {v['flagged']} flagged for review")
     try:
-        corrections = sum(1 for _ in open(CORRECTIONS_LOG))
+        with open(CORRECTIONS_LOG) as f:
+            corrections = sum(1 for _ in f)
     except OSError:
         corrections = 0
     lv = rm_verify.LearnedVocab(LEARNED_VOCAB, LEARN_MIN_COUNT)

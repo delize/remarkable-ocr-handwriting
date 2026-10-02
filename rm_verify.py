@@ -143,8 +143,8 @@ def resolve_prompt(spans, hint=""):
         "Two independent readings of this handwritten page disagree in the places listed below.",
         "For each item, look closely at that spot in the handwriting and decide what is actually written.",
         'Answer "A" or "B" when that reading matches the handwriting. Answer "OTHER" with the exact '
-        'written text in "text" when neither matches. Answer "UNSURE" when the handwriting cannot be '
-        "read with confidence. Judge only by what is written, never by which reading sounds more natural.",
+        + 'written text in "text" when neither matches. Answer "UNSURE" when the handwriting cannot be '
+        + "read with confidence. Judge only by what is written, never by which reading sounds more natural.",
         "",
     ]
     for i, s in enumerate(spans, 1):

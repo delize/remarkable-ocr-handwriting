@@ -172,15 +172,17 @@ def export(cases, out_dir, holdout=0.25, prompt=None):
     holdout pages must stay out of training: score a tuned model on them with
     ``run --ids holdout.ids`` or its gain is measured on pages it memorized.
     """
+    import contextlib
     import shutil
+
     import rm_ocr
     prompt = prompt or rm_ocr.PROMPT
     out = pathlib.Path(out_dir)
     (out / "images").mkdir(parents=True, exist_ok=True)
     counts = {"train": 0, "holdout": 0}
-    files = {k: open(out / f"{k}.jsonl", "w") for k in counts}
     ids = {k: [] for k in counts}
-    try:
+    with contextlib.ExitStack() as stack:
+        files = {k: stack.enter_context(open(out / f"{k}.jsonl", "w")) for k in counts}
         for c in cases:
             split = "holdout" if is_holdout(c["id"], holdout) else "train"
             image = f"images/{c['id']}.png"
@@ -196,9 +198,6 @@ def export(cases, out_dir, holdout=0.25, prompt=None):
             }, ensure_ascii=False) + "\n")
             counts[split] += 1
             ids[split].append(c["id"])
-    finally:
-        for f in files.values():
-            f.close()
     for k, v in ids.items():
         (out / f"{k}.ids").write_text("\n".join(v) + ("\n" if v else ""))
     return counts
