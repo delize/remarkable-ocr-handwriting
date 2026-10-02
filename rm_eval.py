@@ -22,6 +22,7 @@ Examples:
   python3 rm_eval.py run --goldset /state/goldset --model gemma4:26b \\
       --verify-model qwen3.6:35b-a3b --resolve --vocab-file /state/vocab.txt --out dual.json
   python3 rm_eval.py compare base.json dual.json
+  python3 rm_eval.py pairs base.json ornith.json qwen.json --goldset /state/goldset
   python3 rm_eval.py export --goldset /state/goldset --out /state/train --holdout 0.25
 """
 import argparse
@@ -271,6 +272,8 @@ def run(cases, *, model, verify_model="", resolve=False, resolve_model="", terms
                 flagged_only, _ = rm_verify.verify_page(text, b_text, max_span_words=max_span_words)
                 row["flags_only"] = flag_score(flagged_only, c["truth"])
         row["primary"] = text
+        if verify_model:
+            row["secondary"] = b_text
         results.append(row)
     config = {"model": model, "verify_model": verify_model, "resolve": bool(resolve),
               "resolve_model": resolver_model if resolve else "", "terms": len(terms),
@@ -305,6 +308,50 @@ def _fmt(k, v):
     if v is None:
         return "-"
     return f"{v:.0f}" if k == "seconds_per_page" else f"{v:.1%}"
+
+
+def reads_from_runs(runs):
+    """``{model: {case_id: text}}`` from saved runs, including dual-read second readings."""
+    reads = {}
+    for r in runs:
+        cfg = r["config"]
+        for c in r["cases"]:
+            if "primary" in c:
+                reads.setdefault(cfg["model"], {})[c["id"]] = c["primary"]
+            if cfg.get("verify_model") and "secondary" in c:
+                reads.setdefault(cfg["verify_model"], {})[c["id"]] = c["secondary"]
+    return reads
+
+
+def pair_scores(reads, truth, max_span_words=6):
+    """Score every ordered (primary, verifier) pair as a flags-only dual read.
+
+    Uses transcripts already saved by earlier runs, so no model is called.
+    Only pages both models read and that have a truth are scored. The result
+    says which second reader catches the most of a primary's errors, and
+    whether two models simply agree on their mistakes (same family, same
+    weights at another precision).
+    """
+    out = []
+    models = sorted(reads)
+    for a in models:
+        for b in models:
+            if a == b:
+                continue
+            ids = sorted(set(reads[a]) & set(reads[b]) & set(truth))
+            rows = []
+            for i in ids:
+                final, _ = rm_verify.verify_page(reads[a][i], reads[b][i], max_span_words=max_span_words)
+                s = score(reads[a][i], truth[i])
+                rows.append({"words": s["words"], "chars": s["chars"], "seconds": 0,
+                             "primary_word_errors": s["word_errors"],
+                             "primary_char_errors": s["char_errors"],
+                             "final_word_errors": s["word_errors"],
+                             "final_char_errors": s["char_errors"],
+                             **flag_score(final, truth[i])})
+            if rows:
+                out.append({"primary": a, "verifier": b, **summarize(rows)})
+    return sorted(out, key=lambda r: (r["review_wer"] is None, r["review_wer"]))
 
 
 def compare(paths):
@@ -354,6 +401,12 @@ def main():
     c.add_argument("--gate", action="store_true",
                    help="Exit 1 unless the last run's final (or primary) CER beats the first's")
 
+    pr = sub.add_parser("pairs", help="Score every model pair as dual read from saved runs")
+    pr.add_argument("runs", nargs="+")
+    pr.add_argument("--goldset", default=os.environ.get("GOLDSET_DIR", "/state/goldset"))
+    pr.add_argument("--max-span-words", type=int, default=6)
+    pr.add_argument("--out", default="", help="Also save the table as JSON")
+
     i = sub.add_parser("import-pdf", help="Add a PDF's pages with a trusted transcription")
     i.add_argument("pdf")
     i.add_argument("truth", help="JSON: a list of page texts, or an object holding one")
@@ -400,6 +453,19 @@ def main():
                 return s.get("final_cer") if s.get("final_cer") is not None else s.get("primary_cer")
             first, last = cer(runs[0]["summary"]), cer(runs[-1]["summary"])
             sys.exit(0 if first is not None and last is not None and last < first else 1)
+    elif args.cmd == "pairs":
+        runs = [json.loads(pathlib.Path(x).read_text()) for x in args.runs]
+        truth = {c["id"]: c["truth"] for c in load_goldset(args.goldset, include_flagged=True)}
+        table = pair_scores(reads_from_runs(runs), truth, max_span_words=args.max_span_words)
+        print(f"{'primary + verifier':<44}{'pages':>6}{'primary_wer':>13}{'flag_rate':>11}"
+              f"{'error_recall':>14}{'review_wer':>12}")
+        for r in table:
+            print(f"{r['primary'] + ' + ' + r['verifier']:<44}{r['cases']:>6}"
+                  + "".join(f"{_fmt(k, r.get(k)):>{w}}" for k, w in
+                            (("primary_wer", 13), ("flag_rate", 11), ("error_recall", 14),
+                             ("review_wer", 12))))
+        if args.out:
+            rm_verify.save_json(args.out, table)
     elif args.cmd == "import-pdf":
         data = json.loads(pathlib.Path(args.truth).read_text())
         pages = data[args.key] if args.key else data
