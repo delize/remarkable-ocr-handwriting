@@ -3,11 +3,12 @@
 rm_ocr.py — transcribe handwriting with a local Qwen3-VL via Ollama.
 
 Accepts ANY of:
-  - a single .pdf, .zip, .rmdoc, or .rm file
+  - a single .pdf, .zip, .rmdoc, .rm, .png, .jpg, .jpeg, or .webp file
   - a directory containing any mix of the above (searched recursively)
 
 Bundles (.zip / .rmdoc) and loose pages (.rm) are rendered to PDF via the
-shared rm_render module (which shells out to `rmc`). PDFs are processed as-is.
+shared rm_render module (which shells out to `rmc`). Images are wrapped into a
+one-page PDF by the same module. PDFs are processed as-is.
 
 Setup (macOS, Apple Silicon):
   brew install ollama poppler
@@ -55,6 +56,10 @@ OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 BLANK_MEAN_THRESHOLD = 254.5
 BLANK_STDDEV_THRESHOLD = 1.0
 BLANK_PAGE_TEXT = "[blank page]"
+# Written in place of a page the model answered with nothing. Distinct from
+# BLANK_PAGE_TEXT on purpose: "the page was empty" and "the model failed on a
+# page that had ink" must not look the same in a transcript.
+NO_OUTPUT_TEXT = "[no transcription returned]"
 
 
 def _is_blank_page(page):
@@ -119,10 +124,231 @@ def reflow_paragraphs(text):
     return "\n".join(out_lines)
 
 
-def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_think=False,
-           skip_blank=True, page_regions=None, reflow=True):
-    results = []
+def on_link_networks(proc="/proc/net"):
+    """Subnets directly attached to this machine (Linux), from the kernel route tables.
+
+    A destination on one of these is reached without passing a router, so it
+    cannot leave the local network even when its address is globally routable.
+    That is the normal case for Docker with IPv6 on a delegated prefix: the
+    Ollama container gets a public-looking address on the same bridge. Other
+    systems return an empty list and rely on LOCAL_MODEL_NETS.
+    """
+    import ipaddress
+
+    def lines(name):
+        try:
+            return pathlib.Path(proc, name).read_text().splitlines()
+        except OSError:
+            return []        # not Linux, or /proc is not mounted
+
+    nets = []
+    for line in lines("route")[1:]:
+        f = line.split()
+        try:
+            dest, gateway, mask = (int(f[i], 16) for i in (1, 2, 7))
+        except (ValueError, IndexError):
+            continue         # a malformed row says nothing about locality
+        if gateway == 0 and mask:
+            nets.append(ipaddress.ip_network(
+                (ipaddress.IPv4Address(dest.to_bytes(4, "little")),
+                 bin(mask).count("1")), strict=False))
+    for line in lines("ipv6_route"):
+        f = line.split()
+        try:
+            dest, plen, next_hop = f[0], int(f[1], 16), int(f[4], 16)
+        except (ValueError, IndexError):
+            continue
+        if 0 < plen < 128 and next_hop == 0 and not dest.startswith("ff"):
+            nets.append(ipaddress.ip_network(
+                (ipaddress.IPv6Address(bytes.fromhex(dest)), plen), strict=False))
+    return nets
+
+
+def non_local_addresses(url, extra_nets=None):
+    """Addresses ``url``'s host resolves to that would leave the local network.
+
+    Every page image goes to this host. The project's founding rule is that
+    handwriting never leaves the owner's machines. An address is local when it
+    is not publicly routable (loopback, private LAN, link-local, and
+    100.64.0.0/10, which Tailscale uses), when it sits on a subnet directly
+    attached to this machine, or when it falls in ``extra_nets``
+    (LOCAL_MODEL_NETS, comma-separated CIDRs). Raises ``socket.gaierror``
+    when the name does not resolve.
+    """
+    import ipaddress
+    import socket
+    from urllib.parse import urlsplit
+
+    if extra_nets is None:
+        extra_nets = os.environ.get("LOCAL_MODEL_NETS", "")
+    nets = on_link_networks() + [ipaddress.ip_network(n.strip(), strict=False)
+                                 for n in extra_nets.split(",") if n.strip()]
+    parts = urlsplit(url if "://" in url else f"http://{url}")
+    host, port = parts.hostname, parts.port or 11434
+    addrs = {info[4][0] for info in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)}
+    out = []
+    for a in sorted(addrs):
+        ip = ipaddress.ip_address(a.split("%")[0])
+        if ip.is_global and not any(ip.version == n.version and ip in n for n in nets):
+            out.append(a)
+    return out
+
+
+def assert_local_host(url, *, allow_remote=False, wait=0, log=print):
+    """Refuse to send anything to a model server that is not on this machine or LAN.
+
+    ``wait`` retries an unresolvable name for that many seconds (a container
+    whose Ollama sibling is still starting). ``allow_remote`` turns the refusal
+    into a warning, for deployments that knowingly run the model elsewhere.
+    """
+    import socket
+    import time as _time
+
+    deadline = _time.monotonic() + wait
+    while True:
+        try:
+            public = non_local_addresses(url)
+            break
+        except socket.gaierror as e:
+            if _time.monotonic() >= deadline:
+                raise SystemExit(f"cannot resolve model host {url!r} ({e}); refusing to start "
+                                 "without proving it is local")
+            _time.sleep(5)
+    if not public:
+        return
+    msg = (f"model host {url!r} resolves to public address(es) {', '.join(public)}. "
+           "Page images would leave this network.")
+    if allow_remote:
+        log(f"WARNING: {msg} Continuing because ALLOW_REMOTE_MODEL_HOST=1.")
+        return
+    raise SystemExit(f"{msg}\nThis tool only talks to local or LAN model servers. Point "
+                     "OLLAMA_HOST at one, or set ALLOW_REMOTE_MODEL_HOST=1 if sending pages "
+                     "off-network is intended.")
+
+
+def _stream_generate(payload, timeout):
+    """POST a streaming /api/generate request; returns ``(text, think_chars, done_reason)``.
+
+    ``timeout`` is the per-read socket timeout. The first read blocks through
+    the whole prefill, so it must be generous on CPU.
+    """
+    req = urllib.request.Request(
+        OLLAMA_URL, data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    parts = []
+    think_chars = 0
+    done_reason = None
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        for raw in resp:
+            raw = raw.strip()
+            if not raw:
+                continue
+            obj = json.loads(raw)
+            if obj.get("error"):
+                raise RuntimeError(obj["error"])
+            if obj.get("response"):
+                parts.append(obj["response"])
+            # A reasoning model streams its trace here, NOT into "response".
+            # Counted (not kept) purely so an empty answer can be explained.
+            if obj.get("thinking"):
+                think_chars += len(obj["thinking"])
+            if obj.get("done"):
+                done_reason = obj.get("done_reason")
+                break
+    return "".join(parts).strip(), think_chars, done_reason
+
+
+def _options(cpu=False, threads=None, num_ctx=0):
     opts = {"temperature": 0}
+    if num_ctx:
+        opts["num_ctx"] = num_ctx
+    if cpu:
+        opts["num_gpu"] = 0
+    if threads:
+        opts["num_thread"] = threads
+    return opts
+
+
+def image_b64(page, max_px):
+    """Downscale a PIL page so its longest side fits ``max_px``; return it as base64 PNG."""
+    w, h = page.size
+    s = min(1.0, max_px / max(w, h))
+    if s < 1.0:
+        page = page.resize((int(w * s), int(h * s)))
+    buf = io.BytesIO()
+    page.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def render_page_b64(pdf, n, dpi, max_px):
+    """Rasterize page ``n`` (1-based) of ``pdf`` exactly as OCR sees it, as base64 PNG."""
+    page = convert_from_path(str(pdf), dpi=dpi, first_page=n, last_page=n)[0]
+    return image_b64(page, max_px)
+
+
+def ocr_image_b64(img_b64, model, *, timeout=1800, no_think=False, num_ctx=0, threads=None,
+                  prompt_extra="", reflow=True):
+    """Transcribe one already-encoded page image with the standard prompt.
+
+    Used by the evaluation runner, which scores pages from a stored image set
+    rather than from source PDFs.
+    """
+    prompt = f"{PROMPT}\n\n{prompt_extra}" if prompt_extra else PROMPT
+    payload = {"model": model, "prompt": prompt, "images": [img_b64], "stream": True,
+               "keep_alive": "30m", "options": _options(threads=threads, num_ctx=num_ctx)}
+    if no_think:
+        payload["think"] = False
+    text, _, _ = _stream_generate(payload, timeout)
+    return reflow_paragraphs(text) if reflow else text
+
+
+def generate_json(model, prompt, img_b64, schema, *, timeout=1800, num_ctx=0, threads=None):
+    """Ask ``model`` a question about one image and return its answer parsed as JSON.
+
+    ``schema`` is passed as Ollama's ``format`` so the answer is constrained to
+    it. Returns None when the answer does not parse, so a caller can treat the
+    question as unanswered instead of failing the document.
+    """
+    payload = {"model": model, "prompt": prompt, "images": [img_b64], "stream": True,
+               "keep_alive": "30m", "format": schema, "think": False,
+               "options": _options(threads=threads, num_ctx=num_ctx)}
+    text, _, _ = _stream_generate(payload, timeout)
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
+
+
+def unload_model(model, timeout=120):
+    """Ask Ollama to drop ``model`` from memory now instead of after keep_alive.
+
+    A CPU host that cannot hold two large models at once calls this between
+    passes with different models. Failure is logged by the caller, never fatal.
+    """
+    body = json.dumps({"model": model, "keep_alive": 0}).encode()
+    req = urllib.request.Request(OLLAMA_URL, data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        r.read()
+
+
+def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_think=False,
+           skip_blank=True, page_regions=None, reflow=True, num_ctx=0, prompt_extra=""):
+    """Transcribe every page of ``pdf``; returns ``[(page_number, text), ...]``.
+
+    ``prompt_extra`` is appended to the prompt for every page (the vocabulary
+    hint, see ``rm_verify.vocab_hint``).
+    """
+    results = []
+    empty_pages = 0
+    opts = {"temperature": 0}
+    if num_ctx:
+        # Ollama defaults to a 4096 context. A full-page image already costs
+        # ~1800 of those tokens, so a model that reasons before answering can
+        # exhaust the window and be cut off with nothing in "response" (see the
+        # empty-answer handling below). Measured on qwen3-vl:8b against a real
+        # page: 4096 produced 0 chars, 16384 transcribed it correctly.
+        opts["num_ctx"] = num_ctx
     if cpu:
         opts["num_gpu"] = 0   # 0 layers on GPU == CPU-only (num_gpu = #layers, not #GPUs)
     if threads:
@@ -146,11 +372,11 @@ def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_t
             page = page.resize((int(w * s), int(h * s)))
         buf = io.BytesIO()
         page.save(buf, format="PNG")
-        prompt = PROMPT
+        prompt = f"{PROMPT}\n\n{prompt_extra}" if prompt_extra else PROMPT
         if page_regions and n - 1 < len(page_regions):
             hint = rm_strokes.prompt_hint(page_regions[n - 1])
             if hint:
-                prompt = f"{PROMPT}\n\n{hint}"
+                prompt = f"{prompt}\n\n{hint}"
         payload = {
             "model": model,
             "prompt": prompt,
@@ -161,37 +387,41 @@ def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_t
         }
         if no_think:
             payload["think"] = False   # OCR wants a direct transcription, not a reasoning trace
-        req = urllib.request.Request(
-            OLLAMA_URL, data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-        )
         print(f"    page {n}/{num_pages} (prefill on CPU may take minutes)...", end="", flush=True)
-        parts = []
-        # `timeout` is the per-read socket timeout; the first read blocks through
-        # the whole prefill, so it must be generous on CPU.
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            for raw in resp:
-                raw = raw.strip()
-                if not raw:
-                    continue
-                obj = json.loads(raw)
-                if obj.get("error"):
-                    raise RuntimeError(obj["error"])
-                if obj.get("response"):
-                    parts.append(obj["response"])
-                if obj.get("done"):
-                    break
-        print(f" {len(''.join(parts))} chars", flush=True)
-        text = "".join(parts).strip()
+        text, think_chars, done_reason = _stream_generate(payload, timeout)
+        print(f" {len(text)} chars", flush=True)
+        if not text:
+            # An empty answer used to be written out as an empty page under
+            # status=ok, which is indistinguishable from a blank page and hides
+            # a real failure. The common cause is a reasoning model that ignores
+            # think=False, reasons past the context window, and is cut off before
+            # emitting anything (done_reason="length", all output in "thinking").
+            why = f"done_reason={done_reason!r}"
+            if think_chars:
+                why += f", {think_chars} chars of reasoning discarded"
+            if done_reason == "length":
+                why += (" — the model ran out of context before answering; raise"
+                        " num_ctx (NUM_CTX) or use a non-reasoning model")
+            print(f"    page {n}/{num_pages}: model returned NO TEXT ({why})", flush=True)
+            text = f"{NO_OUTPUT_TEXT} ({why})"
+            empty_pages += 1
         if reflow:
             text = reflow_paragraphs(text)
         results.append((n, text))
+    # Every page failing is a broken run, not a transcript. Raising here puts it
+    # through the daemon's normal error path (status=error, capped retries) so it
+    # shows up in --status instead of landing as a plausible-looking empty file.
+    # A partial failure still returns, with the bad pages marked in place.
+    if empty_pages and empty_pages == len(results):
+        raise RuntimeError(
+            f"model returned no text for any of the {empty_pages} page(s) — "
+            "see the per-page reasons above")
     return results
 
 
 def transcribe_pdf(pdf, out_md, *, model, dpi=150, max_px=1568, threads=None,
                    no_think=False, timeout=1800, cpu=False, title=None,
-                   page_regions=None, skip_blank=True, reflow=True):
+                   page_regions=None, skip_blank=True, reflow=True, num_ctx=0):
     """Transcribe a single PDF to a plain ``# title`` / ``## Page N`` markdown file.
 
     Reusable core extracted from ``main()`` (Phase 0). The daemon does NOT call
@@ -208,7 +438,7 @@ def transcribe_pdf(pdf, out_md, *, model, dpi=150, max_px=1568, threads=None,
     out_md = pathlib.Path(out_md)
     title = title or pdf.stem
     pages = ocr_pdf(pdf, model, dpi, max_px, cpu=cpu, timeout=timeout,
-                    threads=threads, no_think=no_think,
+                    threads=threads, no_think=no_think, num_ctx=num_ctx,
                     skip_blank=skip_blank, page_regions=page_regions, reflow=reflow)
     lines = [f"# {title}\n"]
     for n, text in pages:
@@ -266,7 +496,8 @@ def gather(input_path, work, cache_dir=None, extract_regions=False):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("input", help="A .pdf, .zip, .rmdoc, or .rm file, or a folder containing any mix of those")
+    ap.add_argument("input", help="A .pdf, .zip, .rmdoc, .rm, .png, .jpg, .jpeg or .webp file, "
+                                  "or a folder containing any mix of those")
     ap.add_argument("--out", default=None, help="Output dir (default: ./ocr_out)")
     ap.add_argument("--model", default="qwen3-vl:8b")
     ap.add_argument("--dpi", type=int, default=150)
@@ -274,7 +505,14 @@ def main():
     ap.add_argument("--cpu", action="store_true", help="Force CPU-only (num_gpu=0) — simulates the GPU-less NAS")
     ap.add_argument("--timeout", type=int, default=1800, help="Per-page timeout in seconds (covers slow CPU prefill)")
     ap.add_argument("--threads", type=int, default=None, help="Force CPU thread count (e.g. 14 on a 13600K; works around Ollama's cgroup under-detection)")
-    ap.add_argument("--no-think", action="store_true", help="Disable thinking/reasoning trace (much faster on CPU for 'thinking' models like qwen3.5)")
+    ap.add_argument("--no-think", action="store_true",
+                    help="Ask the model to skip its reasoning trace. NOTE: some models "
+                         "(qwen3-vl:8b measured) ignore this outright and reason anyway — "
+                         "see --num-ctx if pages come back empty")
+    ap.add_argument("--num-ctx", type=int, default=int(os.environ.get("NUM_CTX", "0")),
+                    help="Model context window in tokens (0 = Ollama's default, 4096). A "
+                         "page image costs ~1800, so a reasoning model can run out and "
+                         "return nothing; 16384 fixed that on a real page.")
     ap.add_argument("--render-cache", default=os.environ.get("RM_OCR_RENDER_CACHE"),
                     help="Persistent render cache dir (default: ephemeral temp). Point at the daemon's STATE/rendered to share it.")
     ap.add_argument("--stroke-context", action="store_true",
@@ -290,6 +528,7 @@ def main():
                          "word-wrapped lines into flowing paragraphs (default: reflow). Pure "
                          "text post-processing on the model's own output, not a re-transcription.")
     args = ap.parse_args()
+    assert_local_host(OLLAMA_URL, allow_remote=os.environ.get("ALLOW_REMOTE_MODEL_HOST") == "1")
 
     input_path = pathlib.Path(args.input).expanduser()
     if not input_path.exists():
@@ -302,7 +541,8 @@ def main():
         items = gather(input_path, pathlib.Path(tmp), cache_dir=cache_dir,
                        extract_regions=args.stroke_context)
         if not items:
-            sys.exit(f"Nothing to OCR under {input_path} (no .pdf / .zip / .rmdoc / .rm found).")
+            supported = " / ".join(sorted(rm_render.SUPPORTED_INPUT_SUFFIXES))
+            sys.exit(f"Nothing to OCR under {input_path} (no {supported} found).")
         print(f"{len(items)} document(s). model={args.model} dpi={args.dpi}\nout: {out}\n")
         for title, pdf, page_regions in items:
             title = _safe(title)
@@ -316,6 +556,7 @@ def main():
                     page_regions=page_regions,
                     skip_blank=args.skip_blank,
                     reflow=args.reflow,
+                    num_ctx=args.num_ctx,
                 )
                 print(f"        -> {title}.md\n", flush=True)
             except Exception as e:

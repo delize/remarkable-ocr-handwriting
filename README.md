@@ -9,11 +9,13 @@ Automatically transcribes any new or changed reMarkable PDF dropped into a
 watched directory — into searchable Markdown, **fully local on your device**. No
 manual step.
 
-The input side accepts any of **`.pdf`**, **`.zip`**, **`.rmdoc`**, or loose
-**`.rm`** files (any mix, in nested folders). PDFs pass through directly;
-bundles and loose pages are rendered to PDF via `rmc` first and cached under
-`STATE_DIR/rendered/` so a re-extracted-but-byte-identical bundle never re-
-renders. The reference setup uses [Scrybble](https://scrybble.ink) to sync
+The input side accepts any of **`.pdf`**, **`.zip`**, **`.rmdoc`**, loose
+**`.rm`**, or an image (**`.png`**, **`.jpg`**, **`.jpeg`**, **`.webp`**) files
+(any mix, in nested folders). PDFs pass through directly; bundles and loose
+pages are rendered to PDF via `rmc` first, images are wrapped into a one-page
+PDF, and both are cached under `STATE_DIR/rendered/` so a re-extracted-but-
+byte-identical source never re-renders. See [Image inputs](#image-inputs) for
+what a photo or screenshot goes through. The reference setup uses [Scrybble](https://scrybble.ink) to sync
 reMarkable notes into an Obsidian vault, but anything that drops one of those
 formats on disk works just as well — `rmapi`/`rmapy` downloads, the reMarkable
 desktop app's export folder, a `Syncthing`/`rsync`'d directory, or a manual drop.
@@ -25,7 +27,7 @@ because Obsidian indexes the Markdown for search.
 - `ocr_daemon.py` — the automation: scanner, change-detection manifest, transcript
   writer, and the polling loop. Built *around* the core, not a rewrite of it.
 - `rm_render.py` — shared rendering layer: dispatches `.pdf` / `.zip` / `.rmdoc` /
-  `.rm` inputs to a PDF ready for OCR. Used by both the daemon and the CLI.
+  `.rm` / image inputs to a PDF ready for OCR. Used by both the daemon and the CLI.
 - `rm_split.py` — vendored `AUTO_SPLIT` implementation (whitespace-band splitter).
 - `selftest.py` — offline test harness (stubs Ollama + poppler + the renderer; zero deps).
 
@@ -71,6 +73,7 @@ repeat-prevention design.
 
 ## Safety guarantees (enforced in code)
 
+- Handwriting never leaves your machines. At startup the daemon, the CLI and `rm_eval.py` resolve the model host and refuse to run if any address it resolves to is public. Loopback, private LAN ranges, link-local, `100.64.0.0/10` (Tailscale) and any subnet directly attached to the machine count as local. The last one matters for Docker with IPv6 on a delegated prefix, where the Ollama container gets a globally routable address on the same bridge. On systems without Linux's `/proc/net` route tables, list such networks in `LOCAL_MODEL_NETS`. `ALLOW_REMOTE_MODEL_HOST=1` downgrades the refusal to a warning, for a deployment that knowingly runs its model elsewhere.
 - The vault is mounted **fully read-only** (default); transcripts go to a separate
   `OUT_DIR` volume, so nothing is ever written back into the vault.
 - `safe_output_path()` proves every target is a `.md`, never equals the source
@@ -180,15 +183,20 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `MODEL` | `gemma4:26b` | Vision-capable; larger model, expect slower per-page than a 9B |
 | `OLLAMA_HOST` | `http://ollama:11434` | |
 | `THREADS` | `14` | cgroup under-detection workaround |
-| `NO_THINK` | `1` | **Required** — thinking ON = unusable |
+| `NO_THINK` | `1` | Asks the model to skip its reasoning trace. **Some models ignore it** (`qwen3-vl:8b` measured: identical reasoning with and without), so it is a request, not a guarantee — see `NUM_CTX` |
 | `SKIP_BLANK_PAGES` | `1` | `1` = skip the OCR call for a genuinely blank page (writes `[blank page]` instead). Small vision models tend to answer blank pages with refusal-style prose otherwise |
 | `REFLOW_PARAGRAPHS` | `1` | `1` = join word-wrapped lines into flowing paragraphs. Post-processing on the model's own transcription, not a re-transcription — see [Paragraph reflow](#paragraph-reflow) |
 | `DPI` | `150` | Raising alone does nothing (downscaled to `MAX_PX`) |
 | `MAX_PX` | `1568` | The real quality/time lever |
 | `TIMEOUT` | `1800` | Per-page socket timeout |
+| `VISION_CHECK` | `1` | Startup gate: prove the model actually **receives** the images. A runner that drops them makes the model invent a fluent transcript that looks successful. See [The vision gate](#the-vision-gate) |
+| `VISION_CHECK_MIN_TOKENS` | `64` | Minimum extra prompt tokens a 1024×1024 image must cost over a 64×64 one. Measured growth: `qwen3.5:9b` +1015, `gemma4:26b` +207; a runner that drops images stays flat |
+| `NUM_CTX` | `0` | Model context window in tokens (`0` = Ollama's default of 4096). A page image alone costs ~1800, so a model that reasons first can run out and return **nothing**. **Set `16384` for real handwriting** — dense pages exhaust 4096 even with `IMAGE_AUTOCONTRAST` on. Costs VRAM |
+| `ALLOW_REMOTE_MODEL_HOST` | `0` | `1` = allow a model host that resolves to a public address (warns instead of refusing). Leave off to keep every page on your own network |
+| `LOCAL_MODEL_NETS` | _(empty)_ | Extra CIDRs the local-only guard treats as local, comma separated. Linux reads directly attached subnets from the kernel, so this is rarely needed there |
 | `MODEL_WAIT_TIMEOUT` | `1800` | Block at startup until the model is loadable on `OLLAMA_HOST`. `0` disables the gate (see [Startup readiness gate](#startup-readiness-gate)) |
 | `INTERVAL` | `600` | Poll seconds — the latency floor; an inotify event short-circuits this |
-| `INOTIFY` | `1` | `1` = wake immediately on `CLOSE_WRITE` / `MOVED_TO` for `*.pdf` under `SOURCE_SUBDIR` (Linux only; falls back to pure poll if unavailable). See [Inotify wake-up](#inotify-wake-up) |
+| `INOTIFY` | `1` | `1` = wake immediately on `CLOSE_WRITE` / `MOVED_TO` for any supported input under `SOURCE_SUBDIR` (Linux only; falls back to pure poll if unavailable). See [Inotify wake-up](#inotify-wake-up) |
 | `HASH_CHECK` | `1` | `1` = sha256 content detection (authoritative); `0` = last-modified (mtime) detection — cheaper, but re-OCRs on touch-only changes |
 | `MAX_AGE_HOURS` | `24` | Only consider PDFs modified within this window; `0` = no limit |
 | `MAX_PDF_PAGES` | `0` | Skip documents with more rendered pages than this (`0` = no limit). Counted post-`AUTO_SPLIT`; skipped files show as `SKIPPED` in `--status` and re-queue automatically if the cap is raised |
@@ -204,10 +212,31 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `SPLIT_MAX_ASPECT` | `2.0` | Page height/width above which a PDF is "too tall" — splits it (AUTO_SPLIT) or holds it (REQUIRE_SPLIT). Match the splitter's `MIN_ASPECT_RATIO` |
 | `SPLIT_MARKER_KEY` | `/RemarkableSplitter` | PDF Info-dict key the splitter stamps |
 | `SPLIT_MARKER_VALUE` | `processed` | Expected marker value |
+| `IMAGE_PAGE_WIDTH_PT` | `445` | Page width, in PDF points, that every image input is normalized to (height follows the aspect ratio). About one reMarkable page, so the `SPLIT_*` tuning applies to photos unchanged. See [Image inputs](#image-inputs) |
+| `IMAGE_JPEG_QUALITY` | `92` | Quality of the JPEG embedded in the wrapper PDF. Ignored for bilevel scans, which stay on lossless CCITT |
+| `IMAGE_MAX_WIDTH_PX` | `2000` | Downscale image inputs wider than this before embedding (aspect preserved). Guards the decode against a 50 MP phone photo |
+| `IMAGE_AUTOCONTRAST` | `1` | Stretch faint ink to true black / paper to true white before embedding. **Not cosmetic** — a faint page can otherwise make a reasoning model transcribe nothing at all. See [Image inputs](#image-inputs) |
+| `IMAGE_AUTOCONTRAST_CUTOFF` | `0.5` | Percent of the histogram clipped at each end before stretching. Raise it and genuine light-grey pencil starts getting crushed to white |
 | `STROKE_CONTEXT` | `0` | `1` = parse `.rm` stroke geometry into a rough sketch/diagram hint for the OCR prompt + `stroke_regions_flagged` in frontmatter. `.rm`-family sources only; heuristic, not recognition. See [Stroke-assisted OCR context](#stroke-assisted-ocr-context) |
-| `DAILY_NOTE_EMBED` | `0` | `1` = after OCR of a date-named source (`YYYY-MM-DD`), ensure the Obsidian daily note embeds the transcript. See [Daily-note embedding](#daily-note-embedding) |
+| `DAILY_NOTE_EMBED` | `0` | `1` = after OCR of a date-named source (`YYYY-MM-DD`, or `YYYY-MM-DD-P<n>` for one file per page), ensure the Obsidian daily note embeds the transcript. See [Daily-note embedding](#daily-note-embedding) |
 | `DAILY_NOTE_DIR` | `Daily Journal` | Daily-notes folder, relative to `VAULT_DIR`. Must be **outside** `SOURCE_SUBDIR` (refused at startup otherwise) |
 | `DAILY_NOTE_HEADING` | `## reMarkable journal` | Heading of the appended section |
+| `VOCAB_FILE` | `$STATE_DIR/vocab.txt` | Your own terms (comma or newline separated, `#` comments). When the file exists, the prompt asks the model to prefer these spellings for ambiguous words. See [Self-checking transcripts](#self-checking-transcripts) |
+| `VERIFY_MODEL` | _(empty)_ | Second vision model. Each page is read twice and disagreements are flagged as `==A\|B==`. Roughly doubles OCR time |
+| `VERIFY_PATHS` | _(empty)_ | Comma-separated folders under `SOURCE_SUBDIR` to verify (e.g. `Work,Meeting Notes`). Empty = everything |
+| `VERIFY_RESOLVE` | `0` | `1` = ask a model to settle each disagreement against the page image instead of flagging it. Not recommended: measured barely better than chance, ~90 s extra per page, and it removes the flags |
+| `RESOLVE_MODEL` | `$VERIFY_MODEL` | Model that answers the resolution questions |
+| `VERIFY_MAX_SPAN_WORDS` | `6` | Longer disagreements are layout differences (a diagram read in another order), not misreads, and are left alone |
+| `VERIFY_UNLOAD` | `1` | Unload one model before loading the other, for a host that cannot hold both |
+| `LEARN_CORRECTIONS` | `1` | Notice edits you make to transcripts, log them, keep edited pages as ground truth, and keep your edits across a re-OCR. Reads transcripts and writes only under `STATE_DIR` |
+| `GOLDSET_DIR` | `$STATE_DIR/goldset` | Ground-truth pages (image plus trusted text) for `rm_eval.py` and the learned-vocab gate |
+| `USE_LEARNED_VOCAB` | `0` | Add terms learned from your corrections to the vocabulary hint |
+| `LEARN_MIN_COUNT` | `2` | Corrections, in different places, before a term becomes a candidate |
+| `LEARN_GATE` | `1` | Activate a candidate term only when an eval on ground-truth pages shows the model is no worse with it |
+| `LEARN_GATE_PAGES` | `10` | Ground-truth pages the gate evaluates (pages containing the new terms first) |
+| `EVAL_INTERVAL_DAYS` | `0` | Re-score the production configuration on the ground-truth set this often (inside `RUN_WINDOW`) and log an error if quality drops. `0` = off. See [Routine self-check](#routine-self-check) |
+| `EVAL_PAGES` | `0` | Ground-truth pages the self-check scores (`0` = all) |
+| `EVAL_TOLERANCE` | `0.005` | Absolute drop in CER or post-review WER that counts as a regression (0.005 = half a point) |
 | `LOG_LEVEL` | `INFO` | Set `DEBUG` to log each file's gate decision (see below) |
 
 ### Where transcripts go (3 modes)
@@ -285,7 +314,10 @@ rename), so the readable split PDF persists *and* gets transcribed. Because the
 bytes change, normal change-detection then OCRs the new version. No second
 container, no async race.
 
-- Requires the **source dir to be writable** (mount the vault `:rw`, not `:ro`).
+- Requires the **source dir to be writable** (mount the vault `:rw`, not `:ro`)
+  for `.pdf` sources, which are the ones rewritten in place. Bundles and image
+  inputs are split on their *cached* render under `STATE_DIR`, so those never
+  touch the source and work fine with a `:ro` vault.
 - Adds `PyMuPDF` + `numpy`; rm-ocr refuses to start with `AUTO_SPLIT=1` if they're
   missing. Splitting runs on PyMuPDF (each output page references the source page
   once, instead of re-encoding it per segment), so even a native vector export
@@ -322,6 +354,130 @@ and page boxes — far cheaper than an OCR run, and only runs for new/changed fi
 This gate is **off by default** (the tool works fine without the splitter) and
 requires `pypdf` (already in the image / `requirements.txt`); rm-ocr refuses to
 start with `REQUIRE_SPLIT=1` if `pypdf` is missing.
+
+### The vision gate
+
+The daemon refuses to start if the model does not actually **receive** the
+images it is sent. This guards the worst failure the tool can have.
+
+Some Ollama runners accept an `images=` payload, silently discard it, and let
+the model answer from the text prompt alone. Measured on Ollama 0.32.0's MLX
+runner: `gemma4:12b-mlx` was handed a page of handwriting and returned a fluent
+essay about 19th-century American industrialisation, repeated verbatim for
+pages 1 and 2, written out under `status: ok` with 3416 chars. Nothing about
+that transcript looks wrong — which is exactly the problem. **Silent
+fabrication in a journal is far worse than a visible failure**, because you have
+no reason to doubt it.
+
+The check sends the same image at two sizes and compares prompt token counts, so
+it tests whether the image *arrives*, not whether the model is any good at
+reading it:
+
+| model | no image | 64×64 | 1024×1024 | growth | verdict |
+|---|---|---|---|---|---|
+| `qwen3.5:9b` | 17 | 28 | **1043** | +1015 | sees it |
+| `gemma4:26b` | 23 | 74 | **281** | +207 | sees it |
+| `gemma4:12b-mlx` | 30 | 35 | 35 | ~0 | drops it |
+
+Growth with area is the signal, rather than the cost of one image, for two
+reasons. Per-image token cost is heavily tokenizer-dependent — a 64×64 probe
+costs `qwen3.5:9b` 11 tokens and `gemma4:26b` 51, so an absolute "+200 tokens"
+rule rejects both as broken even though both read the image correctly. Only
+`qwen3-vl:8b`'s fixed-tile encoder charges ~1000 for a thumbnail. Differencing
+two sizes also cancels any constant, so a runner that adds a fixed "image mode"
+preamble without encoding pixels cannot fake the signal.
+
+It costs three 1-token generations at startup. If it can't run (server
+unreachable, odd response) it warns and continues rather than blocking startup
+on an unrelated fault. `VISION_CHECK=0` disables it, which is not recommended:
+the failure it catches is invisible in the output.
+
+Note this is about the *runner*, not the model family — the same model in GGUF
+form on the llama.cpp runner handles images normally.
+
+### Image inputs
+
+A `.png`, `.jpg`, `.jpeg` or `.webp` dropped in the source tree is treated as a
+photo or screenshot of handwriting. It is wrapped into a one-page PDF by
+`rm_render` and then follows the exact same path as everything else, so
+`AUTO_SPLIT`, `MAX_PDF_PAGES`, the split gate and the manifest all apply with no
+special cases. The wrap runs on Pillow, which `pdf2image` already pulls in, so
+image support adds no new dependency.
+
+The wrap does four things worth knowing about:
+
+- **Normalizes the page to `IMAGE_PAGE_WIDTH_PT` (445 pt), height following the
+  aspect ratio.** This is the setting that matters. `rm_split` analyses a page at
+  one pixel per point, so embedding a 4000 px photo at 1 px = 1 pt would produce
+  a 4000 pt wide page and `SPLIT_TARGET_PAGE_HEIGHT` would carve it into slivers.
+  445 pt is roughly one reMarkable page (1404 px at 226 dpi), so the existing
+  split tuning carries over: a 4:3 photo lands at 445x593 and is never split, a
+  long stitched screenshot splits every ~700 pt like a tall notebook export.
+- **Applies EXIF rotation.** Phone JPEGs are stored unrotated with an orientation
+  tag, so without this the handwriting would reach the model sideways.
+- **Flattens transparency onto white.** A plain RGB conversion composites
+  transparent pixels onto *black*, which turns a screenshot with a transparent
+  background into an unreadable page. Bilevel scans are left on lossless CCITT
+  rather than re-encoded as JPEG, which would ring around every pen stroke.
+- **Downscales sources wider than `IMAGE_MAX_WIDTH_PX` (2000 px)**, aspect
+  preserved, so a 50 MP photo can't blow up the decode on a small container. Tall
+  stitched screenshots keep their height, since only the width is capped.
+- **Normalizes contrast** (`IMAGE_AUTOCONTRAST`, on by default) so faint pencil
+  reaches true black and the paper true white. See below — this one is not
+  cosmetic.
+
+#### Why contrast normalization matters more than it sounds
+
+Faint ink doesn't just read worse, it changes how the model behaves. A real
+reMarkable page whose darkest pixel was 192 (out of 255) sent `qwen3-vl:8b` into
+18k characters of reasoning about ambiguous strokes until it exhausted its
+context and returned **nothing at all**. Measured on that page, same model, same
+prompt, only the image and context changing:
+
+| image | `num_ctx` | transcript | reasoning | finished? | time |
+|---|---|---|---|---|---|
+| as-is | 4096 (default) | **0 chars** | 11k | no, hit the limit | — |
+| as-is | 16384 | 594 chars | 19k | yes | ~215s |
+| **normalized** | **4096** | **621 chars** | **6k** | **yes** | **101s** |
+| normalized | 16384 | 621 chars | 6k | yes | 100s |
+
+That is the page's *sparse* first section. Its dense middle section still failed
+at 4096 even normalized (9.9k of reasoning, cut off, 0 chars), which is why the
+recommendation below is to set both.
+
+Normalizing attacks the cause (two thirds less reasoning, half the wall clock,
+no extra VRAM) where `NUM_CTX` only widens the budget the model is burning.
+
+**Use both.** Normalizing is not sufficient on its own: on the same real page,
+the sparse first section transcribed fine at the default context, but the dense
+middle section still burned 9,866 characters of reasoning and hit the 4096 wall
+with nothing to show. Denser handwriting costs more reasoning, so for real
+journal pages set **`NUM_CTX=16384`** as well. Contrast lowers the cost; the
+context gives the headroom for pages where the lowered cost is still too high.
+
+Pillow's autocontrast is a no-op on already-crisp scans and provably leaves a
+blank page blank, so it is safe on by default. Set `IMAGE_AUTOCONTRAST=0` to
+keep the original tones.
+
+Note the contrast step applies to **image inputs only** — a faint `.pdf` or
+`.rm` bundle does not pass through the wrap, so those depend on `NUM_CTX` alone.
+Either way the failure is now loud: a page that returns nothing is marked in the
+transcript with the reason, and a document where every page returns nothing is
+recorded as an error rather than a plausible-looking empty file.
+
+Two things to watch for:
+
+- **Resolution.** OCR rasterizes at `DPI` (default `150`), so a 445 pt page
+  becomes only ~927 px wide no matter how sharp the original photo was. For
+  photographed handwriting set **`DPI=254`**, which lands at ~1570 px, right at
+  the `MAX_PX` cap of 1568.
+- **Same-stem collisions.** `note.png` and `note.pdf` in one folder both want
+  `note-handwriting_converted.md`. The second one transcribed gets
+  `-<source_sha256[:8]>` appended, so neither overwrites the other.
+
+Stroke-context hints are never available for images: a photo carries no vector
+ink, so `page_regions` is always empty regardless of `STROKE_CONTEXT`. HEIC is
+not supported (it needs `pillow-heif`); convert to JPEG first.
 
 ### Stroke-assisted OCR context
 
@@ -386,6 +542,10 @@ files:
 - **Append-only.** Existing prose is never rewritten; the section is appended
   once at the end. Writes go through a temp file + atomic rename, so a crash
   can never truncate a note.
+- **Multi-page days.** A day exported one file per page — `2026-07-02-P001`,
+  `-P002`, ... — keeps a separate transcript per page but embeds them all into
+  the single `2026-07-02.md`, under **one** heading, in page order. Anything you
+  wrote after that section stays where it is.
 - **Idempotent.** A note that already references the transcript path — this
   section, or a link you wrote yourself — is left alone.
 - **Full-path embeds.** `2026-07-20.md` often exists twice in a vault (the
@@ -396,14 +556,78 @@ files:
 - **Config guard.** `DAILY_NOTE_DIR` inside `SOURCE_SUBDIR` is refused at
   startup — date-named `.md` files in the source tree belong to the sync tool
   and would be clobbered on its next sync.
-- **Scope guard.** Only titles matching `YYYY-MM-DD` participate; everything
-  else is untouched. An embed failure is logged and never fails or retries the
+- **Scope guard.** Only titles matching `YYYY-MM-DD` or `YYYY-MM-DD-P<n>`
+  participate; everything else is untouched. A stem like `2026-07-23-groceries`
+  is *not* a daily page and never creates a note. An embed failure is logged and never fails or retries the
   completed transcription.
 
 Requirements: the vault mounted **writable** (like `OUT_ALONGSIDE`), and
 transcripts landing **inside** the vault (`OUT_ALONGSIDE=1`, or `OUT_DIR`
 under the vault mount) — Obsidian can't transclude a file outside the vault,
 so with an external `OUT_DIR` the embed is skipped with a warning.
+
+### Self-checking transcripts
+
+Handwriting OCR fails on the words that matter most: acronyms, product names and people. Over 26 hand-checked pages of real notes, gemma4:26b and qwen3.6:35b-a3b both land around 6% word error rate, 1 to 5% on flowing prose and 10 to 13% on jargon-heavy work notes. Neither model was clearly better, and each made errors that flip meaning ("can't" read as "can", "understand" as "misunderstood"). This pipeline does not try to find a perfect model. It makes the transcript tell you where it is unsure, and it learns from the corrections you make.
+
+**Vocabulary hint.** Put the terms you actually write in `VOCAB_FILE`:
+
+```text
+# one per line or comma separated
+Okta, Oktane, ISPM, ITDR, OIG, OPA, CIMD, XAA, ID-JAG
+Pulumi, Terraform, LiteLLM, Gartner, Permiso, Verkada
+```
+
+The prompt then asks the model to use those spellings when a word is ambiguous, and to write arrows as plain `->`. Measured on 16 jargon-heavy pages: WER 9.6% to 8.6% (gemma4:26b) and 8.5% to 7.8% (qwen3.6:35b-a3b), no speed cost. It pulls near misses toward listed terms (CIMD became SCIM when only SCIM was listed), so list your full working vocabulary rather than a sample.
+
+**Dual read.** With `VERIFY_MODEL` set, every page (or every page under `VERIFY_PATHS`) is transcribed a second time and the two readings are aligned word by word. Where they agree the text stands. Where they differ, the span is written as a highlight:
+
+```markdown
+We moved the ==CIMD|SCIM== metadata into the ==Serval|Several== workflow.
+```
+
+Obsidian renders `==text==` as a highlight, so reviewing a transcript means reading the highlights. The first reading is the primary model's, the second is the verify model's, and `?` means that reading had nothing there. Frontmatter records `verify_model` and `verify_flagged`.
+
+Measured on 26 hand-checked pages with gemma4:26b as primary, qwen3.6:35b-a3b as verifier and the vocabulary hint: about 5% of words flagged, and WER falls from 5.4% to 1.9% once the flags are fixed. It costs a second full read, about 140 s per page instead of 66 on a CPU-only host.
+
+`VERIFY_RESOLVE=1` instead puts each disagreement back to `RESOLVE_MODEL` with the page image as a constrained question (reading A, reading B, the exact text if neither, or unsure). On the same pages it answered 88 of 90 questions, choosing unsure only twice, and its choices were barely better than chance: unattended WER went from 5.4% to 5.1%, at about 90 s more per page, while the flags that make review effective disappeared. It stays available for experiments but is off by default.
+
+**Learning from your edits.** With `LEARN_CORRECTIONS` (on by default) the daemon keeps a sidecar of what it wrote to each transcript. When you fix a transcript in Obsidian, the next pass notices, and:
+
+- logs each correction to `STATE_DIR/corrections.jsonl`,
+- stores the edited page, with the page image OCR saw, as ground truth under `GOLDSET_DIR`,
+- counts term-like corrections (acronyms, names, words with digits or an inner hyphen or slash) toward a learned vocabulary,
+- and keeps your edit when the source changes later, for every page whose new model output is the same as before. A page that really changed is re-transcribed, and the edited file is saved under `STATE_DIR/superseded/`.
+
+With `USE_LEARNED_VOCAB=1`, a term corrected in `LEARN_MIN_COUNT` different places is tested before it joins the hint: the primary model reads up to `LEARN_GATE_PAGES` ground-truth pages with and without it, and the term is activated only if the character error rate is no worse. A rejected term is not retried. Each decision is appended to `STATE_DIR/eval/history.jsonl`.
+
+`--status` summarizes all of it: disagreements flagged (and resolved, if `VERIFY_RESOLVE` is on), corrections harvested, ground-truth pages, and learned terms (active, candidate, rejected).
+
+**Measuring a change.** `rm_eval.py` scores any configuration against the ground-truth set:
+
+```bash
+# add pages whose correct text you trust (a list of page texts in JSON)
+python3 rm_eval.py import-pdf note.pdf truth.json --goldset /state/goldset
+# baseline, then the full pipeline
+python3 rm_eval.py run --model gemma4:26b --out base.json
+python3 rm_eval.py run --model gemma4:26b --verify-model qwen3.6:35b-a3b --resolve \
+    --vocab-file /state/vocab.txt --out full.json
+python3 rm_eval.py compare base.json full.json
+```
+
+To prepare local fine-tuning data from the same set, `python3 rm_eval.py export --out /state/train --holdout 0.25` writes the page images with `train.jsonl` and `holdout.jsonl` (plain image and text pairs plus chat-style `messages`). The split is stable by page, and a tuned model should be scored only on the holdout with `run --ids /state/train/holdout.ids`, otherwise it is graded on pages it memorized.
+
+To choose a second reader without running anything new, score every pair of models from saved runs:
+
+```bash
+python3 rm_eval.py pairs gemma.json ornith.json qwen.json --goldset /state/goldset
+```
+
+Each ordered pair (primary, verifier) is aligned exactly as the daemon would and ranked by the error rate left after review. Two versions of the same model (another size or quantization) agree on their mistakes and catch far fewer errors than two different model families. Measured: gemma4:26b with its own q8_0 build caught 28% of errors, with ornith-1.5:35b 69%.
+
+**Routine self-check.** With `EVAL_INTERVAL_DAYS` set (7 is a sensible start), the daemon re-scores the configuration it is actually running (`MODEL`, `VERIFY_MODEL`, the vocabulary) on the ground-truth set, inside `RUN_WINDOW`. The first run for a configuration becomes its baseline in `STATE_DIR/eval/baseline.json`. Later runs are compared on the pages both have scored, so a ground-truth set that grows as you correct transcripts does not skew the result. A drop beyond `EVAL_TOLERANCE` in CER or post-review WER is logged as `QUALITY REGRESSION` and recorded in `eval/history.jsonl`, which catches silent drift such as an Ollama upgrade or a re-pulled model reading worse. Each run's full result is saved as `eval/self-check-<time>.json`, readable by `compare` and `pairs`. `python3 ocr_daemon.py --eval` runs it once now (exit code 1 on a regression), and `--eval --rebaseline` makes that run the new reference. `--status` shows the latest result.
+
+It reports `primary_wer`/`primary_cer` (one model), `final_wer`/`final_cer` (after resolution, ignoring flags), `flag_rate` (how much there is to review), `error_recall` (share of errors inside a flag) and `review_wer` (errors left once the flags are fixed). Scoring ignores case, punctuation and spacing around a slash. Models run in stages so a CPU host holds one at a time.
 
 ### Paragraph reflow
 
@@ -481,6 +705,9 @@ Plain Python with a small set of pip + system deps, all baked into the image:
 - **`pdf2image`** (pip — see `requirements.txt`; pulls in Pillow) + **poppler**
   (system: `apt-get install poppler-utils` / `brew install poppler`). Poppler also
   provides `pdfunite`, used to merge per-page renders into a single bundle PDF.
+  Pillow additionally decodes image inputs and writes their one-page wrapper PDF,
+  so `.png`/`.jpg`/`.jpeg`/`.webp` support needs nothing beyond what is already
+  here (in particular, not PyMuPDF).
 - **`rmc`** (pip; pulls in `rmscene`) — renders `.zip` / `.rmdoc` / `.rm` inputs
   to PDF. Its PDF export shells out to **Inkscape** (system: `apt-get install
   inkscape` / `brew install --cask inkscape`) to rasterize an intermediate SVG
@@ -549,13 +776,16 @@ processed_at, status, retries, render_sha256? }`. Written atomically (temp file
 + rename). `STATE_DIR/ocr.log` mirrors stdout.
 
 - `sha256` is always the **source bytes** hash — for `.pdf` that's the PDF, for
-  bundles that's the `.zip`/`.rmdoc`/`.rm`. It's the change-detection token.
+  bundles that's the `.zip`/`.rmdoc`/`.rm`, for an image input that's the
+  original `.png`/`.jpg`/`.jpeg`/`.webp`. It's the change-detection token.
 - `render_sha256` is set for rendered inputs only — the hash of the cached PDF
   under `STATE_DIR/rendered/<sha[:2]>/<sha>.pdf`. Useful for tracing which
   rendered output produced a transcript.
 - With `STROKE_CONTEXT=1`, a sibling `STATE_DIR/rendered/<sha[:2]>/<sha>.regions.json`
   holds that render's stroke-region data, so a cache hit doesn't need to
   re-parse the source.
+
+With `LEARN_CORRECTIONS` on, `STATE_DIR` also holds `transcripts/` (one sidecar per transcript: what was written and what the model produced), `corrections.jsonl`, `learned_vocab.json`, `goldset/` (`<key>.png` plus `<key>.json` per ground-truth page), `superseded/` and `eval/history.jsonl`. With `VERIFY_MODEL` set, each manifest entry also carries a `verify` block (words, spans, resolved and flagged counts).
 
 `STATE_DIR/rendered/` is the render cache. Sharded two levels deep
 (`<sha[:2]>/<sha>.pdf`). Keyed by source bytes, so renaming a bundle is a free

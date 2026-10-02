@@ -7,12 +7,19 @@ LABEL org.opencontainers.image.source="https://github.com/delize/remarkable-ocr-
 # poppler-utils -> pdftoppm/pdfunite for pdf2image and bundle merging.
 # inkscape -> rmc shells out to it to rasterize its intermediate SVG when
 # rendering .zip/.rmdoc/.rm inputs to PDF (not needed for plain .pdf input).
-RUN apt-get update && apt-get install -y --no-install-recommends poppler-utils inkscape \
+# apt-get upgrade picks up Debian security fixes newer than the base image
+# (libpcre2 tripped the CVE gate before python:3.14-slim was rebuilt).
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends poppler-utils inkscape \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY requirements.txt /app/
-RUN pip install --no-cache-dir -r requirements.txt
+# pip is only needed to build the image. It vendors its own urllib3, msgpack
+# and setuptools, which carry fixed HIGH CVEs the scan gates on, and nothing
+# at runtime imports pip, so it is removed in the same layer.
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip uninstall -y pip
 COPY *.py /app/
 
 # Unbuffered so logs stream to `docker logs` in real time.

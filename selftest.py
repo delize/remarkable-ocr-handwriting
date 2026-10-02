@@ -276,6 +276,28 @@ def main():
     check("loose .rm transcript named from stem",
           (out_base / "Work/Stray-handwriting_converted.md").exists(), True)
 
+    # Image dispatch — .png/.jpeg/.webp reach the scanner and are titled from the
+    # stem. Uses the stubbed renderer, so this needs no Pillow (the real wrap is
+    # exercised in the image-render section further down).
+    for img_name in ("Photo.png", "Snap.jpeg", "Shot.webp"):
+        (tmp / "vault/remarkable/Work" / img_name).write_bytes(b"fake-image-" + img_name.encode())
+    check("image inputs are discovered and processed",
+          ocr_daemon.scan_once(ocr_daemon.load_manifest()), 3)
+    for stem, label in (("Photo", ".png"), ("Snap", ".jpeg"), ("Shot", ".webp")):
+        check(f"{label} transcript named from stem",
+              (out_base / f"Work/{stem}-handwriting_converted.md").exists(), True)
+    check("image pass2 idempotent",
+          ocr_daemon.scan_once(ocr_daemon.load_manifest()), 0)
+    check("inotify wake tuple covers image inputs",
+          all(s in ocr_daemon._INPUT_SUFFIX_TUPLE for s in (".png", ".jpg", ".jpeg", ".webp")), True)
+
+    # A photo sharing a stem with an already-transcribed .pdf must NOT overwrite
+    # that transcript — the source-hash disambiguator kicks in.
+    (tmp / "vault/remarkable/Work/Sample.png").write_bytes(b"photo-of-the-same-note")
+    ocr_daemon.scan_once(ocr_daemon.load_manifest())
+    check("image sharing a stem with a .pdf gets its own disambiguated transcript",
+          len(list((out_base / "Work").glob("Sample*-handwriting_converted.md"))), 2)
+
     # Title precedence: a uuid-named bundle gets the friendly visibleName title.
     uuid_name = "9c4f1234-5678.rmdoc"
     (tmp / "vault/remarkable/Work" / uuid_name).write_bytes(b"PK\x03\x04uuid-bundle")
@@ -368,6 +390,35 @@ def main():
     ocr_daemon.scan_once(ocr_daemon.load_manifest())
     check("daily-note embed: re-OCR does not duplicate the section",
           note2.read_text().count("2026-07-21-handwriting_converted"), 1)
+
+    # Multi-page day: <date>-P001 / -P002 are separate transcripts that both embed
+    # into the SAME <date>.md, under ONE heading, in page order.
+    for page_no in ("P001", "P002"):
+        (tmp / f"vault/remarkable/Work/2026-07-25-{page_no}.png").write_bytes(
+            b"journal-page-" + page_no.encode())
+    ocr_daemon.scan_once(ocr_daemon.load_manifest())
+    note3 = daily_dir / "2026-07-25.md"
+    body3 = note3.read_text()
+    check("daily-note embed: -PXXX pages route to the date's note", note3.exists(), True)
+    check("daily-note embed: no -PXXX-named note is created",
+          (daily_dir / "2026-07-25-P001.md").exists(), False)
+    check("daily-note embed: both pages embedded",
+          all(f"2026-07-25-{p}-handwriting_converted" in body3 for p in ("P001", "P002")), True)
+    check("daily-note embed: multi-page day gets exactly one heading",
+          body3.count("## reMarkable journal"), 1)
+    check("daily-note embed: pages embedded in order",
+          body3.index("2026-07-25-P001") < body3.index("2026-07-25-P002"), True)
+    check("daily-note embed: each page keeps its own transcript",
+          all((ocr_daemon.OUT / f"Work/2026-07-25-{p}-handwriting_converted.md").exists()
+              for p in ("P001", "P002")), True)
+    check("daily-note embed: -PXXX re-OCR does not duplicate",
+          body3.count("2026-07-25-P001-handwriting_converted"), 1)
+
+    # A date-ish stem that isn't a page suffix must NOT be treated as a daily page.
+    (tmp / "vault/remarkable/Work/2026-07-23-groceries.pdf").write_text("not-a-journal-page")
+    ocr_daemon.scan_once(ocr_daemon.load_manifest())
+    check("daily-note embed: non-page suffix is not a daily source",
+          (daily_dir / "2026-07-23.md").exists(), False)
 
     # Non-date sources never touch daily notes.
     (tmp / "vault/remarkable/Work/NotADate.pdf").write_text("misc-bytes")
@@ -479,12 +530,153 @@ def main():
           "stroke_regions_flagged: 1" in sketch_md, True)
     ocr_daemon.STROKE_CONTEXT = False
 
+    # --- image render (the REAL rm_render._render_image, not the stub) ---
+    # Must run BEFORE the blank-page section below, which puts a fake "PIL" into
+    # sys.modules and would shadow the real Pillow from here on. Needs Pillow and
+    # pypdf, which this zero-dependency harness does not install in CI — the
+    # checks are skipped there and run in the Docker image or a dev checkout,
+    # where both are present.
+    try:
+        from PIL import Image as _Img
+        from pypdf import PdfReader as _PdfReader
+    except ImportError:
+        print("  [SKIP] image-render checks (needs Pillow + pypdf)")
+    else:
+        img_dir = tmp / "image-fixtures"
+        img_dir.mkdir()
+
+        def page_size(path):
+            box = _PdfReader(str(path)).pages[0].mediabox
+            return round(float(box.width), 1), round(float(box.height), 1)
+
+        # Every image is normalized to IMAGE_PAGE_WIDTH_PT with the aspect kept,
+        # which is what lets rm_split's point-based tuning apply to photos.
+        src_img = img_dir / "wide.png"
+        _Img.new("RGB", (1200, 900), "white").save(src_img)
+        pdf, regions = rm_render._render_image(src_img, img_dir)
+        w, h = page_size(pdf)
+        check("image page normalized to IMAGE_PAGE_WIDTH_PT",
+              w, round(rm_render.IMAGE_PAGE_WIDTH_PT, 1))
+        check("image page keeps the source aspect ratio", round(h / w, 2), 0.75)
+        check("image render reports no stroke regions", regions, None)
+
+        # A tall source must stay tall in points, so the splitter can cut it.
+        tall_src = img_dir / "tall.png"
+        _Img.new("RGB", (1200, 8000), "white").save(tall_src)
+        tw, th = page_size(rm_render._render_image(tall_src, img_dir)[0])
+        check("tall image stays tall enough to trigger the split gate",
+              th / tw > ocr_daemon.SPLIT_MAX_ASPECT, True)
+
+        # Phone JPEGs store rotation as an EXIF tag, not as pixels. Without
+        # exif_transpose the handwriting reaches the model sideways.
+        rot_src = img_dir / "rotated.jpg"
+        _exif = _Img.Exif()
+        _exif[274] = 6  # Orientation: rotate 90° clockwise
+        _Img.new("RGB", (400, 200), "white").save(rot_src, exif=_exif)
+        rw, rh = page_size(rm_render._render_image(rot_src, img_dir)[0])
+        check("EXIF orientation is applied (landscape source becomes portrait)",
+              rh > rw, True)
+
+        # Oversize sources are downscaled before embedding (aspect preserved), so
+        # a 50 MP photo can't blow up the decode on a small container.
+        big_src = img_dir / "big.jpg"
+        _Img.new("RGB", (rm_render.IMAGE_MAX_WIDTH_PX * 2, 1000), "white").save(big_src)
+        big_pdf = rm_render._render_image(big_src, img_dir)[0]
+        check("oversize image downscaled to IMAGE_MAX_WIDTH_PX",
+              _PdfReader(str(big_pdf)).pages[0].images[0].image.width,
+              rm_render.IMAGE_MAX_WIDTH_PX)
+
+        # Transparency flattens onto WHITE. A plain convert("RGB") composites
+        # onto black and hands the model an unreadable page.
+        alpha_src = img_dir / "alpha.png"
+        _Img.new("RGBA", (300, 300), (0, 0, 0, 0)).save(alpha_src)
+        alpha_pdf = rm_render._render_image(alpha_src, img_dir)[0]
+        check("transparent pixels flattened onto white, not black",
+              _PdfReader(str(alpha_pdf)).pages[0].images[0].image.convert("RGB").getpixel((150, 150)),
+              (255, 255, 255))
+
+        # WebP is decoded like any other raster input.
+        webp_src = img_dir / "shot.webp"
+        _Img.new("RGB", (800, 600), "white").save(webp_src)
+        check("webp renders to a normalized page",
+              page_size(rm_render._render_image(webp_src, img_dir)[0])[0],
+              round(rm_render.IMAGE_PAGE_WIDTH_PT, 1))
+
+        # Faint ink is stretched toward true black. This is the difference
+        # between a transcript and an empty page: a real reMarkable page whose
+        # darkest pixel was 192 made qwen3-vl:8b reason until it ran out of
+        # context and returned nothing, where the normalized page transcribed
+        # correctly inside the default context.
+        def darkest_in_pdf(pdf_path):
+            return _PdfReader(str(pdf_path)).pages[0].images[0].image.convert("L").getextrema()[0]
+
+        faint_src = img_dir / "faint.png"
+        faint = _Img.new("L", (600, 800), 255)
+        for y in range(100, 700, 40):          # light-grey "ink" on white paper
+            for x in range(60, 540):
+                faint.putpixel((x, y), 205)
+        faint.convert("RGB").save(faint_src)
+        check("faint source really is faint", faint.getextrema()[0], 205)
+        check("autocontrast pushes faint ink toward black",
+              darkest_in_pdf(rm_render._render_image(faint_src, img_dir)[0]) < 60, True)
+
+        saved_ac = rm_render.IMAGE_AUTOCONTRAST
+        rm_render.IMAGE_AUTOCONTRAST = False
+        off_dir = img_dir / "ac_off"
+        off_dir.mkdir()
+        check("IMAGE_AUTOCONTRAST=0 leaves the faint original alone",
+              darkest_in_pdf(rm_render._render_image(faint_src, off_dir)[0]) > 150, True)
+        rm_render.IMAGE_AUTOCONTRAST = saved_ac
+
+        # It must not manufacture ink out of a blank page, or JPEG noise would
+        # become "strokes" and the blank-page skip would stop firing.
+        blank_src = img_dir / "blank.png"
+        _Img.new("RGB", (600, 800), "white").save(blank_src)
+        check("autocontrast leaves a blank page blank",
+              darkest_in_pdf(rm_render._render_image(blank_src, img_dir)[0]) > 250, True)
+
+        # A truncated/garbage image is a recognized ValueError, not a crash, so
+        # the daemon records status=error and moves on.
+        bad_src = img_dir / "corrupt.png"
+        bad_src.write_bytes(b"\x89PNG\r\n\x1a\n-truncated-garbage")
+        try:
+            rm_render._render_image(bad_src, img_dir)
+            check("corrupt image raises ValueError", False, True)
+        except ValueError as e:
+            check("corrupt image raises ValueError", "image render failed" in str(e), True)
+
+        # AUTO_SPLIT's whole point for images: one tall page becomes several
+        # readable ones. Needs PyMuPDF + numpy on top of the above.
+        try:
+            import numpy  # noqa: F401
+            from rm_split import SplitConfig as _SplitConfig
+            from rm_split import split_in_place as _split_in_place
+            import fitz  # noqa: F401
+        except ImportError:
+            print("  [SKIP] image auto-split check (needs PyMuPDF + numpy)")
+        else:
+            banded = _Img.new("RGB", (1200, 6000), "white")
+            for band in range(6):  # ink bands separated by whitespace gutters
+                for y in range(band * 1000 + 100, band * 1000 + 400):
+                    for x in range(100, 1100, 3):
+                        banded.putpixel((x, y), (0, 0, 0))
+            banded_src = img_dir / "banded.png"
+            banded.save(banded_src)
+            banded_pdf = rm_render._render_image(banded_src, img_dir)[0]
+            check("tall image is one page before splitting",
+                  len(_PdfReader(str(banded_pdf)).pages), 1)
+            _split_in_place(banded_pdf, _SplitConfig())
+            check("AUTO_SPLIT cuts a tall image into multiple readable pages",
+                  len(_PdfReader(str(banded_pdf)).pages) > 1, True)
+
     # --- blank-page detection (rm_ocr's real ocr_pdf, not the fake_ocr stub) ---
     # PIL/Pillow isn't installed in this zero-dependency harness (real
     # pdf2image — which pulls it in — is stubbed out above), so fake just
     # enough of PIL.ImageStat's surface for _is_blank_page's real code path
     # (page.convert("L") -> ImageStat.Stat(...).mean/.stddev) to run unmodified.
+    import base64 as _base64
     import json as _json
+    import struct as _struct
     import urllib.request as _urllib_request
 
     class _FakeStat:
@@ -561,6 +753,171 @@ def main():
     check("skip_blank + reflow: real page is reflowed by ocr_pdf's default (reflow=True)",
           blank_pages[1], (2, "real page text wrapped"))
 
+    # --- empty-answer detection (a reasoning model that never answers) ---
+    # Real failure mode: qwen3-vl ignores think=False, reasons past the context
+    # window, and is cut off with done_reason="length" — every token lands in
+    # "thinking", "response" is empty, and the old code wrote a plausible-looking
+    # empty page under status=ok. A page with ink that yields nothing must be
+    # visible, and a document where EVERY page yields nothing must be an error.
+    def make_urlopen(stream_objs):
+        def _fake(req, timeout=None):
+            class _FakeResp:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+                def __iter__(self):
+                    for o in stream_objs:
+                        yield _json.dumps(o).encode()
+
+            return _FakeResp()
+        return _fake
+
+    THINKING_ONLY = [{"thinking": "let me work through this page..." * 20},
+                     {"done": True, "done_reason": "length"}]
+    _doc_pages = [content_page_img]
+    rm_ocr.convert_from_path = lambda *a, first_page=1, **k: [_doc_pages[first_page - 1]]
+    rm_ocr.pdfinfo_from_path = lambda *a, **k: {"Pages": len(_doc_pages)}
+    _urllib_request.urlopen = make_urlopen(THINKING_ONLY)
+    try:
+        _real_ocr_pdf("fake.pdf", "test-model", 150, 1568)
+        check("all-pages-empty raises instead of writing an empty transcript", False, True)
+    except RuntimeError as e:
+        check("all-pages-empty raises instead of writing an empty transcript",
+              "no text for any" in str(e), True)
+    finally:
+        _urllib_request.urlopen = saved_urlopen
+
+    # A partial failure still returns, with the bad page marked in place so the
+    # transcript says what happened rather than looking like a blank page.
+    _doc_pages = [content_page_img, content_page_img]
+    rm_ocr.convert_from_path = lambda *a, first_page=1, **k: [_doc_pages[first_page - 1]]
+    rm_ocr.pdfinfo_from_path = lambda *a, **k: {"Pages": len(_doc_pages)}
+    _calls = {"n": 0}
+
+    def _mixed(req, timeout=None):
+        _calls["n"] += 1
+        objs = THINKING_ONLY if _calls["n"] == 1 else [
+            {"response": "second page is fine"}, {"done": True, "done_reason": "stop"}]
+        return make_urlopen(objs)(req, timeout)
+
+    _urllib_request.urlopen = _mixed
+    try:
+        mixed = _real_ocr_pdf("fake.pdf", "test-model", 150, 1568)
+    finally:
+        rm_ocr.convert_from_path = saved_convert
+        rm_ocr.pdfinfo_from_path = saved_pdfinfo
+        _urllib_request.urlopen = saved_urlopen
+    check("partial failure still returns every page", len(mixed), 2)
+    check("failed page is marked, not left blank",
+          mixed[0][1].startswith(rm_ocr.NO_OUTPUT_TEXT), True)
+    check("failed page records why it was empty",
+          "done_reason='length'" in mixed[0][1] and "reasoning discarded" in mixed[0][1], True)
+    check("failed page is distinguishable from a genuinely blank page",
+          rm_ocr.NO_OUTPUT_TEXT != rm_ocr.BLANK_PAGE_TEXT, True)
+    check("good page in a partially-failed document is untouched",
+          mixed[1][1], "second page is fine")
+
+    # --- vision gate: refuse a model that silently drops images ---
+    # The worst failure this tool can have. Ollama 0.32.0's MLX runner accepted
+    # images=, dropped them, and gemma4:12b-mlx answered from the prompt alone —
+    # serving a page of handwriting as a fluent essay about 19th-century America,
+    # repeated verbatim per page, under status=ok. The gate reads how prompt cost
+    # GROWS from a 64px image to a 1024px one, so it tests image DELIVERY and not
+    # the model's OCR skill — and, unlike an absolute token threshold, it holds
+    # across tokenizers that charge very different rates per image.
+    # Counts below are (no image, 64px, 1024px).
+    def fake_generate(counts):
+        seen = {"n": 0}
+
+        def _fake(req, timeout=None):
+            body = _json.loads(req.data)
+            imgs = body.get("images")
+            if not imgs:
+                n = counts[0]
+            else:
+                # Width straight out of the PNG IHDR: 8-byte signature, then a
+                # 4-byte length and the "IHDR" tag, so width lands at offset 16.
+                # Avoids Pillow — CI runs this file on a bare interpreter.
+                raw = _base64.b64decode(imgs[0])
+                w = _struct.unpack(">I", raw[16:20])[0]
+                n = counts[1] if w <= 64 else counts[2]
+            seen["n"] += 1
+
+            class _R:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+                def read(self):
+                    return _json.dumps({"prompt_eval_count": n}).encode()
+
+            return _R()
+        return _fake
+
+    saved_urlopen2 = _urllib_request.urlopen
+    try:
+        # qwen3.5:9b, measured. Charges per area, ~1000 tokens at 1024px.
+        _urllib_request.urlopen = fake_generate((17, 28, 1043))
+        ocr_daemon.assert_model_sees_images("http://x", "good-model", 64)
+        check("vision gate lets a real vision model through", True, True)
+    except SystemExit:
+        check("vision gate lets a real vision model through", False, True)
+    finally:
+        _urllib_request.urlopen = saved_urlopen2
+
+    try:
+        # gemma4:26b, measured. A far more compressive vision encoder: a 64px
+        # probe costs it only 51 tokens, so the old absolute "+200 with an image
+        # attached" rule called this working model blind and refused to start.
+        _urllib_request.urlopen = fake_generate((23, 74, 281))
+        ocr_daemon.assert_model_sees_images("http://x", "frugal-tokenizer", 64)
+        check("vision gate lets a frugal-tokenizer vision model through", True, True)
+    except SystemExit:
+        check("vision gate lets a frugal-tokenizer vision model through", False, True)
+    finally:
+        _urllib_request.urlopen = saved_urlopen2
+
+    try:
+        # gemma4:12b-mlx, measured: flat regardless of what it is sent.
+        _urllib_request.urlopen = fake_generate((30, 35, 35))
+        ocr_daemon.assert_model_sees_images("http://x", "blind-model", 64)
+        check("vision gate refuses a model that drops images", False, True)
+    except SystemExit as e:
+        check("vision gate refuses a model that drops images", "IGNORE images" in str(e), True)
+        check("vision gate names the fabrication risk", "FABRICATED" in str(e), True)
+    finally:
+        _urllib_request.urlopen = saved_urlopen2
+
+    try:
+        # A runner that adds a constant "image mode" preamble but encodes no
+        # pixels: big jump from no-image, zero growth with area. The old rule
+        # passed this; differencing two sizes catches it.
+        _urllib_request.urlopen = fake_generate((30, 900, 900))
+        ocr_daemon.assert_model_sees_images("http://x", "constant-preamble", 64)
+        check("vision gate refuses a constant image-mode preamble", False, True)
+    except SystemExit:
+        check("vision gate refuses a constant image-mode preamble", True, True)
+    finally:
+        _urllib_request.urlopen = saved_urlopen2
+
+    # An unreachable/odd server must not block startup — warn and continue.
+    def _boom(req, timeout=None):
+        raise OSError("connection refused")
+
+    try:
+        _urllib_request.urlopen = _boom
+        ocr_daemon.assert_model_sees_images("http://x", "unreachable", 64)
+        check("vision gate degrades to a warning when it can't run", True, True)
+    except SystemExit:
+        check("vision gate degrades to a warning when it can't run", False, True)
+    finally:
+        _urllib_request.urlopen = saved_urlopen2
+
     # --- reflow_paragraphs (pure text transform, no model/PIL involved) ---
     check("reflow_paragraphs: joins word-wrapped lines within a paragraph",
           rm_ocr.reflow_paragraphs("It's really difficult to\nput into words\nwhen you find someone."),
@@ -614,6 +971,317 @@ def main():
         check("forbidden path refused", True, True)
     finally:
         ocr_daemon.OUT = saved
+
+    # --- self-checking transcripts: rm_verify, rm_eval and their daemon wiring ---
+    import json as _json2
+
+    import rm_eval
+    import rm_verify
+
+    a = "We use Palantir with GH Actions and the Gartner guide to track CIMD work."
+    b = "We use Pulumi with GH Actions and the gather guide to track CIMD work."
+    text, st = rm_verify.verify_page(a, b)
+    check("verify: disagreements are flagged as ==A|B==",
+          ("==Palantir|Pulumi==" in text, "==Gartner|gather==" in text), (True, True))
+    check("verify: agreed words are untouched", text.startswith("We use ") and "CIMD work." in text, True)
+    check("verify: stats count spans and flags", (st["spans"], st["flagged"]), (2, 2))
+    check("verify: formatting-only differences are not flagged",
+          rm_verify.verify_page("see Claude/OpenAI docs", "see Claude / Open AI docs")[1]["spans"], 0)
+    check("verify: a span never crosses a paragraph break",
+          rm_verify.verify_page("tool -\n\nThick: A policy", "tool Third: A policy")[1]["flagged"] <= 1
+          and "\n\n" not in "".join(m.group(0) for m in rm_verify.MARK_RE.finditer(
+              rm_verify.verify_page("tool -\n\nThick: A policy", "tool Third: A policy")[0])), True)
+    fixed, st = rm_verify.verify_page(a, b, resolver=lambda spans: {"answers": [
+        {"id": 1, "choice": "B"}, {"id": 2, "choice": "A"}]})
+    check("verify: resolver choices are applied",
+          fixed, "We use Pulumi with GH Actions and the Gartner guide to track CIMD work.")
+    check("verify: resolved counts", (st["resolved_a"], st["resolved_b"], st["flagged"]), (1, 1, 0))
+    ins, _ = rm_verify.verify_page("engine. At the very least", "engine. Or at the very least",
+                                   resolver=lambda s: {"answers": [{"id": 1, "choice": "B"}]})
+    check("verify: an inserted word gets its own space", ins, "engine. Or At the very least")
+    _, st = rm_verify.verify_page(a, b, resolver=lambda s: {"answers": [
+        {"id": 1, "choice": "OTHER", "text": "a whole invented sentence that goes on and on"}]})
+    check("verify: an overlong OTHER answer stays flagged", st["flagged"], 2)
+    _, st = rm_verify.verify_page(a, b, resolver=lambda s: None)
+    check("verify: an unparseable resolver reply flags everything", st["flagged"], 2)
+    check("verify: a flag whose reading contains '=' still parses",
+          rm_verify.strip_marks("Phot at ==#=36-37|11:36-37== ok"), "Phot at #=36-37 ok")
+    check("verify: strip_marks can keep the second reading",
+          rm_verify.strip_marks("x ==?|Or== at", side="b"), "x Or at")
+
+    corr = rm_verify.diff_corrections(
+        "Look at the ==CIMD|SCIM== data. We use Palantir daily.",
+        "Look at the CIMD data. We use Pulumi daily.")
+    check("harvest: corrections pair what was written with the edit",
+          [(c["before"], c["after"]) for c in corr], [("==CIMD|SCIM==", "CIMD"), ("Palantir", "Pulumi")])
+    check("harvest: term-like words are extracted", [c["terms"] for c in corr], [["CIMD"], ["Pulumi"]])
+    check("harvest: a sentence-start capital is not a term",
+          rm_verify.diff_corrections("Lustly there is", "Lastly there is")[0]["terms"], [])
+    check("harvest: a case-only change is not a correction",
+          rm_verify.diff_corrections("with GH actions", "with GH Actions"), [])
+
+    lv = rm_verify.LearnedVocab(tmp / "lv-test.json", min_count=2)
+    lv.record("Pulumi", "a#1")
+    lv.record("Pulumi", "a#1")
+    check("learned vocab: the same place counts once", lv.candidates(), [])
+    lv.record("Pulumi", "b#2")
+    check("learned vocab: two places make a candidate", lv.candidates(), ["Pulumi"])
+    lv.reject(["Pulumi"])
+    check("learned vocab: a rejected term is not retried", lv.candidates(), [])
+
+    check("vocab: parse_terms splits commas, newlines and drops comments and duplicates",
+          rm_verify.parse_terms("Okta, ISPM  # identity\nPulumi,okta\n"), ["Okta", "ISPM", "Pulumi"])
+    check("vocab: the hint lists the terms", "Okta, ISPM." in rm_verify.vocab_hint(["Okta", "ISPM"]), True)
+    check("vocab: no terms means no hint", rm_verify.vocab_hint([]), "")
+
+    s = rm_eval.score("We use Pulumi daily", "We use Pulumi daily.")
+    check("eval: a perfect page scores zero errors", (s["word_errors"], s["char_errors"]), (0, 0))
+    check("eval: slash spacing is not an error",
+          rm_eval.score("Claude/OpenAI", "Claude / OpenAI")["word_errors"], 0)
+    fs = rm_eval.flag_score("We use ==Palantir|Pulumi== with the gather guide", "We use Pulumi with the Gartner guide")
+    check("eval: flag_score finds one caught and one missed error", (fs["caught"], fs["diff_errors"]), (1, 2))
+    summ = rm_eval.summarize([{"words": 10, "chars": 50, "primary_word_errors": 2, "primary_char_errors": 5,
+                               "final_word_errors": 1, "final_char_errors": 2, "seconds": 4,
+                               "flagged_words": 1, "hyp_words": 10, "diff_errors": 2, "caught": 1}])
+    check("eval: summary rates", (summ["primary_wer"], summ["final_wer"], summ["error_recall"],
+                                  summ["review_wer"]), (0.2, 0.1, 0.5, 0.1))
+    gdir = tmp / "gold-test"
+    rm_verify.write_gold_case(gdir, "x.pdf", 1, "clean page", b"png")
+    rm_verify.write_gold_case(gdir, "x.pdf", 2, "still ==a|b== open", b"png")
+    check("eval: pages with open flags are skipped by default",
+          [c["page"] for c in rm_eval.load_goldset(gdir)], [1])
+    check("eval: ...unless asked for", len(rm_eval.load_goldset(gdir, include_flagged=True)), 2)
+
+    # Daemon wiring. Each model returns its own reading; the resolver picks B.
+    VDIR = tmp / "vault/remarkable/Verify"
+    VDIR.mkdir(parents=True, exist_ok=True)
+    (tmp / "vault/remarkable/Work/Plain.pdf").write_text("plain-v1")
+    READINGS = {"gemma4:26b": "We use Palantir with GH Actions.",
+                "qwen3.6:35b-a3b": "We use Pulumi with GH Actions."}
+    prompts = []
+
+    def fake_dual(pdf, model, *a, **k):
+        prompts.append(k.get("prompt_extra", ""))
+        return [(1, READINGS.get(model, "?")), (2, "Second page agrees.")]
+
+    saved = {n: getattr(ocr_daemon, n) for n in (
+        "ocr_pdf", "VERIFY_MODEL", "RESOLVE_MODEL", "VERIFY_RESOLVE", "VERIFY_PATHS", "VOCAB_FILE",
+        "USE_LEARNED_VOCAB", "LEARN_GATE", "LEARN_MIN_COUNT")}
+    saved_rm = {n: getattr(rm_ocr, n) for n in ("render_page_b64", "generate_json", "unload_model")}
+    unloaded = []
+    try:
+        ocr_daemon.ocr_pdf = fake_dual
+        rm_ocr.render_page_b64 = lambda *a, **k: "cG5n"          # base64 of b"png"
+        rm_ocr.generate_json = lambda *a, **k: {"answers": [{"id": 1, "choice": "B"}]}
+        rm_ocr.unload_model = lambda m, **k: unloaded.append(m)
+        ocr_daemon.VERIFY_MODEL = ocr_daemon.RESOLVE_MODEL = "qwen3.6:35b-a3b"
+        ocr_daemon.VERIFY_PATHS = ("Verify",)
+        check("daemon verify: resolution is off by default (flags only)", ocr_daemon.VERIFY_RESOLVE, False)
+        (VDIR / "Flags.pdf").write_text("flags-v1")
+        ocr_daemon.scan_once(ocr_daemon.load_manifest())
+        frec = ocr_daemon.load_manifest()["remarkable/Verify/Flags.pdf"]
+        check("daemon verify: by default a disagreement is written as a flag",
+              "==Palantir|Pulumi==" in ocr_daemon._out_md_path(frec["out_path"]).read_text(), True)
+        ocr_daemon.VERIFY_RESOLVE = True
+        prompts.clear()
+        (VDIR / "Roadmap.pdf").write_text("roadmap-v1")
+        vocab = tmp / "state/vocab.txt"
+        vocab.write_text("Pulumi, GH Actions\n")
+        ocr_daemon.VOCAB_FILE = vocab
+
+        ocr_daemon.scan_once(ocr_daemon.load_manifest())
+        man = ocr_daemon.load_manifest()
+        rec = man["remarkable/Verify/Roadmap.pdf"]
+        out_md = ocr_daemon._out_md_path(rec["out_path"])
+        md_v = out_md.read_text()
+        check("daemon verify: the resolver's choice lands in the transcript",
+              "We use Pulumi with GH Actions." in md_v, True)
+        check("daemon verify: frontmatter records the verification",
+              ("verify_model: qwen3.6:35b-a3b" in md_v, "verify_resolved: 1" in md_v,
+               "verify_flagged: 0" in md_v), (True, True, True))
+        check("daemon verify: manifest keeps the stats", rec["verify"]["resolved_b"], 1)
+        check("daemon verify: models are unloaded between readings", "gemma4:26b" in unloaded, True)
+        check("daemon verify: VERIFY_PATHS leaves other folders single-read",
+              "verify" in man["remarkable/Work/Plain.pdf"], False)
+        check("daemon vocab: the hint reaches every OCR call",
+              all("Pulumi, GH Actions." in p for p in prompts), True)
+        check("daemon learn: a sidecar records what was written",
+              rm_verify.sidecar_path(ocr_daemon.STATE, rec["out_path"]).exists(), True)
+
+        # The user fixes page 2 in Obsidian; the next pass harvests it.
+        edited = md_v.replace("Second page agrees.", "Second page agrees with Kontext.")
+        out_md.write_text(edited)
+        n_h = ocr_daemon.harvest_edits(ocr_daemon.load_manifest())
+        check("daemon learn: an edited page is harvested", n_h, 1)
+        log_lines = [_json2.loads(x) for x in ocr_daemon.CORRECTIONS_LOG.read_text().splitlines()]
+        check("daemon learn: the correction is logged",
+              (log_lines[-1]["page"], log_lines[-1]["after"]), (2, "agrees with Kontext."))
+        gold = rm_eval.load_goldset(ocr_daemon.GOLDSET_DIR)
+        check("daemon learn: the edited page becomes ground truth with its image",
+              [(c["page"], c["truth"], c["png"].read_bytes()) for c in gold],
+              [(2, "Second page agrees with Kontext.", b"png")])
+        check("daemon learn: an unchanged file is not harvested twice",
+              ocr_daemon.harvest_edits(ocr_daemon.load_manifest()), 0)
+
+        # The source changes, but page 2 reads the same: the edit must survive.
+        (VDIR / "Roadmap.pdf").write_text("roadmap-v2")
+        ocr_daemon.scan_once(ocr_daemon.load_manifest())
+        md_v2 = out_md.read_text()
+        check("daemon learn: a re-OCR keeps edits on unchanged pages",
+              "Second page agrees with Kontext." in md_v2, True)
+        check("daemon learn: kept edits are recorded", "kept_edits: 1" in md_v2, True)
+        (VDIR / "Roadmap.pdf").write_text("roadmap-v3")
+        ocr_daemon.scan_once(ocr_daemon.load_manifest())
+        check("daemon learn: ...and keeps them on the re-OCR after that too",
+              "Second page agrees with Kontext." in out_md.read_text(), True)
+
+        # A learned term becomes active only through the gate.
+        lv = rm_verify.LearnedVocab(ocr_daemon.LEARNED_VOCAB)
+        lv.record("Kontext", "other.pdf#1")
+        lv.save()
+        ocr_daemon.USE_LEARNED_VOCAB = True
+        ocr_daemon.LEARN_MIN_COUNT = 2
+        saved_gate = rm_eval.gate_terms
+        rm_eval.gate_terms = lambda *a, **k: (False, {"primary_cer": 0.02}, {"primary_cer": 0.03})
+        ocr_daemon.gate_learned_terms()
+        rm_eval.gate_terms = saved_gate
+        lv = rm_verify.LearnedVocab(ocr_daemon.LEARNED_VOCAB)
+        check("daemon gate: a term that makes the eval worse is rejected",
+              (lv.active(), lv.data["rejected"]), ([], ["Kontext"]))
+        lv.data["rejected"] = []
+        lv.save()
+        ocr_daemon.LEARN_GATE = False
+        ocr_daemon.gate_learned_terms()
+        check("daemon gate: LEARN_GATE=0 activates candidates directly",
+              rm_verify.LearnedVocab(ocr_daemon.LEARNED_VOCAB).active(), ["Kontext"])
+        check("daemon gate: active learned terms join the hint",
+              "Kontext" in ocr_daemon.current_terms(), True)
+    finally:
+        for n, v in saved.items():
+            setattr(ocr_daemon, n, v)
+        for n, v in saved_rm.items():
+            setattr(rm_ocr, n, v)
+
+    # --- scheduled quality self-check ---
+    gold_sc = tmp / "gold-selfcheck"
+    for i in range(3):
+        rm_verify.write_gold_case(gold_sc, f"sc{i}.pdf", 1, f"truth {i}", b"png")
+    fake_cer = {"v": 0.02}
+
+    def fake_run(cases, *, model, verify_model="", **k):
+        rows = [{"id": c["id"], "words": 100, "chars": 500, "primary_word_errors": 5,
+                 "primary_char_errors": int(500 * fake_cer["v"]), "final_word_errors": 5,
+                 "final_char_errors": int(500 * fake_cer["v"]), "flagged_words": 5,
+                 "hyp_words": 100, "diff_errors": 5, "caught": 3, "seconds": 1,
+                 "primary": "x"} for c in cases]
+        return {"config": {"model": model, "verify_model": verify_model, "resolve": False},
+                "summary": rm_eval.summarize(rows), "cases": rows, "at": "2026-10-02T03:00:00"}
+
+    saved_sc = {n: getattr(ocr_daemon, n) for n in (
+        "GOLDSET_DIR", "EVAL_INTERVAL_DAYS", "EVAL_HISTORY", "EVAL_BASELINE", "VERIFY_MODEL")}
+    saved_run = rm_eval.run
+    try:
+        ocr_daemon.GOLDSET_DIR = gold_sc
+        ocr_daemon.EVAL_HISTORY = tmp / "state/eval-sc/history.jsonl"
+        ocr_daemon.EVAL_BASELINE = tmp / "state/eval-sc/baseline.json"
+        ocr_daemon.VERIFY_MODEL = "qwen3.6:35b-a3b"
+        rm_eval.run = fake_run
+        ocr_daemon.EVAL_INTERVAL_DAYS = 0
+        check("self-check: off by default", ocr_daemon.self_check(), None)
+        ocr_daemon.EVAL_INTERVAL_DAYS = 7
+        first = ocr_daemon.self_check()
+        check("self-check: the first run sets the baseline",
+              (first["baseline"], ocr_daemon.EVAL_BASELINE.exists()), ("new (first run)", True))
+        check("self-check: not due again within the interval", ocr_daemon.self_check(), None)
+        fake_cer["v"] = 0.05
+        worse = ocr_daemon.self_check(force=True)
+        check("self-check: a CER drop beyond the tolerance is a regression",
+              [r["metric"] for r in worse["regressions"]], ["primary_cer"])
+        check("self-check: a regression is logged as an error",
+              any("QUALITY REGRESSION" in m for m in gate_msgs), True)
+        fake_cer["v"] = 0.021
+        check("self-check: a change within the tolerance is fine",
+              ocr_daemon.self_check(force=True)["regressions"], [])
+        rm_verify.write_gold_case(gold_sc, "sc-new.pdf", 1, "new truth", b"png")
+        grown = ocr_daemon.self_check(force=True)
+        check("self-check: only pages the baseline also scored are compared",
+              grown["common_pages"], 3)
+        ocr_daemon.VERIFY_MODEL = "ornith-1.5:35b"
+        check("self-check: a new configuration starts a new baseline",
+              ocr_daemon.self_check(force=True)["baseline"], "new (configuration changed)")
+        check("self-check: every run is in the history",
+              len(ocr_daemon._history("self-check")), 5)
+    finally:
+        rm_eval.run = saved_run
+        for n, v in saved_sc.items():
+            setattr(ocr_daemon, n, v)
+
+    # --- pairs: choosing a second reader from saved runs ---
+    truth_p = {"p1": "We use Pulumi with the Gartner guide", "p2": "Lastly the third item"}
+    reads = {"A": {"p1": "We use Palantir with the Gartner guide", "p2": "Lustly the third item"},
+             "B": {"p1": "We use Pulumi with the gather guide", "p2": "Lastly the third item"},
+             "A2": {"p1": "We use Palantir with the Gartner guide", "p2": "Lustly the third item"}}
+    table = {(r["primary"], r["verifier"]): r for r in rm_eval.pair_scores(reads, truth_p)}
+    check("pairs: a different reader flags the primary's errors",
+          table[("A", "B")]["error_recall"], 1.0)
+    check("pairs: an identical reader catches nothing", table[("A", "A2")]["error_recall"], 0.0)
+    check("pairs: reads_from_runs includes dual-read second readings",
+          sorted(rm_eval.reads_from_runs([{"config": {"model": "m1", "verify_model": "m2"},
+                                           "cases": [{"id": "x", "primary": "a", "secondary": "b"}]}])),
+          ["m1", "m2"])
+
+    # --- local-only guard: page images never go to a public host ---
+    for url in ("http://127.0.0.1:11434", "http://192.168.50.2:11434", "http://10.0.0.5",
+                "http://172.18.0.3:11434", "http://100.101.102.103:11434", "http://[::1]:11434"):
+        check(f"local guard: {url} is local", rm_ocr.non_local_addresses(url), [])
+    check("local guard: a public address is caught",
+          rm_ocr.non_local_addresses("http://8.8.8.8:11434"), ["8.8.8.8"])
+    try:
+        rm_ocr.assert_local_host("http://8.8.8.8:11434")
+        check("local guard: a public host is refused", False, True)
+    except SystemExit as e:
+        check("local guard: a public host is refused", "public address" in str(e), True)
+    warned = []
+    rm_ocr.assert_local_host("http://8.8.8.8:11434", allow_remote=True, log=warned.append)
+    check("local guard: ALLOW_REMOTE_MODEL_HOST turns the refusal into a warning",
+          len(warned) == 1 and "WARNING" in warned[0], True)
+    rm_ocr.assert_local_host("http://192.168.50.2:11434")
+    check("local guard: a LAN host passes silently", True, True)
+    # Docker with IPv6 on a delegated prefix gives the Ollama container a
+    # globally routable address on the same bridge (seen in production). The
+    # kernel's on-link routes are what make it local.
+    procdir = tmp / "proc-net"
+    procdir.mkdir()
+    (procdir / "route").write_text(
+        "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n"
+        "eth0\t00000000\t010013AC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n"
+        "eth0\t000013AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n")
+    (procdir / "ipv6_route").write_text(
+        "200120423419a6040000000000000000 40 " + "0" * 32 + " 00 " + "0" * 32
+        + " 00000100 0000000a 00000000 00000001 eth0\n"
+        + "0" * 32 + " 00 " + "0" * 32 + " 00 200120423419a6040000000000000001"
+        + " 00000400 00000001 00000000 00000003 eth0\n")
+    check("local guard: on-link subnets come from the kernel route tables, not the default route",
+          [str(n) for n in rm_ocr.on_link_networks(str(procdir))],
+          ["172.19.0.0/16", "2001:2042:3419:a604::/64"])
+    check("local guard: LOCAL_MODEL_NETS makes a listed global prefix local",
+          rm_ocr.non_local_addresses("http://[2001:2042:3419:a604::34]:11434",
+                                     extra_nets="2001:2042:3419:a604::/64"), [])
+
+    # --- export: local fine-tuning data with a stable holdout ---
+    for i in range(12):
+        rm_verify.write_gold_case(gdir, f"doc{i}.pdf", 1, f"page text {i}", b"png")
+    xcases = rm_eval.load_goldset(gdir)
+    counts = rm_eval.export(xcases, tmp / "export-test", holdout=0.25, prompt="P")
+    check("export: every page lands in train or holdout",
+          counts["train"] + counts["holdout"], len(xcases))
+    first = _json2.loads((tmp / "export-test/train.jsonl").read_text().splitlines()[0])
+    check("export: lines carry the image, text and chat messages",
+          (first["image"].startswith("images/"), first["messages"][1]["content"][0]["text"] == first["text"],
+           (tmp / "export-test" / first["image"]).read_bytes()), (True, True, b"png"))
+    held = set((tmp / "export-test/holdout.ids").read_text().split())
+    check("export: holdout ids are never in train",
+          held & set((tmp / "export-test/train.ids").read_text().split()), set())
 
     print(f"\n--- sample transcript ---\n{md}")
     if failures:

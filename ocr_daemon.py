@@ -14,6 +14,7 @@ Modes:
 All configuration is via environment variables (see the table in the brief / README).
 """
 import argparse
+import base64
 import datetime
 import hashlib
 import json
@@ -24,10 +25,18 @@ import re
 import sys
 import time
 
+from collections import Counter
+
+import rm_ocr
 import rm_render
 import rm_strokes
-from rm_ocr import _safe, ocr_pdf  # reuse the proven core
+import rm_verify
 from rm_split import SplitConfig, split_in_place
+
+# Reuse the proven core. Bound as module names (not `from rm_ocr import`) so the
+# offline self-test can swap ocr_pdf here without touching rm_ocr itself.
+ocr_pdf = rm_ocr.ocr_pdf
+_safe = rm_ocr._safe
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +72,10 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/"
 # (useful for tests / non-ollama setups). The default headroom accommodates a
 # cold pull on a slow link plus the first CPU model-load.
 MODEL_WAIT_TIMEOUT = int(os.environ.get("MODEL_WAIT_TIMEOUT", "1800"))
+# Handwriting never leaves the owner's machines: at startup the model host must
+# resolve only to loopback, private LAN, link-local or 100.64/10 (Tailscale)
+# addresses. ALLOW_REMOTE_MODEL_HOST=1 downgrades the refusal to a warning.
+ALLOW_REMOTE_MODEL_HOST = _env_bool("ALLOW_REMOTE_MODEL_HOST", False)
 THREADS = int(os.environ.get("THREADS", "14"))
 NO_THINK = _env_bool("NO_THINK", True)
 # Skip the OCR call entirely for a page that's genuinely blank (rm_ocr's cheap
@@ -78,6 +91,23 @@ REFLOW_PARAGRAPHS = _env_bool("REFLOW_PARAGRAPHS", True)
 DPI = int(os.environ.get("DPI", "150"))
 MAX_PX = int(os.environ.get("MAX_PX", "1568"))
 TIMEOUT = int(os.environ.get("TIMEOUT", "1800"))
+# Context window for the model, in tokens (0 = leave it to Ollama, which
+# defaults to 4096). A full-page image alone costs roughly 1800 of those, so a
+# model that reasons before answering can burn the rest of the window and get
+# cut off mid-thought, returning NOTHING. Measured on qwen3-vl:8b against a real
+# faint reMarkable page: 4096 -> 0 chars on every page, 16384 -> a correct
+# transcript. Costs VRAM, so it is opt-in rather than defaulted.
+NUM_CTX = int(os.environ.get("NUM_CTX", "0"))
+# Startup gate: prove the model actually RECEIVES the images we send. A runner
+# that drops them silently (Ollama 0.32.0's MLX runner does) makes the model
+# answer from the prompt alone and invent a fluent transcript that looks
+# perfectly successful. Compares prompt token counts across two image SIZES, so
+# it tests delivery rather than OCR skill. Costs three 1-token generates.
+VISION_CHECK = _env_bool("VISION_CHECK", True)
+# Minimum extra prompt tokens a 1024x1024 image must cost over a 64x64 one.
+# Measured growth: qwen3.5:9b 1015, gemma4:26b 207; a runner that drops images
+# shows ~0. 64 sits an order of magnitude clear of the failure case.
+VISION_CHECK_MIN_TOKENS = int(os.environ.get("VISION_CHECK_MIN_TOKENS", "64"))
 INTERVAL = int(os.environ.get("INTERVAL", "600"))
 # Inotify wake-up signal layered on top of the poll. The poll stays as a
 # correctness floor (so a missed event never strands a file forever), but a
@@ -157,6 +187,61 @@ STROKE_CONTEXT = _env_bool("STROKE_CONTEXT", False)
 DAILY_NOTE_EMBED = _env_bool("DAILY_NOTE_EMBED", False)
 DAILY_NOTE_DIR = os.environ.get("DAILY_NOTE_DIR", "Daily Journal")
 DAILY_NOTE_HEADING = os.environ.get("DAILY_NOTE_HEADING", "## reMarkable journal")
+
+# --- Self-checking transcripts (rm_verify, rm_eval) ---
+# VOCAB_FILE: the writer's own terms, comma or newline separated. When present
+# the OCR prompt asks the model to prefer these spellings for ambiguous words.
+# Measured on 16 jargon-heavy pages: WER 9.6% -> 8.6% at no speed cost.
+VOCAB_FILE = pathlib.Path(os.environ.get("VOCAB_FILE", str(STATE / "vocab.txt")))
+# VERIFY_MODEL (opt-in): transcribe each page a second time with this model and
+# flag words the two readings disagree on as ==A|B== highlights. Measured on 26
+# pages, flags covered ~6% of words and fixing just those took WER from ~6.2%
+# to ~2.2%. Doubles OCR time per page, so VERIFY_PATHS can limit it to some
+# folders (comma-separated, relative to SOURCE_SUBDIR, e.g. "Work,Meeting Notes").
+VERIFY_MODEL = os.environ.get("VERIFY_MODEL", "").strip()
+VERIFY_PATHS = tuple(p.strip().strip("/") for p in os.environ.get("VERIFY_PATHS", "").split(",")
+                     if p.strip())
+# VERIFY_RESOLVE (opt-in): put each disagreement back to a model with the page
+# image as a constrained choice (A, B, the exact text, or unsure) instead of
+# flagging it. Measured on 26 pages it answered 88 of 90 questions and was
+# barely better than chance: WER 5.4% -> 5.1% unattended, at ~90 s extra per
+# page, and it removed the flags that let review reach 1.9%. Flags stay the
+# default. RESOLVE_MODEL defaults to VERIFY_MODEL, already loaded at that point.
+VERIFY_RESOLVE = _env_bool("VERIFY_RESOLVE", False)
+RESOLVE_MODEL = os.environ.get("RESOLVE_MODEL", "").strip() or VERIFY_MODEL
+VERIFY_MAX_SPAN_WORDS = int(os.environ.get("VERIFY_MAX_SPAN_WORDS", "6"))
+# VERIFY_UNLOAD: drop one model before loading the other, for a CPU host that
+# cannot hold both (two ~20 GB models on a box with ~35 GB free).
+VERIFY_UNLOAD = _env_bool("VERIFY_UNLOAD", True)
+# LEARN_CORRECTIONS: remember what was written to each transcript (a sidecar
+# under STATE/transcripts), notice when it is edited in Obsidian, log the
+# corrections, store edited pages as ground truth under GOLDSET_DIR, and keep
+# those edits when a re-OCR produces the same text for the page. Only reads
+# transcripts and writes under STATE, so it is on by default.
+LEARN_CORRECTIONS = _env_bool("LEARN_CORRECTIONS", True)
+GOLDSET_DIR = pathlib.Path(os.environ.get("GOLDSET_DIR", str(STATE / "goldset")))
+# USE_LEARNED_VOCAB (opt-in): add terms learned from corrections to the prompt
+# hint. A term qualifies after LEARN_MIN_COUNT separate corrections, and with
+# LEARN_GATE it is only activated when an evaluation on up to LEARN_GATE_PAGES
+# ground-truth pages shows the primary model is no worse with it.
+USE_LEARNED_VOCAB = _env_bool("USE_LEARNED_VOCAB", False)
+LEARN_MIN_COUNT = int(os.environ.get("LEARN_MIN_COUNT", "2"))
+LEARN_GATE = _env_bool("LEARN_GATE", True)
+LEARN_GATE_PAGES = int(os.environ.get("LEARN_GATE_PAGES", "10"))
+LEARNED_VOCAB = STATE / "learned_vocab.json"
+CORRECTIONS_LOG = STATE / "corrections.jsonl"
+EVAL_HISTORY = STATE / "eval" / "history.jsonl"
+# EVAL_INTERVAL_DAYS (opt-in): re-score the production configuration (MODEL,
+# VERIFY_MODEL, vocabulary) on the ground-truth set this often, inside
+# RUN_WINDOW. The first run for a configuration is its baseline; a later run
+# whose CER or post-review WER is worse by more than EVAL_TOLERANCE (absolute,
+# 0.005 = half a point) is logged as an error and recorded in the history.
+# Catches silent drift such as an Ollama upgrade or a re-pulled model reading
+# worse. EVAL_PAGES limits how many ground-truth pages it scores (0 = all).
+EVAL_INTERVAL_DAYS = float(os.environ.get("EVAL_INTERVAL_DAYS", "0"))
+EVAL_PAGES = int(os.environ.get("EVAL_PAGES", "0"))
+EVAL_TOLERANCE = float(os.environ.get("EVAL_TOLERANCE", "0.005"))
+EVAL_BASELINE = STATE / "eval" / "baseline.json"
 
 # Absolute paths the daemon must NEVER read or write under, no matter what.
 # Comma-separated override via FORBIDDEN_PATHS; default protects the standalone
@@ -425,9 +510,12 @@ def _iso_mtime(st):
     return datetime.datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")
 
 
-def write_md(out_md, title, rel, pages, source_modified=None, stroke_regions_flagged=None):
+def write_md(out_md, title, rel, pages, source_modified=None, stroke_regions_flagged=None,
+             verify=None, kept_edits=0):
     out_md.parent.mkdir(parents=True, exist_ok=True)
     chars = [len(text) for _, text in pages]
+    verify = verify or {}
+    resolved = sum(verify.get(k, 0) for k in ("resolved_a", "resolved_b", "resolved_other"))
     fm = [
         "---",
         f"source: {rel}",
@@ -437,6 +525,12 @@ def write_md(out_md, title, rel, pages, source_modified=None, stroke_regions_fla
         f"pages: {len(pages)}",
         f"chars_per_page: {json.dumps(chars)}",
         f"stroke_regions_flagged: {stroke_regions_flagged}" if stroke_regions_flagged is not None else None,
+        f"verify_model: {VERIFY_MODEL}" if verify else None,
+        f"verify_resolved: {resolved}" if verify else None,
+        # Words the two readings still disagree on, highlighted as ==A|B== in the text.
+        f"verify_flagged: {verify.get('flagged', 0)}" if verify else None,
+        f"verify_error: {json.dumps(verify['error'])}" if verify.get("error") else None,
+        f"kept_edits: {kept_edits}" if kept_edits else None,
         "status: ok",
         "---",
         "",
@@ -458,11 +552,49 @@ def _pdf_page_count(pdf):
 # ---------------------------------------------------------------------------
 # Daily-note embed (opt-in, DAILY_NOTE_EMBED)
 # ---------------------------------------------------------------------------
-_DAILY_NOTE_TITLE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# A daily-journal source is titled either `YYYY-MM-DD` (one file per day) or
+# `YYYY-MM-DD-P<n>` (one file per PAGE of that day, the shape a multi-page photo
+# or per-page export produces). Both route to the same `<date>.md` daily note;
+# the page suffix only distinguishes the transcripts from each other.
+_DAILY_NOTE_TITLE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:-P\d+)?$", re.IGNORECASE)
+
+
+def _insert_into_section(text, heading, link_line):
+    """Append `link_line` inside `heading`'s existing section, or add the section.
+
+    Multi-page days (`<date>-P001`, `-P002`, ...) embed one link per page into
+    the SAME note, so a plain append would stack a duplicate heading per page.
+    When the heading is already there the link joins that section instead, which
+    also keeps the pages contiguous and in processing order (P001 before P002).
+    Anything the human wrote after the section is left where it is.
+    """
+    if not text.strip() or heading not in text:
+        section = f"{heading}\n\n{link_line}\n"
+        return (text.rstrip("\n") + "\n\n" if text.strip() else "") + section
+
+    lines = text.split("\n")
+    start = next(i for i, ln in enumerate(lines) if ln.strip() == heading.strip())
+    level = len(heading) - len(heading.lstrip("#"))
+    end = len(lines)
+    if level:  # a real markdown heading — its section ends at the next same-or-higher one
+        for i in range(start + 1, len(lines)):
+            stripped = lines[i].lstrip()
+            if stripped.startswith("#"):
+                if len(stripped) - len(stripped.lstrip("#")) <= level:
+                    end = i
+                    break
+    tail = end
+    while tail > start + 1 and not lines[tail - 1].strip():
+        tail -= 1  # step back over blank lines so the link lands with its siblings
+    lines[tail:tail] = [link_line]
+    return "\n".join(lines)
 
 
 def embed_in_daily_note(out_md, title):
     """Ensure the Obsidian daily note for a date-named source embeds its transcript.
+
+    Accepts `YYYY-MM-DD` and `YYYY-MM-DD-P<n>` titles; both target the same
+    `<date>.md` note, so every page of a multi-page day lands in one place.
 
     Returns True if the note was written (created or appended to), False for
     every no-op or skip. The embed uses the transcript's FULL vault-relative
@@ -472,8 +604,10 @@ def embed_in_daily_note(out_md, title):
     counts as "already embedded". Writes go through a temp file + os.replace,
     so a crash mid-write can never truncate a human's daily note.
     """
-    if not _DAILY_NOTE_TITLE.match(title):
+    matched = _DAILY_NOTE_TITLE.match(title)
+    if not matched:
         return False
+    note_date = matched.group(1)
     try:
         target = str(out_md.resolve().relative_to(VAULT.resolve()))
     except ValueError:
@@ -482,7 +616,7 @@ def embed_in_daily_note(out_md, title):
         return False
     if target.endswith(".md"):
         target = target[: -len(".md")]
-    note = (VAULT / DAILY_NOTE_DIR / f"{title}.md").resolve()
+    note = (VAULT / DAILY_NOTE_DIR / f"{note_date}.md").resolve()
     for forbidden in FORBIDDEN_PREFIXES:
         if str(note) == forbidden or str(note).startswith(forbidden.rstrip("/") + "/"):
             log.warning("daily-note embed: %s under forbidden prefix, skipping", note)
@@ -493,8 +627,7 @@ def embed_in_daily_note(out_md, title):
     text = note.read_text() if note.exists() else ""
     if target in text:
         return False  # already embedded (or hand-linked) — never duplicate
-    section = f"{DAILY_NOTE_HEADING}\n\n![[{target}]]\n"
-    new_text = (text.rstrip("\n") + "\n\n" if text.strip() else "") + section
+    new_text = _insert_into_section(text, DAILY_NOTE_HEADING, f"![[{target}]]")
     note.parent.mkdir(parents=True, exist_ok=True)
     tmp = note.with_name(note.name + ".rm-embed.tmp")
     tmp.write_text(new_text)
@@ -524,6 +657,314 @@ def in_run_window():
     return now >= start or now <= end  # window wraps midnight
 
 
+# ---------------------------------------------------------------------------
+# Self-checking transcripts (VOCAB_FILE, VERIFY_MODEL, LEARN_CORRECTIONS)
+# ---------------------------------------------------------------------------
+def current_terms():
+    """The vocabulary hint's terms: VOCAB_FILE, plus active learned terms when enabled."""
+    terms = []
+    try:
+        if VOCAB_FILE.is_file():
+            terms = rm_verify.parse_terms(VOCAB_FILE.read_text())
+    except OSError as e:
+        log.warning("vocab file %s unreadable: %s", VOCAB_FILE, e)
+    if USE_LEARNED_VOCAB:
+        seen = {t.lower() for t in terms}
+        terms += [t for t in rm_verify.LearnedVocab(LEARNED_VOCAB).active() if t.lower() not in seen]
+    return terms
+
+
+def verify_applies(src):
+    """Dual read this source? Needs VERIFY_MODEL, and a matching VERIFY_PATHS prefix when set."""
+    if not VERIFY_MODEL:
+        return False
+    if not VERIFY_PATHS:
+        return True
+    try:
+        rel = src.relative_to(SRC).as_posix()
+    except ValueError:
+        return False
+    return any(rel == p or rel.startswith(p + "/") for p in VERIFY_PATHS)
+
+
+def _unload(model):
+    try:
+        rm_ocr.unload_model(model)
+    except Exception as e:  # costs memory at worst, never the transcript
+        log.warning("could not unload %s: %s", model, e)
+
+
+def dual_read(pdf, pages, hint):
+    """Second reading with VERIFY_MODEL, then resolve or flag each disagreement.
+
+    Returns ``(pages, stats)``. A failure of the second reading keeps the
+    primary text and records the error in the stats instead of failing the
+    document: an unverified transcript is still better than none.
+    """
+    if VERIFY_UNLOAD and VERIFY_MODEL != MODEL:
+        _unload(MODEL)
+    try:
+        second = dict(ocr_pdf(pdf, VERIFY_MODEL, DPI, MAX_PX, timeout=TIMEOUT, threads=THREADS,
+                              no_think=NO_THINK, skip_blank=SKIP_BLANK_PAGES,
+                              reflow=REFLOW_PARAGRAPHS, num_ctx=NUM_CTX, prompt_extra=hint))
+    except Exception as e:
+        log.warning("verify: second reading with %s failed: %s (keeping the primary text)",
+                    VERIFY_MODEL, e)
+        return pages, {"error": f"second reading: {e}"}
+    totals = Counter()
+    out = []
+    for n, text in pages:
+        other = second.get(n)
+        if (other is None or text == rm_ocr.BLANK_PAGE_TEXT
+                or text.startswith(rm_ocr.NO_OUTPUT_TEXT)
+                or other.startswith(rm_ocr.NO_OUTPUT_TEXT)):
+            out.append((n, text))
+            continue
+        resolver = None
+        if VERIFY_RESOLVE:
+            def resolver(spans, n=n):
+                try:
+                    img = rm_ocr.render_page_b64(pdf, n, DPI, MAX_PX)
+                    return rm_ocr.generate_json(
+                        RESOLVE_MODEL, rm_verify.resolve_prompt(spans, hint), img,
+                        rm_verify.RESOLVE_SCHEMA, timeout=TIMEOUT, threads=THREADS,
+                        num_ctx=NUM_CTX or 16384)
+                except Exception as e:  # unresolved spans are simply flagged
+                    log.warning("verify: resolving page %d failed: %s", n, e)
+                    return None
+        text, stats = rm_verify.verify_page(text, other, resolver=resolver,
+                                            max_span_words=VERIFY_MAX_SPAN_WORDS)
+        totals.update(stats)
+        out.append((n, text))
+    if VERIFY_UNLOAD:
+        for m in {VERIFY_MODEL, RESOLVE_MODEL} - {MODEL}:
+            _unload(m)
+    return out, dict(totals)
+
+
+def _out_md_path(out_rel):
+    p = pathlib.Path(out_rel)
+    if p.is_absolute():
+        return p
+    for base in (OUT, VAULT):
+        if (base / p).exists():
+            return base / p
+    return OUT / p
+
+
+def _page_png(rel, rec, page):
+    """The page image OCR saw, re-rendered from the source, or None if it has changed since."""
+    try:
+        if rec.get("render_sha256"):
+            pdf = rm_render._cache_path(STATE / "rendered", rec.get("sha256", ""))
+            if not pdf.exists() or sha256(pdf) != rec["render_sha256"]:
+                return None
+        else:
+            pdf = VAULT / rel
+            if not HASH_CHECK or not pdf.exists() or sha256(pdf) != rec.get("sha256"):
+                return None
+        return base64.b64decode(rm_ocr.render_page_b64(pdf, page, DPI, MAX_PX))
+    except Exception as e:
+        log.debug("gold snapshot for %s p%d unavailable: %s", rel, page, e)
+        return None
+
+
+def harvest_one(rel, rec, learned):
+    """Learn from edits to one transcript. Returns the number of pages harvested."""
+    out_rel = rec.get("out_path")
+    if not out_rel:
+        return 0
+    side_path = rm_verify.sidecar_path(STATE, out_rel)
+    side = rm_verify.load_json(side_path, None)
+    out_md = _out_md_path(out_rel)
+    if not side or not out_md.exists():
+        return 0
+    st = out_md.stat()
+    if side.get("seen_mtime") == st.st_mtime:
+        return 0
+    data = out_md.read_bytes()
+    sha = rm_verify.sha256_bytes(data)
+    side["seen_mtime"] = st.st_mtime
+    if sha == side.get("seen_sha"):
+        rm_verify.save_json(side_path, side)
+        return 0
+    side["seen_sha"] = sha
+    edits = rm_verify.edited_pages(side, rm_verify.parse_pages(data.decode("utf-8", "replace")))
+    harvested = side.setdefault("harvested", {})
+    new_terms = []
+    for n, (written, current) in sorted(edits.items()):
+        seen = {tuple(x) for x in harvested.get(str(n), [])}
+        fresh = [c for c in rm_verify.diff_corrections(written, current)
+                 if (c["before"], c["after"]) not in seen]
+        if not fresh:
+            continue
+        with open(CORRECTIONS_LOG, "a") as f:
+            for c in fresh:
+                f.write(json.dumps({"at": datetime.datetime.now().isoformat(timespec="seconds"),
+                                    "source": rel, "page": n, **c}, ensure_ascii=False) + "\n")
+                for term in c["terms"]:
+                    learned.record(term, f"{rel}#{n}")
+                    new_terms.append(term)
+        harvested[str(n)] = sorted(seen | {(c["before"], c["after"]) for c in fresh})
+        rm_verify.write_gold_case(GOLDSET_DIR, rel, n, current, _page_png(rel, rec, n),
+                                  source_sha256=rec.get("sha256"))
+    rm_verify.save_json(side_path, side)
+    if edits:
+        log.info("learned from edits to %s: page(s) %s%s", out_md.name, sorted(edits),
+                 f", terms {sorted(set(new_terms))}" if new_terms else "")
+    return len(edits)
+
+
+def harvest_edits(man):
+    """Scan every transcript for edits made since the daemon wrote it."""
+    if not LEARN_CORRECTIONS:
+        return 0
+    STATE.mkdir(parents=True, exist_ok=True)
+    learned = rm_verify.LearnedVocab(LEARNED_VOCAB, LEARN_MIN_COUNT)
+    n = 0
+    for rel, rec in list(man.items()):
+        if rec.get("status") == "ok":
+            try:
+                n += harvest_one(rel, rec, learned)
+            except Exception as e:  # one unreadable transcript must not stop the rest
+                log.warning("harvest failed for %s: %s", rel, e)
+    if n:
+        learned.save()
+    return n
+
+
+def gate_learned_terms():
+    """Activate learned terms that have earned it, checked against the ground-truth set."""
+    if not (LEARN_CORRECTIONS and USE_LEARNED_VOCAB):
+        return
+    learned = rm_verify.LearnedVocab(LEARNED_VOCAB, LEARN_MIN_COUNT)
+    cand = learned.candidates()
+    if not cand:
+        return
+    if not LEARN_GATE:
+        learned.accept(cand)
+        learned.save()
+        log.info("learned vocab: activated %s (LEARN_GATE=0)", cand)
+        return
+    import rm_eval
+    cases = rm_eval.load_goldset(GOLDSET_DIR)
+    if not cases:
+        log.info("learned vocab: %d candidate term(s) waiting for ground-truth pages to test on",
+                 len(cand))
+        return
+    # Pages that actually contain the new terms say the most about them.
+    lowered = [t.lower() for t in cand]
+    cases.sort(key=lambda c: not any(t in c["truth"].lower() for t in lowered))
+    cases = cases[:LEARN_GATE_PAGES]
+    base = rm_verify.parse_terms(VOCAB_FILE.read_text()) if VOCAB_FILE.is_file() else []
+    base += [t for t in learned.active() if t not in base]
+    log.info("learned vocab: testing %s on %d page(s)", cand, len(cases))
+    accepted, b, c = rm_eval.gate_terms(cases, MODEL, base, cand, timeout=TIMEOUT,
+                                        num_ctx=NUM_CTX or 16384, log=log.debug)
+    (learned.accept if accepted else learned.reject)(cand)
+    learned.save()
+    EVAL_HISTORY.parent.mkdir(parents=True, exist_ok=True)
+    with open(EVAL_HISTORY, "a") as f:
+        f.write(json.dumps({"at": datetime.datetime.now().isoformat(timespec="seconds"),
+                            "kind": "learned-vocab-gate", "terms": cand, "accepted": accepted,
+                            "base": b, "candidate": c}) + "\n")
+    log.info("learned vocab: %s %s (CER %s -> %s)", "accepted" if accepted else "rejected",
+             cand, b.get("primary_cer"), c.get("primary_cer"))
+
+
+def _history(kind):
+    try:
+        lines = EVAL_HISTORY.read_text().splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("kind") == kind:
+            out.append(rec)
+    return out
+
+
+_SELF_CHECK_KEYS = ("model", "verify_model", "resolve")
+_SELF_CHECK_ROW = ("id", "words", "chars", "primary_word_errors", "primary_char_errors",
+                   "final_word_errors", "final_char_errors", "flagged_words", "hyp_words",
+                   "diff_errors", "caught", "seconds")
+
+
+def self_check(force=False, rebaseline=False):
+    """Score the production configuration on the ground-truth set and compare to its baseline.
+
+    Returns the history record, or None when nothing ran (off, not due, or no
+    ground truth yet). Both sides are summarized over the pages they share,
+    so a ground-truth set that grows between runs does not skew the result.
+    """
+    if not force and EVAL_INTERVAL_DAYS <= 0:
+        return None
+    if not force:
+        last = _history("self-check")
+        if last:
+            try:
+                age = time.time() - datetime.datetime.fromisoformat(last[-1]["at"]).timestamp()
+            except (KeyError, ValueError):
+                age = float("inf")
+            if age < EVAL_INTERVAL_DAYS * 86400:
+                return None
+    import rm_eval
+    cases = rm_eval.load_goldset(GOLDSET_DIR, limit=EVAL_PAGES)
+    if not cases:
+        log.info("self-check: no ground-truth pages under %s yet (fix a transcript, or import "
+                 "pages with rm_eval.py import-pdf)", GOLDSET_DIR)
+        return None
+    log.info("self-check: scoring %s%s on %d ground-truth page(s)", MODEL,
+             f" + {VERIFY_MODEL}" if VERIFY_MODEL else "", len(cases))
+    result = rm_eval.run(cases, model=MODEL, verify_model=VERIFY_MODEL, resolve=VERIFY_RESOLVE,
+                         resolve_model=RESOLVE_MODEL, terms=current_terms(), timeout=TIMEOUT,
+                         num_ctx=NUM_CTX or 16384, max_span_words=VERIFY_MAX_SPAN_WORDS,
+                         log=log.debug)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    rm_verify.save_json(STATE / "eval" / f"self-check-{stamp}.json", result)
+    key = {k: result["config"].get(k) for k in _SELF_CHECK_KEYS}
+    rows = [{k: c.get(k) for k in _SELF_CHECK_ROW if k in c} for c in result["cases"]]
+    base = rm_verify.load_json(EVAL_BASELINE, None)
+    rec = {"at": result["at"], "kind": "self-check", "config": result["config"],
+           "summary": result["summary"], "file": f"self-check-{stamp}.json", "regressions": []}
+    if rebaseline or not base or base.get("key") != key:
+        why = ("asked to" if rebaseline else "first run" if not base
+               else "configuration changed")
+        rm_verify.save_json(EVAL_BASELINE, {"at": result["at"], "key": key, "rows": rows,
+                                            "summary": result["summary"]})
+        rec["baseline"] = f"new ({why})"
+        log.info("self-check: baseline set (%s): CER %s, post-review WER %s", why,
+                 result["summary"].get("primary_cer"), result["summary"].get("review_wer"))
+    else:
+        common = {r["id"] for r in rows} & {r["id"] for r in base["rows"]}
+        now = rm_eval.summarize([r for r in rows if r["id"] in common])
+        then = rm_eval.summarize([r for r in base["rows"] if r["id"] in common])
+        rec.update(baseline=base["at"], common_pages=len(common),
+                   compared={"now": now, "baseline": then})
+        for metric in ("primary_cer", "review_wer"):
+            a, b = then.get(metric), now.get(metric)
+            if a is not None and b is not None and b > a + EVAL_TOLERANCE:
+                rec["regressions"].append({"metric": metric, "baseline": a, "now": b})
+        if rec["regressions"]:
+            log.error("self-check: QUALITY REGRESSION vs baseline %s on %d page(s): %s. "
+                      "Check for an Ollama or model change; details in %s",
+                      base["at"], len(common),
+                      ", ".join(f"{r['metric']} {r['baseline']:.2%} -> {r['now']:.2%}"
+                                for r in rec["regressions"]), EVAL_HISTORY)
+        else:
+            log.info("self-check: OK vs baseline %s on %d page(s): CER %s -> %s, "
+                     "post-review WER %s -> %s", base["at"], len(common), then.get("primary_cer"),
+                     now.get("primary_cer"), then.get("review_wer"), now.get("review_wer"))
+    EVAL_HISTORY.parent.mkdir(parents=True, exist_ok=True)
+    with open(EVAL_HISTORY, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+    return rec
+
+
 def process_one(src, result, rel, digest, man, page_regions=None):
     """OCR a single (rendered) PDF and write its manifest entry + transcript.
 
@@ -542,14 +983,16 @@ def process_one(src, result, rel, digest, man, page_regions=None):
     log.info("processing %s", rel)
     st = src.stat()
     source_modified = _iso_mtime(st)             # last-modified of the source file
+    hint = rm_verify.vocab_hint(current_terms())
     pages = ocr_pdf(result.pdf, MODEL, DPI, MAX_PX, timeout=TIMEOUT, threads=THREADS,
                     no_think=NO_THINK, skip_blank=SKIP_BLANK_PAGES, page_regions=page_regions,
-                    reflow=REFLOW_PARAGRAPHS)
+                    reflow=REFLOW_PARAGRAPHS, num_ctx=NUM_CTX, prompt_extra=hint)
+    verify = None
+    if verify_applies(src):
+        pages, verify = dual_read(result.pdf, pages, hint)
     stroke_regions_flagged = sum(
         rm_strokes.summarize(regions)["likely_drawing_regions"] for regions in page_regions
     ) if page_regions else None
-    chars = write_md(out_md, result.title, rel, pages, source_modified=source_modified,
-                     stroke_regions_flagged=stroke_regions_flagged)
     out_rel = str(out_md)
     for base in (OUT, VAULT):                     # prefer a tidy relative path
         try:
@@ -557,6 +1000,31 @@ def process_one(src, result, rel, digest, man, page_regions=None):
             break
         except ValueError:
             continue
+    kept = 0
+    model_pages = pages
+    if LEARN_CORRECTIONS and out_md.exists():
+        # Harvest any edits before this write replaces the file, then keep the
+        # edits of every page whose new model output is unchanged.
+        prev = man.get(rel, {})
+        harvest_one(rel, {**prev, "out_path": prev.get("out_path") or out_rel},
+                    rm_verify.LearnedVocab(LEARNED_VOCAB, LEARN_MIN_COUNT))
+        side = rm_verify.load_json(rm_verify.sidecar_path(STATE, out_rel), None)
+        if side:
+            old_text = out_md.read_text()
+            pages, kept, superseded = rm_verify.carry_over(
+                pages, side, rm_verify.parse_pages(old_text))
+            if superseded:
+                keep = STATE / "superseded" / f"{out_md.stem}.{time.strftime('%Y%m%d-%H%M%S')}.md"
+                keep.parent.mkdir(parents=True, exist_ok=True)
+                keep.write_text(old_text)
+                log.warning("%d edited page(s) of %s changed on the page itself and were "
+                            "re-transcribed; the edited file is kept at %s",
+                            superseded, out_md.name, keep)
+    chars = write_md(out_md, result.title, rel, pages, source_modified=source_modified,
+                     stroke_regions_flagged=stroke_regions_flagged, verify=verify, kept_edits=kept)
+    if LEARN_CORRECTIONS:
+        rm_verify.write_sidecar(STATE, out_rel, rel, pages, out_md.read_bytes(),
+                                model_pages=model_pages)
     entry = {
         "mtime": st.st_mtime,
         "size": st.st_size,
@@ -571,9 +1039,15 @@ def process_one(src, result, rel, digest, man, page_regions=None):
     }
     if result.rendered:
         entry["render_sha256"] = sha256(result.pdf)
+    if verify:
+        entry["verify"] = verify
+    if kept:
+        entry["kept_edits"] = kept
     man[rel] = entry
     save_manifest(man)
-    log.info("ok %s -> %s (%dp, %d chars)", rel, out_md.name, len(pages), sum(chars))
+    log.info("ok %s -> %s (%dp, %d chars)%s", rel, out_md.name, len(pages), sum(chars),
+             f", verify: {verify.get('flagged', 0)} flagged of {verify.get('spans', 0)} "
+             f"disagreement(s)" if verify else "")
     if DAILY_NOTE_EMBED:
         try:  # an embed failure must never fail (or retry) a completed transcription
             embed_in_daily_note(out_md, result.title)
@@ -601,7 +1075,8 @@ def scan_once(man):
         digest = needs_work(src, rel, man)
         if digest is False:
             continue
-        # Render: passthrough for .pdf; rmc + pdfunite for .zip/.rmdoc/.rm.
+        # Render: passthrough for .pdf; rmc + pdfunite for .zip/.rmdoc/.rm;
+        # a one-page wrap for .png/.jpg/.jpeg/.webp.
         # Cached under STATE/rendered, keyed by source bytes hash, so a re-
         # extracted-but-byte-identical bundle never re-renders.
         try:
@@ -727,6 +1202,46 @@ def scan_once(man):
     return done
 
 
+def print_learning_status(man):
+    """Verification and learning at a glance: what is flagged, learned and measured."""
+    v = Counter()
+    docs = 0
+    for r in man.values():
+        if r.get("status") == "ok" and r.get("verify"):
+            docs += 1
+            v.update({k: n for k, n in r["verify"].items() if isinstance(n, int)})
+    if docs:
+        resolved = v["resolved_a"] + v["resolved_b"] + v["resolved_other"]
+        print(f"verify: {docs} doc(s), {v['words']} words, {v['spans']} disagreement(s): "
+              f"{resolved} resolved (A {v['resolved_a']}, B {v['resolved_b']}, "
+              f"other {v['resolved_other']}), {v['flagged']} flagged for review")
+    try:
+        with open(CORRECTIONS_LOG) as f:
+            corrections = sum(1 for _ in f)
+    except OSError:
+        corrections = 0
+    lv = rm_verify.LearnedVocab(LEARNED_VOCAB, LEARN_MIN_COUNT)
+    gold = list(GOLDSET_DIR.glob("*.json")) if GOLDSET_DIR.is_dir() else []
+    if corrections or gold or lv.data["terms"]:
+        print(f"learning: {corrections} correction(s) harvested, {len(gold)} ground-truth page(s), "
+              f"learned terms active={len(lv.active())} candidates={len(lv.candidates())} "
+              f"rejected={len(lv.data['rejected'])}")
+    gates = _history("learned-vocab-gate")
+    if gates:
+        g = gates[-1]
+        print(f"last vocab gate: {g.get('at')} {'accepted' if g.get('accepted') else 'rejected'} "
+              f"{g.get('terms')}")
+    checks = _history("self-check")
+    if checks:
+        c = checks[-1]
+        s = c.get("summary", {})
+        state = ("REGRESSION " + ", ".join(r["metric"] for r in c["regressions"])
+                 if c.get("regressions") else "ok")
+        print(f"last self-check: {c.get('at')} {state} | CER {s.get('primary_cer')} "
+              f"post-review WER {s.get('review_wer')} on {s.get('cases')} page(s), "
+              f"baseline {c.get('baseline')}")
+
+
 def print_status(man):
     ok = sum(1 for r in man.values() if r.get("status") == "ok")
     err = sum(1 for r in man.values() if r.get("status") == "error")
@@ -740,6 +1255,7 @@ def print_status(man):
     print(f"manifest: {MANIFEST}")
     print(f"  ok={ok}  error={err}  pending_split={pending}  attempting={attempting}  "
           f"skipped_pages={skipped}  total_pages={pages}")
+    print_learning_status(man)
     for rel, r in sorted(man.items()):
         if r.get("status") == "error":
             print(f"  ERROR    {rel}  (retries={r.get('retries', 0)}): {r.get('error', '')}")
@@ -751,6 +1267,9 @@ def print_status(man):
         elif r.get("status") == "skipped_pages":
             print(f"  SKIPPED  {rel}  ({r.get('page_count', '?')} pages > MAX_PDF_PAGES; "
                   f"raise the cap to re-queue)")
+
+
+_INPUT_SUFFIX_TUPLE = tuple(sorted(rm_render.SUPPORTED_INPUT_SUFFIXES))
 
 
 def start_inotify_watcher(src, wake):
@@ -810,14 +1329,110 @@ def start_inotify_watcher(src, wake):
                 if ev.mask & flags.CREATE and ev.mask & flags.ISDIR and ev.name:
                     add_dir(base / ev.name)
                     continue
-                # File-level event on a *.pdf → fire the wake.
-                if ev.name and ev.name.lower().endswith((".pdf", ".zip", ".rmdoc", ".rm")):
+                # File-level event on a supported input → fire the wake. Derived
+                # from rm_render rather than hardcoded, so a new input type can
+                # never be silently poll-only.
+                if ev.name and ev.name.lower().endswith(_INPUT_SUFFIX_TUPLE):
                     log.debug("inotify wake: %s/%s (mask=0x%x)", base, ev.name, ev.mask)
                     wake.set()
 
     t = threading.Thread(target=loop, name="rm-ocr-inotify", daemon=True)
     t.start()
     return t
+
+
+def _probe_png(side):
+    """A `side`x`side` PNG as raw bytes, built with the standard library only.
+
+    Deliberately not Pillow. The gate has to be exercisable by selftest.py,
+    which CI runs on a bare interpreter with no third-party packages
+    installed — importing Pillow here is what made the self-test fail to even
+    start. Encoding a solid image is a dozen lines, so the dependency buys
+    nothing.
+
+    A white field under a black bar: some encoders special-case a perfectly
+    uniform image, and a real edge keeps the probe representative of a page.
+    """
+    import struct
+    import zlib
+
+    def chunk(tag, payload):
+        body = tag + payload
+        return (struct.pack(">I", len(payload)) + body
+                + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
+
+    # 8-bit truecolour (colour type 2) — the most broadly accepted PNG flavour.
+    ihdr = struct.pack(">IIBBBBB", side, side, 8, 2, 0, 0, 0)
+    bar = max(1, side // 8)
+    black, white = b"\x00" * (side * 3), b"\xff" * (side * 3)
+    # Each scanline is prefixed with filter type 0 (None).
+    raw = b"".join(b"\x00" + (black if y < bar else white) for y in range(side))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
+def assert_model_sees_images(host, model, min_image_tokens=64):
+    """Refuse to start if `model` silently ignores the images we send it.
+
+    This guards the worst failure this tool can have. Some Ollama runners accept
+    an ``images=`` payload, drop it, and answer from the text prompt alone —
+    measured on gemma4:12b-mlx under Ollama 0.32.0, which served a page of
+    handwriting as a confident, fluent essay about 19th-century America and
+    repeated it verbatim for every page. Nothing about that output looks wrong:
+    it is well-formed prose under ``status: ok``. Silent fabrication in a
+    journal is far worse than a visible failure.
+
+    The signal is how prompt cost GROWS with image area, not the answer, so it
+    does not depend on the model being any good at OCR — only on the image
+    arriving. Comparing two sizes rather than image-vs-no-image matters twice
+    over:
+
+      * Token cost per image is wildly tokenizer-dependent. A 64x64 probe costs
+        qwen3.5:9b 11 tokens and gemma4:26b 51 — both fully vision-capable, both
+        of which an absolute "+200 tokens" threshold rejects as broken. Only
+        qwen3-vl:8b's fixed-tile encoder charges ~1000 for a thumbnail.
+      * Differencing two sizes cancels any constant. A runner that adds a fixed
+        "image mode" preamble without encoding pixels cannot fake growth.
+
+    Measured 64x64 -> 1024x1024 growth: qwen3.5:9b 30 -> 1045 (+1015),
+    gemma4:26b 71 -> 278 (+207). A runner that drops images stays flat.
+    """
+    import urllib.request
+
+    def prompt_tokens(images):
+        body = {"model": model, "prompt": "What text is in this image?",
+                "stream": False, "options": {"num_predict": 1}}
+        if images:
+            body["images"] = images
+        req = urllib.request.Request(
+            host + "/api/generate", data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=300) as r:
+            return json.loads(r.read()).get("prompt_eval_count") or 0
+
+    def b64_png(side):
+        return base64.b64encode(_probe_png(side)).decode()
+
+    try:
+        without = prompt_tokens(None)
+        small = prompt_tokens([b64_png(64)])
+        large = prompt_tokens([b64_png(1024)])
+    except Exception as e:
+        log.warning("vision check could not run (%s) — continuing unguarded", e)
+        return
+    growth = large - small
+    log.info("vision check: %s prompt tokens %d none / %d at 64px / %d at 1024px "
+             "(+%d for area)", model, without, small, large, growth)
+    if growth < min_image_tokens:
+        raise SystemExit(
+            f"model {model!r} on {host} appears to IGNORE images: growing the "
+            f"image from 64x64 to 1024x1024 changed the prompt from {small} to "
+            f"{large} tokens (expected at least +{min_image_tokens}).\n"
+            "It would answer from the prompt alone and write confident, "
+            "entirely FABRICATED transcripts that look successful. Measured on "
+            "gemma4:12b-mlx, whose MLX runner drops images silently.\n"
+            "Use a model served by a vision-capable runner, or set "
+            "VISION_CHECK=0 to skip this gate (not recommended).")
 
 
 def wait_for_model(host, model, timeout):
@@ -879,6 +1494,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scan", action="store_true", help="Run a single incremental pass and exit")
     ap.add_argument("--status", action="store_true", help="Print manifest summary and exit")
+    ap.add_argument("--eval", action="store_true",
+                    help="Run the quality self-check on the ground-truth set now and exit")
+    ap.add_argument("--rebaseline", action="store_true",
+                    help="With --eval: make this run the new baseline")
     args = ap.parse_args()
 
     setup_logging()
@@ -888,6 +1507,8 @@ def main():
         return
 
     assert_safe_paths()
+    rm_ocr.assert_local_host(rm_ocr.OLLAMA_URL, allow_remote=ALLOW_REMOTE_MODEL_HOST,
+                             wait=max(MODEL_WAIT_TIMEOUT, 60), log=log.warning)
     if REQUIRE_SPLIT:
         try:
             import pypdf  # noqa: F401  fail fast if the split gate is on but pypdf is missing
@@ -927,14 +1548,54 @@ def main():
                         VAULT / DAILY_NOTE_DIR)
     if MAX_PDF_PAGES > 0:
         log.info("MAX_PDF_PAGES=%d | longer documents are skipped (visible via --status)", MAX_PDF_PAGES)
+    terms = current_terms()
+    if terms:
+        log.info("vocabulary hint ON | %d term(s) from %s%s", len(terms), VOCAB_FILE,
+                 " + learned" if USE_LEARNED_VOCAB else "")
+    if VERIFY_MODEL:
+        log.info("VERIFY ON | second reader=%s resolve=%s (model=%s) paths=%s unload=%s",
+                 VERIFY_MODEL, VERIFY_RESOLVE, RESOLVE_MODEL,
+                 ",".join(VERIFY_PATHS) or "all", VERIFY_UNLOAD)
+    if LEARN_CORRECTIONS:
+        log.info("LEARN_CORRECTIONS ON | edits harvested to %s, ground truth to %s, "
+                 "learned vocab %s%s", CORRECTIONS_LOG, GOLDSET_DIR,
+                 "in use" if USE_LEARNED_VOCAB else "collected only",
+                 " (eval-gated)" if USE_LEARNED_VOCAB and LEARN_GATE else "")
 
     if MODEL_WAIT_TIMEOUT > 0:
         wait_for_model(OLLAMA_HOST, MODEL, MODEL_WAIT_TIMEOUT)
     else:
         log.info("MODEL_WAIT_TIMEOUT=0, skipping startup readiness gate")
+    if VISION_CHECK:
+        assert_model_sees_images(OLLAMA_HOST, MODEL, VISION_CHECK_MIN_TOKENS)
+    if VERIFY_MODEL:
+        # Same gates for the second reader and the resolver: a verify model that
+        # drops images would "confirm" fabricated text.
+        for extra in dict.fromkeys(m for m in (VERIFY_MODEL, RESOLVE_MODEL) if m != MODEL):
+            if VERIFY_UNLOAD:
+                _unload(MODEL)
+            if MODEL_WAIT_TIMEOUT > 0:
+                wait_for_model(OLLAMA_HOST, extra, MODEL_WAIT_TIMEOUT)
+            if VISION_CHECK:
+                assert_model_sees_images(OLLAMA_HOST, extra, VISION_CHECK_MIN_TOKENS)
+            if VERIFY_UNLOAD:
+                _unload(extra)
+    if not VISION_CHECK:
+        log.warning("VISION_CHECK=0 — not verifying the model actually receives "
+                    "images; a runner that drops them writes fabricated transcripts")
+
+    if args.eval:
+        rec = self_check(force=True, rebaseline=args.rebaseline)
+        if rec and rec["regressions"]:
+            raise SystemExit(1)
+        return
 
     if args.scan:
-        n = scan_once(load_manifest())
+        man = load_manifest()
+        harvest_edits(man)
+        n = scan_once(man)
+        gate_learned_terms()
+        self_check()
         log.info("scan complete: %d file(s) processed", n)
         return
 
@@ -946,9 +1607,13 @@ def main():
     while True:
         if in_run_window():
             try:
-                n = scan_once(load_manifest())
+                man = load_manifest()
+                harvest_edits(man)
+                n = scan_once(man)
                 if n:
                     log.info("pass complete: %d file(s) processed", n)
+                gate_learned_terms()
+                self_check()
             except Exception as e:
                 log.exception("scan pass failed: %s", e)
         else:
