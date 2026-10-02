@@ -1162,6 +1162,74 @@ def main():
         for n, v in saved_rm.items():
             setattr(rm_ocr, n, v)
 
+    # --- scheduled quality self-check ---
+    gold_sc = tmp / "gold-selfcheck"
+    for i in range(3):
+        rm_verify.write_gold_case(gold_sc, f"sc{i}.pdf", 1, f"truth {i}", b"png")
+    fake_cer = {"v": 0.02}
+
+    def fake_run(cases, *, model, verify_model="", **k):
+        rows = [{"id": c["id"], "words": 100, "chars": 500, "primary_word_errors": 5,
+                 "primary_char_errors": int(500 * fake_cer["v"]), "final_word_errors": 5,
+                 "final_char_errors": int(500 * fake_cer["v"]), "flagged_words": 5,
+                 "hyp_words": 100, "diff_errors": 5, "caught": 3, "seconds": 1,
+                 "primary": "x"} for c in cases]
+        return {"config": {"model": model, "verify_model": verify_model, "resolve": False},
+                "summary": rm_eval.summarize(rows), "cases": rows, "at": "2026-10-02T03:00:00"}
+
+    saved_sc = {n: getattr(ocr_daemon, n) for n in (
+        "GOLDSET_DIR", "EVAL_INTERVAL_DAYS", "EVAL_HISTORY", "EVAL_BASELINE", "VERIFY_MODEL")}
+    saved_run = rm_eval.run
+    try:
+        ocr_daemon.GOLDSET_DIR = gold_sc
+        ocr_daemon.EVAL_HISTORY = tmp / "state/eval-sc/history.jsonl"
+        ocr_daemon.EVAL_BASELINE = tmp / "state/eval-sc/baseline.json"
+        ocr_daemon.VERIFY_MODEL = "qwen3.6:35b-a3b"
+        rm_eval.run = fake_run
+        ocr_daemon.EVAL_INTERVAL_DAYS = 0
+        check("self-check: off by default", ocr_daemon.self_check(), None)
+        ocr_daemon.EVAL_INTERVAL_DAYS = 7
+        first = ocr_daemon.self_check()
+        check("self-check: the first run sets the baseline",
+              (first["baseline"], ocr_daemon.EVAL_BASELINE.exists()), ("new (first run)", True))
+        check("self-check: not due again within the interval", ocr_daemon.self_check(), None)
+        fake_cer["v"] = 0.05
+        worse = ocr_daemon.self_check(force=True)
+        check("self-check: a CER drop beyond the tolerance is a regression",
+              [r["metric"] for r in worse["regressions"]], ["primary_cer"])
+        check("self-check: a regression is logged as an error",
+              any("QUALITY REGRESSION" in m for m in gate_msgs), True)
+        fake_cer["v"] = 0.021
+        check("self-check: a change within the tolerance is fine",
+              ocr_daemon.self_check(force=True)["regressions"], [])
+        rm_verify.write_gold_case(gold_sc, "sc-new.pdf", 1, "new truth", b"png")
+        grown = ocr_daemon.self_check(force=True)
+        check("self-check: only pages the baseline also scored are compared",
+              grown["common_pages"], 3)
+        ocr_daemon.VERIFY_MODEL = "ornith-1.5:35b"
+        check("self-check: a new configuration starts a new baseline",
+              ocr_daemon.self_check(force=True)["baseline"], "new (configuration changed)")
+        check("self-check: every run is in the history",
+              len(ocr_daemon._history("self-check")), 5)
+    finally:
+        rm_eval.run = saved_run
+        for n, v in saved_sc.items():
+            setattr(ocr_daemon, n, v)
+
+    # --- pairs: choosing a second reader from saved runs ---
+    truth_p = {"p1": "We use Pulumi with the Gartner guide", "p2": "Lastly the third item"}
+    reads = {"A": {"p1": "We use Palantir with the Gartner guide", "p2": "Lustly the third item"},
+             "B": {"p1": "We use Pulumi with the gather guide", "p2": "Lastly the third item"},
+             "A2": {"p1": "We use Palantir with the Gartner guide", "p2": "Lustly the third item"}}
+    table = {(r["primary"], r["verifier"]): r for r in rm_eval.pair_scores(reads, truth_p)}
+    check("pairs: a different reader flags the primary's errors",
+          table[("A", "B")]["error_recall"], 1.0)
+    check("pairs: an identical reader catches nothing", table[("A", "A2")]["error_recall"], 0.0)
+    check("pairs: reads_from_runs includes dual-read second readings",
+          sorted(rm_eval.reads_from_runs([{"config": {"model": "m1", "verify_model": "m2"},
+                                           "cases": [{"id": "x", "primary": "a", "secondary": "b"}]}])),
+          ["m1", "m2"])
+
     # --- local-only guard: page images never go to a public host ---
     for url in ("http://127.0.0.1:11434", "http://192.168.50.2:11434", "http://10.0.0.5",
                 "http://172.18.0.3:11434", "http://100.101.102.103:11434", "http://[::1]:11434"):

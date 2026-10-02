@@ -234,6 +234,9 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `LEARN_MIN_COUNT` | `2` | Corrections, in different places, before a term becomes a candidate |
 | `LEARN_GATE` | `1` | Activate a candidate term only when an eval on ground-truth pages shows the model is no worse with it |
 | `LEARN_GATE_PAGES` | `10` | Ground-truth pages the gate evaluates (pages containing the new terms first) |
+| `EVAL_INTERVAL_DAYS` | `0` | Re-score the production configuration on the ground-truth set this often (inside `RUN_WINDOW`) and log an error if quality drops. `0` = off. See [Routine self-check](#routine-self-check) |
+| `EVAL_PAGES` | `0` | Ground-truth pages the self-check scores (`0` = all) |
+| `EVAL_TOLERANCE` | `0.005` | Absolute drop in CER or post-review WER that counts as a regression (0.005 = half a point) |
 | `LOG_LEVEL` | `INFO` | Set `DEBUG` to log each file's gate decision (see below) |
 
 ### Where transcripts go (3 modes)
@@ -613,6 +616,16 @@ python3 rm_eval.py compare base.json full.json
 ```
 
 To prepare local fine-tuning data from the same set, `python3 rm_eval.py export --out /state/train --holdout 0.25` writes the page images with `train.jsonl` and `holdout.jsonl` (plain image and text pairs plus chat-style `messages`). The split is stable by page, and a tuned model should be scored only on the holdout with `run --ids /state/train/holdout.ids`, otherwise it is graded on pages it memorized.
+
+To choose a second reader without running anything new, score every pair of models from saved runs:
+
+```bash
+python3 rm_eval.py pairs gemma.json ornith.json qwen.json --goldset /state/goldset
+```
+
+Each ordered pair (primary, verifier) is aligned exactly as the daemon would and ranked by the error rate left after review. Two versions of the same model (another size or quantization) agree on their mistakes and catch far fewer errors than two different model families. Measured: gemma4:26b with its own q8_0 build caught 28% of errors, with ornith-1.5:35b 69%.
+
+**Routine self-check.** With `EVAL_INTERVAL_DAYS` set (7 is a sensible start), the daemon re-scores the configuration it is actually running (`MODEL`, `VERIFY_MODEL`, the vocabulary) on the ground-truth set, inside `RUN_WINDOW`. The first run for a configuration becomes its baseline in `STATE_DIR/eval/baseline.json`. Later runs are compared on the pages both have scored, so a ground-truth set that grows as you correct transcripts does not skew the result. A drop beyond `EVAL_TOLERANCE` in CER or post-review WER is logged as `QUALITY REGRESSION` and recorded in `eval/history.jsonl`, which catches silent drift such as an Ollama upgrade or a re-pulled model reading worse. Each run's full result is saved as `eval/self-check-<time>.json`, readable by `compare` and `pairs`. `python3 ocr_daemon.py --eval` runs it once now (exit code 1 on a regression), and `--eval --rebaseline` makes that run the new reference. `--status` shows the latest result.
 
 It reports `primary_wer`/`primary_cer` (one model), `final_wer`/`final_cer` (after resolution, ignoring flags), `flag_rate` (how much there is to review), `error_recall` (share of errors inside a flag) and `review_wer` (errors left once the flags are fixed). Scoring ignores case, punctuation and spacing around a slash. Models run in stages so a CPU host holds one at a time.
 

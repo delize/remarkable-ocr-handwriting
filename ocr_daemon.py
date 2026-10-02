@@ -227,6 +227,17 @@ LEARN_GATE_PAGES = int(os.environ.get("LEARN_GATE_PAGES", "10"))
 LEARNED_VOCAB = STATE / "learned_vocab.json"
 CORRECTIONS_LOG = STATE / "corrections.jsonl"
 EVAL_HISTORY = STATE / "eval" / "history.jsonl"
+# EVAL_INTERVAL_DAYS (opt-in): re-score the production configuration (MODEL,
+# VERIFY_MODEL, vocabulary) on the ground-truth set this often, inside
+# RUN_WINDOW. The first run for a configuration is its baseline; a later run
+# whose CER or post-review WER is worse by more than EVAL_TOLERANCE (absolute,
+# 0.005 = half a point) is logged as an error and recorded in the history.
+# Catches silent drift such as an Ollama upgrade or a re-pulled model reading
+# worse. EVAL_PAGES limits how many ground-truth pages it scores (0 = all).
+EVAL_INTERVAL_DAYS = float(os.environ.get("EVAL_INTERVAL_DAYS", "0"))
+EVAL_PAGES = int(os.environ.get("EVAL_PAGES", "0"))
+EVAL_TOLERANCE = float(os.environ.get("EVAL_TOLERANCE", "0.005"))
+EVAL_BASELINE = STATE / "eval" / "baseline.json"
 
 # Absolute paths the daemon must NEVER read or write under, no matter what.
 # Comma-separated override via FORBIDDEN_PATHS; default protects the standalone
@@ -856,6 +867,99 @@ def gate_learned_terms():
              cand, b.get("primary_cer"), c.get("primary_cer"))
 
 
+def _history(kind):
+    try:
+        lines = EVAL_HISTORY.read_text().splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("kind") == kind:
+            out.append(rec)
+    return out
+
+
+_SELF_CHECK_KEYS = ("model", "verify_model", "resolve")
+_SELF_CHECK_ROW = ("id", "words", "chars", "primary_word_errors", "primary_char_errors",
+                   "final_word_errors", "final_char_errors", "flagged_words", "hyp_words",
+                   "diff_errors", "caught", "seconds")
+
+
+def self_check(force=False, rebaseline=False):
+    """Score the production configuration on the ground-truth set and compare to its baseline.
+
+    Returns the history record, or None when nothing ran (off, not due, or no
+    ground truth yet). Both sides are summarized over the pages they share,
+    so a ground-truth set that grows between runs does not skew the result.
+    """
+    if not force and EVAL_INTERVAL_DAYS <= 0:
+        return None
+    if not force:
+        last = _history("self-check")
+        if last:
+            try:
+                age = time.time() - datetime.datetime.fromisoformat(last[-1]["at"]).timestamp()
+            except (KeyError, ValueError):
+                age = float("inf")
+            if age < EVAL_INTERVAL_DAYS * 86400:
+                return None
+    import rm_eval
+    cases = rm_eval.load_goldset(GOLDSET_DIR, limit=EVAL_PAGES)
+    if not cases:
+        log.info("self-check: no ground-truth pages under %s yet (fix a transcript, or import "
+                 "pages with rm_eval.py import-pdf)", GOLDSET_DIR)
+        return None
+    log.info("self-check: scoring %s%s on %d ground-truth page(s)", MODEL,
+             f" + {VERIFY_MODEL}" if VERIFY_MODEL else "", len(cases))
+    result = rm_eval.run(cases, model=MODEL, verify_model=VERIFY_MODEL, resolve=VERIFY_RESOLVE,
+                         resolve_model=RESOLVE_MODEL, terms=current_terms(), timeout=TIMEOUT,
+                         num_ctx=NUM_CTX or 16384, max_span_words=VERIFY_MAX_SPAN_WORDS,
+                         log=log.debug)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    rm_verify.save_json(STATE / "eval" / f"self-check-{stamp}.json", result)
+    key = {k: result["config"].get(k) for k in _SELF_CHECK_KEYS}
+    rows = [{k: c.get(k) for k in _SELF_CHECK_ROW if k in c} for c in result["cases"]]
+    base = rm_verify.load_json(EVAL_BASELINE, None)
+    rec = {"at": result["at"], "kind": "self-check", "config": result["config"],
+           "summary": result["summary"], "file": f"self-check-{stamp}.json", "regressions": []}
+    if rebaseline or not base or base.get("key") != key:
+        why = ("asked to" if rebaseline else "first run" if not base
+               else "configuration changed")
+        rm_verify.save_json(EVAL_BASELINE, {"at": result["at"], "key": key, "rows": rows,
+                                            "summary": result["summary"]})
+        rec["baseline"] = f"new ({why})"
+        log.info("self-check: baseline set (%s): CER %s, post-review WER %s", why,
+                 result["summary"].get("primary_cer"), result["summary"].get("review_wer"))
+    else:
+        common = {r["id"] for r in rows} & {r["id"] for r in base["rows"]}
+        now = rm_eval.summarize([r for r in rows if r["id"] in common])
+        then = rm_eval.summarize([r for r in base["rows"] if r["id"] in common])
+        rec.update(baseline=base["at"], common_pages=len(common),
+                   compared={"now": now, "baseline": then})
+        for metric in ("primary_cer", "review_wer"):
+            a, b = then.get(metric), now.get(metric)
+            if a is not None and b is not None and b > a + EVAL_TOLERANCE:
+                rec["regressions"].append({"metric": metric, "baseline": a, "now": b})
+        if rec["regressions"]:
+            log.error("self-check: QUALITY REGRESSION vs baseline %s on %d page(s): %s. "
+                      "Check for an Ollama or model change; details in %s",
+                      base["at"], len(common),
+                      ", ".join(f"{r['metric']} {r['baseline']:.2%} -> {r['now']:.2%}"
+                                for r in rec["regressions"]), EVAL_HISTORY)
+        else:
+            log.info("self-check: OK vs baseline %s on %d page(s): CER %s -> %s, "
+                     "post-review WER %s -> %s", base["at"], len(common), then.get("primary_cer"),
+                     now.get("primary_cer"), then.get("review_wer"), now.get("review_wer"))
+    EVAL_HISTORY.parent.mkdir(parents=True, exist_ok=True)
+    with open(EVAL_HISTORY, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+    return rec
+
+
 def process_one(src, result, rel, digest, man, page_regions=None):
     """OCR a single (rendered) PDF and write its manifest entry + transcript.
 
@@ -1116,12 +1220,20 @@ def print_learning_status(man):
         print(f"learning: {corrections} correction(s) harvested, {len(gold)} ground-truth page(s), "
               f"learned terms active={len(lv.active())} candidates={len(lv.candidates())} "
               f"rejected={len(lv.data['rejected'])}")
-    try:
-        last = json.loads(EVAL_HISTORY.read_text().splitlines()[-1])
-        print(f"last eval: {last.get('at')} {last.get('kind', 'run')} "
-              f"accepted={last.get('accepted')} terms={last.get('terms')}")
-    except (OSError, IndexError, ValueError):
-        pass
+    gates = _history("learned-vocab-gate")
+    if gates:
+        g = gates[-1]
+        print(f"last vocab gate: {g.get('at')} {'accepted' if g.get('accepted') else 'rejected'} "
+              f"{g.get('terms')}")
+    checks = _history("self-check")
+    if checks:
+        c = checks[-1]
+        s = c.get("summary", {})
+        state = ("REGRESSION " + ", ".join(r["metric"] for r in c["regressions"])
+                 if c.get("regressions") else "ok")
+        print(f"last self-check: {c.get('at')} {state} | CER {s.get('primary_cer')} "
+              f"post-review WER {s.get('review_wer')} on {s.get('cases')} page(s), "
+              f"baseline {c.get('baseline')}")
 
 
 def print_status(man):
@@ -1376,6 +1488,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scan", action="store_true", help="Run a single incremental pass and exit")
     ap.add_argument("--status", action="store_true", help="Print manifest summary and exit")
+    ap.add_argument("--eval", action="store_true",
+                    help="Run the quality self-check on the ground-truth set now and exit")
+    ap.add_argument("--rebaseline", action="store_true",
+                    help="With --eval: make this run the new baseline")
     args = ap.parse_args()
 
     setup_logging()
@@ -1462,11 +1578,18 @@ def main():
         log.warning("VISION_CHECK=0 — not verifying the model actually receives "
                     "images; a runner that drops them writes fabricated transcripts")
 
+    if args.eval:
+        rec = self_check(force=True, rebaseline=args.rebaseline)
+        if rec and rec["regressions"]:
+            raise SystemExit(1)
+        return
+
     if args.scan:
         man = load_manifest()
         harvest_edits(man)
         n = scan_once(man)
         gate_learned_terms()
+        self_check()
         log.info("scan complete: %d file(s) processed", n)
         return
 
@@ -1484,6 +1607,7 @@ def main():
                 if n:
                     log.info("pass complete: %d file(s) processed", n)
                 gate_learned_terms()
+                self_check()
             except Exception as e:
                 log.exception("scan pass failed: %s", e)
         else:
