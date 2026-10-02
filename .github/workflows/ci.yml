@@ -160,7 +160,7 @@ jobs:
       # Prove every runtime import — rmc is invoked as a subprocess so
       # import-time silence is what bit us in v0.3.1.
       - name: Smoke test (imports)
-        run: docker run --rm --entrypoint python3 rm-ocr:scan -c "import rmc, rm_render, rm_split, rm_ocr, ocr_daemon"
+        run: docker run --rm --entrypoint python3 rm-ocr:scan -c "import rmc, rm_render, rm_split, rm_ocr, rm_verify, rm_eval, ocr_daemon"
 
       # --status needs no Ollama, no vault, no PDFs. Proves the image boots.
       - name: Smoke test (--status)
