@@ -11,7 +11,7 @@ pdf2image>=1.17
 # pypdf reads the splitter's /RemarkableSplitter metadata marker and page sizes
 # for the split-readiness gate (REQUIRE_SPLIT=1). Lazily imported, so only
 # strictly required when that gate is enabled.
-pypdf>=6.13.0
+pypdf>=6.19.0
 
 # PyMuPDF + numpy are used ONLY by AUTO_SPLIT (rm_split.py). PyMuPDF renders
 # tall pages in-process for the whitespace-band analysis and assembles the
@@ -20,11 +20,11 @@ pypdf>=6.13.0
 # input-sized. The previous pypdf merge_page assembly re-encoded the full
 # page content once per segment and could OOM on native reMarkable exports.
 # Note PyMuPDF is AGPL-3.0. Both lazily imported, not needed unless AUTO_SPLIT=1.
-PyMuPDF>=1.26
-numpy>=2.4.6
+PyMuPDF>=1.28.2
+numpy>=2.5.3
 
 # Pillow is pulled in by pdf2image anyway; pinned for the OCR image pipeline.
-Pillow>=12.2.0
+Pillow>=12.3.0
 
 # inotify_simple powers the optional inotify wake-up signal (INOTIFY=1, on by
 # default). Linux-only — on macOS the import will fail and the daemon falls back
@@ -43,4 +43,4 @@ rmc>=0.3
 # rmscene is already pulled in transitively by rmc, but rm_strokes.py now
 # imports it directly (STROKE_CONTEXT=1 — stroke-region hints, see README),
 # so it's declared explicitly here too.
-rmscene>=0.6
+rmscene>=0.8.0
