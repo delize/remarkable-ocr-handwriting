@@ -368,6 +368,8 @@ def safe_output_path(src, title=None, *, source_sha256=None):
                 name = f"{safe_title}-{source_sha256[:8]}{OUT_SUFFIX}.md"
                 out_md = src.with_name(name) if OUT_ALONGSIDE else OUT / rel.parent / name
         except OSError:
+            # An unreadable existing transcript can't prove it belongs to a
+            # different bundle, so keep the plain name and let the write replace it.
             pass
 
     out_res = out_md.resolve()
