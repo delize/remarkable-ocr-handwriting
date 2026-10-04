@@ -383,6 +383,8 @@ def _page_order(content_path, page_dir):
         if ordered:
             return ordered
     except Exception:
+        # A missing, malformed or unexpectedly shaped .content file only loses
+        # the notebook's page order. Sorted file names are the documented fallback.
         pass
     return [rms[k] for k in sorted(rms)]
 
