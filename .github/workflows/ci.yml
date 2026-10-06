@@ -112,6 +112,20 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # This repo is public and the tool reads private handwriting. Fail if any
+      # tracked file is a handwriting source, page image, transcript, ground
+      # truth or daemon state, even one force-added past .gitignore. The project
+      # icon is the only image allowed.
+      - name: No note files
+        run: |
+          bad=$(git ls-files | grep -iE '\.(pdf|rmdoc|rm|zip|png|jpe?g|webp|heic|jsonl)$|-hwr\.md$|-handwriting_converted\.md$|(^|/)(goldset|train|train-export|transcripts|superseded|eval|state|ocr_out|rmocr-research|\.remarkable-ocr)/|(^|/)(manifest|learned_vocab)\.json$|(^|/)vocab\.txt$' \
+                | grep -vx 'dalle_generated-remarkable-ocr-handwriting.png' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::Note content must never be committed to this public repo:"
+            echo "$bad"
+            exit 1
+          fi
+
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
