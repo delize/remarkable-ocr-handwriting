@@ -224,6 +224,7 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `VOCAB_FILE` | `$STATE_DIR/vocab.txt` | Your own terms (comma or newline separated, `#` comments). When the file exists, the prompt asks the model to prefer these spellings for ambiguous words. See [Self-checking transcripts](#self-checking-transcripts) |
 | `VERIFY_MODEL` | _(empty)_ | Second vision model. Each page is read twice and disagreements are flagged as `==A\|B==`. Roughly doubles OCR time |
 | `VERIFY_PATHS` | _(empty)_ | Comma-separated folders under `SOURCE_SUBDIR` to verify (e.g. `Work,Meeting Notes`). Empty = everything |
+| `CONFIDENCE_THRESHOLD` | _(empty)_ | Flag the primary model's own low-confidence words as `==word\|~==` (log-probability of the weakest token below this value, e.g. `-0.2`). Comes with the normal read, no extra model call. Empty = off. See [Confidence flags](#confidence-flags) |
 | `VERIFY_RESOLVE` | `0` | `1` = ask a model to settle each disagreement against the page image instead of flagging it. Not recommended: measured barely better than chance, ~90 s extra per page, and it removes the flags |
 | `RESOLVE_MODEL` | `$VERIFY_MODEL` | Model that answers the resolution questions |
 | `VERIFY_MAX_SPAN_WORDS` | `6` | Longer disagreements are layout differences (a diagram read in another order), not misreads, and are left alone |
@@ -591,6 +592,17 @@ Obsidian renders `==text==` as a highlight, so reviewing a transcript means read
 Measured on 26 hand-checked pages with gemma4:26b as primary, qwen3.6:35b-a3b as verifier and the vocabulary hint: about 5% of words flagged, and WER falls from 5.4% to 1.9% once the flags are fixed. It costs a second full read, about 140 s per page instead of 66 on a CPU-only host.
 
 `VERIFY_RESOLVE=1` instead puts each disagreement back to `RESOLVE_MODEL` with the page image as a constrained question (reading A, reading B, the exact text if neither, or unsure). On the same pages it answered 88 of 90 questions, choosing unsure only twice, and its choices were barely better than chance: unattended WER went from 5.4% to 5.1%, at about 90 s more per page, while the flags that make review effective disappeared. It stays available for experiments but is off by default.
+
+**Confidence flags.** Two readers catch the errors they disagree on, but not the ones they make the same way. The primary model's own confidence covers part of that gap at no extra cost: with `CONFIDENCE_THRESHOLD` set, the first read asks Ollama for per-token log-probabilities, and every word whose weakest token falls below the threshold is flagged as `==word|~==` (`~` means the model was unsure and there is no second reading). Words already inside a dual-read flag are left alone. Measured on 26 hand-checked pages with gemma4:26b and qwen3.6:35b-a3b:
+
+| Flags | Words flagged | Errors under a flag | WER after review |
+|---|---|---|---|
+| Dual read only | 4.8% | 59% | 2.1% |
+| Dual read + confidence below -0.5 | 6.0% | 66% | 1.8% |
+| Dual read + confidence below -0.2 | 8.0% | 72% | 1.5% |
+| Dual read + confidence below -0.05 | 10.2% | 79% | 1.1% |
+
+The model is confident even on many of its misreads, so useful thresholds sit just below zero. Use it to add flags, not to decide which pages can skip the second read: almost every page has at least one uncertain word. `rm_eval.py run --confidence-threshold` records each page's word confidences, and `rm_eval.py sweep RUN.json` re-scores a saved run at other thresholds without calling a model, so the threshold can be re-tuned as corrections grow the ground-truth set. Frontmatter records `confidence_flagged`.
 
 **Learning from your edits.** With `LEARN_CORRECTIONS` (on by default) the daemon keeps a sidecar of what it wrote to each transcript. When you fix a transcript in Obsidian, the next pass notices, and:
 

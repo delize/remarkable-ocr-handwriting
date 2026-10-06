@@ -228,6 +228,14 @@ USE_LEARNED_VOCAB = _env_bool("USE_LEARNED_VOCAB", False)
 LEARN_MIN_COUNT = int(os.environ.get("LEARN_MIN_COUNT", "2"))
 LEARN_GATE = _env_bool("LEARN_GATE", True)
 LEARN_GATE_PAGES = int(os.environ.get("LEARN_GATE_PAGES", "10"))
+# CONFIDENCE_THRESHOLD (opt-in): ask the primary model for per-token
+# log-probabilities during its normal read (no extra model call) and flag each
+# word whose weakest token falls below this value as ==word|~==, on top of any
+# dual-read flags. Empty disables it. Measured on 26 hand-checked pages with
+# gemma4:26b plus dual read: -0.2 put 72% of errors under a flag at 8.0% of
+# words flagged (59% at 4.8% without it), -0.05 reached 79% at 10.2%.
+_ct = os.environ.get("CONFIDENCE_THRESHOLD", "").strip()
+CONFIDENCE_THRESHOLD = float(_ct) if _ct else None
 LEARNED_VOCAB = STATE / "learned_vocab.json"
 CORRECTIONS_LOG = STATE / "corrections.jsonl"
 EVAL_HISTORY = STATE / "eval" / "history.jsonl"
@@ -511,7 +519,7 @@ def _iso_mtime(st):
 
 
 def write_md(out_md, title, rel, pages, source_modified=None, stroke_regions_flagged=None,
-             verify=None, kept_edits=0):
+             verify=None, kept_edits=0, confidence=None):
     out_md.parent.mkdir(parents=True, exist_ok=True)
     chars = [len(text) for _, text in pages]
     verify = verify or {}
@@ -531,6 +539,8 @@ def write_md(out_md, title, rel, pages, source_modified=None, stroke_regions_fla
         f"verify_flagged: {verify.get('flagged', 0)}" if verify else None,
         f"verify_error: {json.dumps(verify['error'])}" if verify.get("error") else None,
         f"kept_edits: {kept_edits}" if kept_edits else None,
+        # Words the primary model itself was unsure of, highlighted as ==word|~==.
+        f"confidence_flagged: {confidence['flagged']}" if confidence else None,
         "status: ok",
         "---",
         "",
@@ -888,7 +898,7 @@ def _history(kind):
     return out
 
 
-_SELF_CHECK_KEYS = ("model", "verify_model", "resolve")
+_SELF_CHECK_KEYS = ("model", "verify_model", "resolve", "confidence_threshold")
 _SELF_CHECK_ROW = ("id", "words", "chars", "primary_word_errors", "primary_char_errors",
                    "final_word_errors", "final_char_errors", "flagged_words", "hyp_words",
                    "diff_errors", "caught", "seconds")
@@ -923,7 +933,7 @@ def self_check(force=False, rebaseline=False):
     result = rm_eval.run(cases, model=MODEL, verify_model=VERIFY_MODEL, resolve=VERIFY_RESOLVE,
                          resolve_model=RESOLVE_MODEL, terms=current_terms(), timeout=TIMEOUT,
                          num_ctx=NUM_CTX or 16384, max_span_words=VERIFY_MAX_SPAN_WORDS,
-                         log=log.debug)
+                         confidence_threshold=CONFIDENCE_THRESHOLD, log=log.debug)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     rm_verify.save_json(STATE / "eval" / f"self-check-{stamp}.json", result)
     key = {k: result["config"].get(k) for k in _SELF_CHECK_KEYS}
@@ -984,12 +994,27 @@ def process_one(src, result, rel, digest, man, page_regions=None):
     st = src.stat()
     source_modified = _iso_mtime(st)             # last-modified of the source file
     hint = rm_verify.vocab_hint(current_terms())
+    confidences = {} if CONFIDENCE_THRESHOLD is not None else None
     pages = ocr_pdf(result.pdf, MODEL, DPI, MAX_PX, timeout=TIMEOUT, threads=THREADS,
                     no_think=NO_THINK, skip_blank=SKIP_BLANK_PAGES, page_regions=page_regions,
-                    reflow=REFLOW_PARAGRAPHS, num_ctx=NUM_CTX, prompt_extra=hint)
+                    reflow=REFLOW_PARAGRAPHS, num_ctx=NUM_CTX, prompt_extra=hint,
+                    confidence_out=confidences)
     verify = None
     if verify_applies(src):
         pages, verify = dual_read(result.pdf, pages, hint)
+    confidence = None
+    if confidences is not None:
+        confidence = {"threshold": CONFIDENCE_THRESHOLD, "flagged": 0, "unmatched_pages": 0}
+        marked = []
+        for n, text in pages:
+            new, k = rm_verify.mark_low_confidence(text, confidences.get(n), CONFIDENCE_THRESHOLD)
+            if k is None:
+                confidence["unmatched_pages"] += 1   # word count drifted, page left unflagged
+                log.debug("confidence: page %d of %s left unflagged (word count changed)", n, rel)
+            else:
+                confidence["flagged"] += k
+            marked.append((n, new))
+        pages = marked
     stroke_regions_flagged = sum(
         rm_strokes.summarize(regions)["likely_drawing_regions"] for regions in page_regions
     ) if page_regions else None
@@ -1021,7 +1046,8 @@ def process_one(src, result, rel, digest, man, page_regions=None):
                             "re-transcribed; the edited file is kept at %s",
                             superseded, out_md.name, keep)
     chars = write_md(out_md, result.title, rel, pages, source_modified=source_modified,
-                     stroke_regions_flagged=stroke_regions_flagged, verify=verify, kept_edits=kept)
+                     stroke_regions_flagged=stroke_regions_flagged, verify=verify, kept_edits=kept,
+                     confidence=confidence)
     if LEARN_CORRECTIONS:
         rm_verify.write_sidecar(STATE, out_rel, rel, pages, out_md.read_bytes(),
                                 model_pages=model_pages)
@@ -1041,6 +1067,8 @@ def process_one(src, result, rel, digest, man, page_regions=None):
         entry["render_sha256"] = sha256(result.pdf)
     if verify:
         entry["verify"] = verify
+    if confidence:
+        entry["confidence"] = confidence
     if kept:
         entry["kept_edits"] = kept
     man[rel] = entry

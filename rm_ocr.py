@@ -37,6 +37,7 @@ from pdf2image import convert_from_path, pdfinfo_from_path
 
 import rm_render
 import rm_strokes
+import rm_verify
 
 PROMPT = (
     "Transcribe all handwritten text on this page exactly as written. "
@@ -226,12 +227,16 @@ def assert_local_host(url, *, allow_remote=False, wait=0, log=print):
                      "off-network is intended.")
 
 
-def _stream_generate(payload, timeout):
+def _stream_generate(payload, timeout, tokens_out=None):
     """POST a streaming /api/generate request; returns ``(text, think_chars, done_reason)``.
 
     ``timeout`` is the per-read socket timeout. The first read blocks through
-    the whole prefill, so it must be generous on CPU.
+    the whole prefill, so it must be generous on CPU. When ``tokens_out`` is a
+    list, the request asks for log-probabilities and each generated token is
+    appended as ``(token, logprob)``.
     """
+    if tokens_out is not None:
+        payload = {**payload, "logprobs": True}
     req = urllib.request.Request(
         OLLAMA_URL, data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
@@ -249,6 +254,9 @@ def _stream_generate(payload, timeout):
                 raise RuntimeError(obj["error"])
             if obj.get("response"):
                 parts.append(obj["response"])
+            if tokens_out is not None:
+                tokens_out.extend((t.get("token", ""), t.get("logprob", 0.0))
+                                  for t in obj.get("logprobs") or [])
             # A reasoning model streams its trace here, NOT into "response".
             # Counted (not kept) purely so an empty answer can be explained.
             if obj.get("thinking"):
@@ -288,7 +296,7 @@ def render_page_b64(pdf, n, dpi, max_px):
 
 
 def ocr_image_b64(img_b64, model, *, timeout=1800, no_think=False, num_ctx=0, threads=None,
-                  prompt_extra="", reflow=True):
+                  prompt_extra="", reflow=True, confidence_out=None):
     """Transcribe one already-encoded page image with the standard prompt.
 
     Used by the evaluation runner, which scores pages from a stored image set
@@ -299,7 +307,10 @@ def ocr_image_b64(img_b64, model, *, timeout=1800, no_think=False, num_ctx=0, th
                "keep_alive": "30m", "options": _options(threads=threads, num_ctx=num_ctx)}
     if no_think:
         payload["think"] = False
-    text, _, _ = _stream_generate(payload, timeout)
+    tokens = [] if confidence_out is not None else None
+    text, _, _ = _stream_generate(payload, timeout, tokens_out=tokens)
+    if confidence_out is not None:
+        confidence_out[:] = rm_verify.word_confidences(tokens)
     return reflow_paragraphs(text) if reflow else text
 
 
@@ -333,11 +344,15 @@ def unload_model(model, timeout=120):
 
 
 def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_think=False,
-           skip_blank=True, page_regions=None, reflow=True, num_ctx=0, prompt_extra=""):
+           skip_blank=True, page_regions=None, reflow=True, num_ctx=0, prompt_extra="",
+           confidence_out=None):
     """Transcribe every page of ``pdf``; returns ``[(page_number, text), ...]``.
 
     ``prompt_extra`` is appended to the prompt for every page (the vocabulary
-    hint, see ``rm_verify.vocab_hint``).
+    hint, see ``rm_verify.vocab_hint``). When ``confidence_out`` is a dict, it
+    receives ``{page_number: [word confidence, ...]}`` for every transcribed
+    page, one value per whitespace-separated word of the model's text (see
+    ``rm_verify.word_confidences``).
     """
     results = []
     empty_pages = 0
@@ -388,7 +403,10 @@ def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_t
         if no_think:
             payload["think"] = False   # OCR wants a direct transcription, not a reasoning trace
         print(f"    page {n}/{num_pages} (prefill on CPU may take minutes)...", end="", flush=True)
-        text, think_chars, done_reason = _stream_generate(payload, timeout)
+        tokens = [] if confidence_out is not None else None
+        text, think_chars, done_reason = _stream_generate(payload, timeout, tokens_out=tokens)
+        if confidence_out is not None and text:
+            confidence_out[n] = rm_verify.word_confidences(tokens)
         print(f" {len(text)} chars", flush=True)
         if not text:
             # An empty answer used to be written out as an empty page under
