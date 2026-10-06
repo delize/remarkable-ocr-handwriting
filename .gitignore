@@ -33,3 +33,36 @@ Thumbs.db
 
 # personal blog drafts — keep local, never commit
 docs/blog/
+
+# --- Never commit note content -------------------------------------------
+# This repo is public. Handwriting sources, page images, transcripts, ground
+# truth and daemon state hold private writing and must never be committed.
+# CI enforces the same rule (see the "No note files" check) in case a file is
+# force-added past this list.
+*.pdf
+*.rmdoc
+*.rm
+*.zip
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.heic
+*-hwr.md
+*-handwriting_converted.md
+*.jsonl
+goldset/
+train/
+train-export/
+transcripts/
+superseded/
+eval/
+state/
+ocr_out/
+rmocr-research/
+.remarkable-ocr/
+manifest.json
+learned_vocab.json
+vocab.txt
+# The project icon is the one image that belongs here.
+!dalle_generated-remarkable-ocr-handwriting.png
