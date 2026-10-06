@@ -35,6 +35,7 @@ from dataclasses import dataclass
 
 MARK = "=={a}|{b}=="
 EMPTY = "?"                       # stands in for "this reading has nothing here"
+LOW_CONFIDENCE = "~"              # second slot of a flag the model was unsure of, with no other reading
 # Lazy on both sides so a reading that itself contains "=" (gemma once read a
 # time as "#=36-37") still parses as one flag.
 MARK_RE = re.compile(r"==([^|\n]*?)\|([^\n]*?)==")
@@ -228,7 +229,7 @@ def verify_page(a_text, b_text, resolver=None, max_span_words=6, max_questions=3
 def strip_marks(text, side="a"):
     """Remove flags, keeping one reading; ``side`` is "a" or "b"."""
     def pick(m):
-        v = m.group(1) if side == "a" else m.group(2)
+        v = m.group(1) if side == "a" or m.group(2) == LOW_CONFIDENCE else m.group(2)
         return "" if v == EMPTY else v
     return MARK_RE.sub(pick, text)
 
@@ -249,6 +250,77 @@ def flagged_words(text):
         pos = m.end()
     tail = text[pos:].split()
     return words + tail, flags + [False] * len(tail)
+
+
+# ---------------------------------------------------------------------------
+# Confidence flags
+# ---------------------------------------------------------------------------
+def word_confidences(tokens):
+    """One confidence per whitespace-separated word of the generated text.
+
+    ``tokens`` is ``[(token, logprob), ...]`` in generation order. A word's
+    confidence is the lowest log-probability among the tokens that make it up,
+    so one shaky letter is enough to mark the word.
+    """
+    text, spans, pos = "", [], 0
+    for tok, lp in tokens:
+        spans.append((pos, pos + len(tok), lp))
+        pos += len(tok)
+        text += tok
+    out = []
+    for m in re.finditer(r"\S+", text):
+        lps = [lp for s, e, lp in spans if s < m.end() and e > m.start()]
+        out.append(min(lps) if lps else 0.0)
+    return out
+
+
+def mark_low_confidence(text, confidences, threshold):
+    """Flag the primary model's low-confidence words as ``==word|~==``.
+
+    ``text`` is the page as written so far, possibly already carrying dual-read
+    flags. ``confidences`` holds one value per word of the primary model's own
+    reading, in order. Words inside an existing flag are left alone, since they
+    are already up for review. Returns ``(text, flagged)``. When the word count
+    does not match the confidences (the text was reshaped since the model wrote
+    it), the page is returned unchanged with ``flagged`` None, rather than
+    flagging the wrong words.
+
+    Measured on 26 hand-checked pages with gemma4:26b and dual read: adding
+    words below -0.2 raised the share of errors under a flag from 59% to 72%
+    while flagged words went from 4.8% to 8.0%, and -0.05 reached 79% at 10.2%.
+    """
+    if not confidences:
+        return text, 0
+    pieces, primary_words = [], 0
+    pos = 0
+    for m in MARK_RE.finditer(text):
+        pieces.append(("plain", text[pos:m.start()]))
+        pieces.append(("mark", m.group(0)))
+        primary_words += 0 if m.group(1) == EMPTY else len(m.group(1).split())
+        pos = m.end()
+    pieces.append(("plain", text[pos:]))
+    primary_words += sum(len(p.split()) for kind, p in pieces if kind == "plain")
+    if primary_words != len(confidences):
+        return text, None
+    out, i, flagged = [], 0, 0
+    for kind, chunk in pieces:
+        if kind == "mark":
+            a = MARK_RE.match(chunk).group(1)
+            i += 0 if a == EMPTY else len(a.split())
+            out.append(chunk)
+            continue
+        last = 0
+        for w in re.finditer(r"\S+", chunk):
+            out.append(chunk[last:w.start()])
+            if confidences[i] < threshold:
+                out.append(MARK.format(a=w.group(0), b=LOW_CONFIDENCE))
+                flagged += 1
+            else:
+                out.append(w.group(0))
+            i += 1
+            last = w.end()
+        out.append(chunk[last:])
+    return "".join(out), flagged
 
 
 # ---------------------------------------------------------------------------
