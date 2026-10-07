@@ -572,7 +572,12 @@ def write_md(out_md, title, rel, pages, source_modified=None, stroke_regions_fla
     body = [f"# {title}", "", f"Source: [[{rel}]]", ""]
     for n, text in pages:
         body += [f"## Page {n}", "", text, ""]
-    out_md.write_text("\n".join(fm + body))
+    # Temp file then rename, like the manifest and the daily-note embed: a
+    # crash or a full disk mid-write must never leave a truncated transcript
+    # for Obsidian (or its git sync) to pick up.
+    tmp = out_md.with_name(out_md.name + ".rm-ocr.tmp")
+    tmp.write_text("\n".join(fm + body))
+    tmp.replace(out_md)
     return chars
 
 
