@@ -98,6 +98,10 @@ TIMEOUT = int(os.environ.get("TIMEOUT", "1800"))
 # faint reMarkable page: 4096 -> 0 chars on every page, 16384 -> a correct
 # transcript. Costs VRAM, so it is opt-in rather than defaulted.
 NUM_CTX = int(os.environ.get("NUM_CTX", "0"))
+# Most tokens the model may generate for one page (0 = no cap). A dense page
+# is a few hundred tokens; the cap bounds a model stuck repeating itself, and a
+# page that hits it is marked as cut off in the transcript.
+NUM_PREDICT = int(os.environ.get("NUM_PREDICT", "4096"))
 # Startup gate: prove the model actually RECEIVES the images we send. A runner
 # that drops them silently (Ollama 0.32.0's MLX runner does) makes the model
 # answer from the prompt alone and invent a fluent transcript that looks
@@ -762,7 +766,8 @@ def dual_read(pdf, pages, hint):
     try:
         second = dict(ocr_pdf(pdf, VERIFY_MODEL, DPI, MAX_PX, timeout=TIMEOUT, threads=THREADS,
                               no_think=NO_THINK, skip_blank=SKIP_BLANK_PAGES,
-                              reflow=REFLOW_PARAGRAPHS, num_ctx=NUM_CTX, prompt_extra=hint))
+                              reflow=REFLOW_PARAGRAPHS, num_ctx=NUM_CTX, prompt_extra=hint,
+                              num_predict=NUM_PREDICT))
     except Exception as e:
         log.warning("verify: second reading with %s failed: %s (keeping the primary text)",
                     VERIFY_MODEL, e)
@@ -1053,7 +1058,7 @@ def process_one(src, result, rel, digest, man, page_regions=None):
     pages = ocr_pdf(result.pdf, MODEL, DPI, MAX_PX, timeout=TIMEOUT, threads=THREADS,
                     no_think=NO_THINK, skip_blank=SKIP_BLANK_PAGES, page_regions=page_regions,
                     reflow=REFLOW_PARAGRAPHS, num_ctx=NUM_CTX, prompt_extra=hint,
-                    confidence_out=confidences)
+                    confidence_out=confidences, num_predict=NUM_PREDICT)
     verify = None
     if verify_applies(src):
         pages, verify = dual_read(result.pdf, pages, hint)
