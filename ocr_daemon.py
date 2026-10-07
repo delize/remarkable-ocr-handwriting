@@ -873,7 +873,21 @@ def harvest_one(rel, rec, learned):
     side_path = rm_verify.sidecar_path(STATE, out_rel)
     side = rm_verify.load_json(side_path, None)
     out_md = _out_md_path(out_rel)
-    if not side or not out_md.exists():
+    if not out_md.exists():
+        return 0
+    if not side:
+        # Written before sidecars existed. Adopt the file as it stands, so
+        # edits from now on are harvested and survive a re-OCR. Edits already
+        # in it cannot be told apart from the model's text, so they are not
+        # harvested, but a later re-OCR keeps a copy under STATE/superseded.
+        if rec.get("status") != "ok":
+            return 0
+        data = out_md.read_bytes()
+        pages = rm_verify.parse_pages(data.decode("utf-8", "replace"))
+        if not pages:
+            return 0
+        rm_verify.write_sidecar(STATE, out_rel, rel, sorted(pages.items()), data)
+        log.info("adopted %s: edits are tracked from now on", out_md.name)
         return 0
     st = out_md.stat()
     if side.get("seen_mtime") == st.st_mtime:
