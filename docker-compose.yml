@@ -27,6 +27,11 @@ services:
     container_name: rm-ocr
     restart: unless-stopped
     env_file: .env
+    # Run as an unprivileged user that owns the state and output volumes, with
+    # no Linux capabilities and no privilege escalation. The daemon needs none.
+    user: "${PUID:-1000}:${PGID:-1000}"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     environment:
       VAULT_DIR: /vault
       SOURCE_SUBDIR: remarkable

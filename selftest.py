@@ -905,18 +905,25 @@ def main():
     finally:
         _urllib_request.urlopen = saved_urlopen2
 
-    # An unreachable/odd server must not block startup — warn and continue.
+    # A probe that cannot run must not fail open: retry, then refuse to start.
+    _boom_calls = {"n": 0}
+
     def _boom(req, timeout=None):
+        _boom_calls["n"] += 1
         raise OSError("connection refused")
 
+    saved_delay = ocr_daemon.VISION_CHECK_RETRY_DELAY
     try:
+        ocr_daemon.VISION_CHECK_RETRY_DELAY = 0
         _urllib_request.urlopen = _boom
         ocr_daemon.assert_model_sees_images("http://x", "unreachable", 64)
-        check("vision gate degrades to a warning when it can't run", True, True)
-    except SystemExit:
-        check("vision gate degrades to a warning when it can't run", False, True)
+        check("vision gate refuses to start when the probe cannot run", False, True)
+    except SystemExit as e:
+        check("vision gate refuses to start when the probe cannot run", "could not run" in str(e), True)
+        check("vision gate retries before refusing", _boom_calls["n"], ocr_daemon.VISION_CHECK_RETRIES)
     finally:
         _urllib_request.urlopen = saved_urlopen2
+        ocr_daemon.VISION_CHECK_RETRY_DELAY = saved_delay
 
     # --- reflow_paragraphs (pure text transform, no model/PIL involved) ---
     check("reflow_paragraphs: joins word-wrapped lines within a paragraph",
@@ -1336,6 +1343,144 @@ def main():
     held = set((tmp / "export-test/holdout.ids").read_text().split())
     check("export: holdout ids are never in train",
           held & set((tmp / "export-test/train.ids").read_text().split()), set())
+
+    # --- hardening: the daemon never scans its own files ---
+    saved_state = ocr_daemon.STATE
+    try:
+        ocr_daemon.STATE = tmp / "vault/remarkable/.remarkable-ocr"
+        check("scan guard: a file under STATE inside the source tree is excluded",
+              ocr_daemon.is_excluded_input(ocr_daemon.STATE / "goldset/abc.png"), True)
+        check("scan guard: a file under OUT is excluded",
+              ocr_daemon.is_excluded_input(ocr_daemon.OUT / "remarkable/x.pdf"), True)
+        check("scan guard: a note in a hidden folder is excluded",
+              ocr_daemon.is_excluded_input(tmp / "vault/remarkable/.trash/old.pdf"), True)
+        check("scan guard: an ordinary note is not",
+              ocr_daemon.is_excluded_input(tmp / "vault/remarkable/Work/Sample.pdf"), False)
+    finally:
+        ocr_daemon.STATE = saved_state
+    (tmp / "vault/remarkable/.hidden").mkdir(exist_ok=True)
+    (tmp / "vault/remarkable/.hidden/Ghost.pdf").write_text("ghost-v1")
+    ocr_daemon.scan_once(ocr_daemon.load_manifest())
+    check("scan guard: the scanner skips a hidden folder",
+          "remarkable/.hidden/Ghost.pdf" in ocr_daemon.load_manifest(), False)
+
+    # --- hardening: atomic transcript writes leave no temp file behind ---
+    check("atomic write: no transcript temp file is left anywhere",
+          list(tmp.rglob("*.rm-ocr.tmp")), [])
+
+    # --- hardening: a broken manifest stops the daemon ---
+    good = ocr_daemon.MANIFEST.read_text()
+    try:
+        ocr_daemon.MANIFEST.write_text("{broken")
+        try:
+            ocr_daemon.load_manifest()
+            check("manifest: a corrupt manifest refuses to load", False, True)
+        except SystemExit as e:
+            check("manifest: a corrupt manifest refuses to load", "Refusing" in str(e), True)
+    finally:
+        ocr_daemon.MANIFEST.write_text(good)
+    saved_manifest = ocr_daemon.MANIFEST
+    try:
+        ocr_daemon.MANIFEST = tmp / "state/never-written.json"
+        check("manifest: a missing manifest is a fresh start", ocr_daemon.load_manifest(), {})
+    finally:
+        ocr_daemon.MANIFEST = saved_manifest
+
+    # --- hardening: page headings inside model text ---
+    esc = rm_verify.escape_page_headings("real text\n## Page 2\nmore")
+    check("headings: a heading inside page text is escaped", esc, "real text\n\\## Page 2\nmore")
+    check("headings: the escaped line is no longer a page boundary",
+          rm_verify.parse_pages("# T\n\n## Page 1\n\n" + esc + "\n\n## Page 2\n\nsecond\n"),
+          {1: esc, 2: "second"})
+    check("headings: a transcript whose headings changed does not match its sidecar",
+          rm_verify.pages_match({"pages": {"1": "a", "2": "b"}}, {1: "a"}), False)
+
+    # --- hardening: the collision check compares the source line exactly ---
+    coll_src = tmp / "vault/remarkable/Work/Collide.pdf"
+    coll_src.write_text("collide")
+    coll_md = ocr_daemon.safe_output_path(coll_src)   # where this source's transcript lands
+    coll_md.parent.mkdir(parents=True, exist_ok=True)
+    coll_md.write_text("---\nsource: remarkable/Work/Collide.pdfx\n---\n")
+    check("collision: a transcript recorded for a longer-named source is not ours",
+          ocr_daemon.safe_output_path(coll_src, source_sha256="abcdef1234").name,
+          f"Collide-abcdef12{ocr_daemon.OUT_SUFFIX}.md")
+    coll_md.write_text("---\nsource: remarkable/Work/Collide.pdf\n---\n")
+    check("collision: the exact source line keeps the plain name",
+          ocr_daemon.safe_output_path(coll_src, source_sha256="abcdef1234").name,
+          f"Collide{ocr_daemon.OUT_SUFFIX}.md")
+
+    # --- hardening: generated tokens are capped and a cut-off page says so ---
+    check("num_predict: the cap reaches the request options",
+          rm_ocr._options(num_predict=4096).get("num_predict"), 4096)
+    _doc_pages = [content_page_img]
+    rm_ocr.convert_from_path = lambda *a, first_page=1, **k: [_doc_pages[first_page - 1]]
+    rm_ocr.pdfinfo_from_path = lambda *a, **k: {"Pages": len(_doc_pages)}
+    _urllib_request.urlopen = make_urlopen([{"response": "partial text"},
+                                            {"done": True, "done_reason": "length"}])
+    try:
+        cut = _real_ocr_pdf("fake.pdf", "test-model", 150, 1568)
+        check("num_predict: a page cut off by the limit carries a marker",
+              cut[0][1].startswith("partial text") and rm_ocr.TRUNCATED_TEXT in cut[0][1], True)
+    finally:
+        _urllib_request.urlopen = saved_urlopen
+
+    # --- hardening: one instance per state dir ---
+    first = ocr_daemon.acquire_instance_lock()
+    if first is not None:   # platforms without fcntl run unlocked
+        try:
+            ocr_daemon.acquire_instance_lock()
+            check("lock: a second instance is refused", False, True)
+        except SystemExit as e:
+            check("lock: a second instance is refused", "another rm-ocr instance" in str(e), True)
+        first.close()
+        ocr_daemon.acquire_instance_lock().close()
+        check("lock: released when the holder exits", True, True)
+
+    # --- hardening: bundle extraction limits ---
+    import io as _io
+    import zipfile as _zipfile
+
+    def _zip(members):
+        buf = _io.BytesIO()
+        with _zipfile.ZipFile(buf, "w") as z:
+            for name, size in members:
+                z.writestr(name, b"x" * size)
+        buf.seek(0)
+        return _zipfile.ZipFile(buf)
+
+    saved_bytes = rm_render.MAX_BUNDLE_BYTES
+    try:
+        rm_render.MAX_BUNDLE_BYTES = 100
+        try:
+            rm_render.check_bundle(_zip([("a.rm", 60), ("b.rm", 60)]))
+            check("bundle: an archive over MAX_BUNDLE_MB is refused", False, True)
+        except ValueError as e:
+            check("bundle: an archive over MAX_BUNDLE_MB is refused", "MAX_BUNDLE_MB" in str(e), True)
+        try:
+            rm_render.check_bundle(_zip([("../evil.rm", 1)]))
+            check("bundle: a member escaping its folder is refused", False, True)
+        except ValueError as e:
+            check("bundle: a member escaping its folder is refused", "escapes" in str(e), True)
+        rm_render.check_bundle(_zip([("uuid/page.rm", 10), ("uuid.content", 5)]))
+        check("bundle: a normal archive passes", True, True)
+    finally:
+        rm_render.MAX_BUNDLE_BYTES = saved_bytes
+
+    # --- hardening: transcripts from before sidecars are adopted ---
+    legacy_md = out_base / "remarkable/Work" / f"Legacy{ocr_daemon.OUT_SUFFIX}.md"
+    legacy_md.parent.mkdir(parents=True, exist_ok=True)
+    legacy_md.write_text("---\nsource: remarkable/Work/Legacy.pdf\nstatus: ok\n---\n\n# Legacy\n\n"
+                         "## Page 1\n\nold page one\n\n## Page 2\n\nold page two\n")
+    man = ocr_daemon.load_manifest()
+    man["remarkable/Work/Legacy.pdf"] = {"status": "ok", "sha256": "legacy",
+                                         "out_path": f"remarkable/Work/Legacy{ocr_daemon.OUT_SUFFIX}.md"}
+    ocr_daemon.save_manifest(man)
+    check("adopt: the first pass adopts a sidecar-less transcript without harvesting",
+          (ocr_daemon.harvest_edits(man),
+           rm_verify.sidecar_path(ocr_daemon.STATE, man["remarkable/Work/Legacy.pdf"]["out_path"]).exists()),
+          (0, True))
+    legacy_md.write_text(legacy_md.read_text().replace("old page two", "old page two, corrected"))
+    check("adopt: an edit made after adoption is harvested", ocr_daemon.harvest_edits(man), 1)
 
     print(f"\n--- sample transcript ---\n{md}")
     if failures:

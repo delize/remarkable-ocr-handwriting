@@ -98,6 +98,10 @@ TIMEOUT = int(os.environ.get("TIMEOUT", "1800"))
 # faint reMarkable page: 4096 -> 0 chars on every page, 16384 -> a correct
 # transcript. Costs VRAM, so it is opt-in rather than defaulted.
 NUM_CTX = int(os.environ.get("NUM_CTX", "0"))
+# Most tokens the model may generate for one page (0 = no cap). A dense page
+# is a few hundred tokens; the cap bounds a model stuck repeating itself, and a
+# page that hits it is marked as cut off in the transcript.
+NUM_PREDICT = int(os.environ.get("NUM_PREDICT", "4096"))
 # Startup gate: prove the model actually RECEIVES the images we send. A runner
 # that drops them silently (Ollama 0.32.0's MLX runner does) makes the model
 # answer from the prompt alone and invent a fluent transcript that looks
@@ -108,6 +112,8 @@ VISION_CHECK = _env_bool("VISION_CHECK", True)
 # Measured growth: qwen3.5:9b 1015, gemma4:26b 207; a runner that drops images
 # shows ~0. 64 sits an order of magnitude clear of the failure case.
 VISION_CHECK_MIN_TOKENS = int(os.environ.get("VISION_CHECK_MIN_TOKENS", "64"))
+VISION_CHECK_RETRIES = 3          # probe attempts before the gate refuses to start
+VISION_CHECK_RETRY_DELAY = 10.0   # seconds between attempts
 INTERVAL = int(os.environ.get("INTERVAL", "600"))
 # Inotify wake-up signal layered on top of the poll. The poll stays as a
 # correctness floor (so a missed event never strands a file forever), but a
@@ -291,10 +297,24 @@ def setup_logging():
 # Manifest
 # ---------------------------------------------------------------------------
 def load_manifest():
-    try:
-        return json.loads(MANIFEST.read_text())
-    except Exception:
+    """The manifest, or an empty one when none exists yet.
+
+    A manifest that exists but cannot be read or parsed is fatal. Treating it
+    as empty would re-transcribe every recent note and overwrite transcripts,
+    including hand-corrected ones, so the daemon refuses and says what to do.
+    """
+    if not MANIFEST.exists():
         return {}
+    try:
+        data = json.loads(MANIFEST.read_text())
+    except (OSError, ValueError) as e:
+        raise SystemExit(
+            f"manifest {MANIFEST} exists but cannot be loaded ({e}). Refusing to start "
+            "from an empty manifest, which would re-OCR and overwrite recent transcripts. "
+            "Repair or move the file aside (the daemon then starts fresh deliberately).")
+    if not isinstance(data, dict):
+        raise SystemExit(f"manifest {MANIFEST} is not a JSON object; move it aside to start fresh")
+    return data
 
 
 def save_manifest(man):
@@ -302,6 +322,44 @@ def save_manifest(man):
     tmp = MANIFEST.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(man, indent=2, sort_keys=True))
     tmp.replace(MANIFEST)  # atomic: never leave a half-written manifest
+
+
+_LOCK_HANDLE = None   # kept open for the life of the process; closing it releases the lock
+
+
+def acquire_instance_lock():
+    """Hold STATE/daemon.lock so two instances never write one manifest.
+
+    A cron ``--scan`` racing the daemon, or two daemons on one state dir,
+    would each rewrite the manifest from their own copy and lose the other's
+    work. Advisory flock, non-blocking: the second instance exits with a
+    message. Platforms without fcntl (Windows) run unlocked.
+    """
+    global _LOCK_HANDLE
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    STATE.mkdir(parents=True, exist_ok=True)
+    lock_path = STATE / "daemon.lock"
+    handle = open(lock_path, "a+")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.seek(0)
+        holder = handle.read().strip() or "unknown pid"
+        handle.close()
+        raise SystemExit(f"another rm-ocr instance ({holder}) holds {lock_path}; "
+                         "stop it first, or point this one at its own STATE_DIR")
+    import socket
+    handle.seek(0)
+    handle.truncate()
+    # Host plus pid: inside a container the daemon is pid 1, which alone would
+    # tell a reader nothing about where the holder runs.
+    handle.write(f"{socket.gethostname()}:{os.getpid()}")
+    handle.flush()
+    _LOCK_HANDLE = handle
+    return handle
 
 
 def sha256(p):
@@ -369,9 +427,11 @@ def safe_output_path(src, title=None, *, source_sha256=None):
 
     if source_sha256 and out_md.exists():
         try:
-            head = out_md.read_text()[:512]
+            with open(out_md, encoding="utf-8", errors="replace") as f:
+                head = f.read(512)
             rel_str = str(src.relative_to(VAULT))
-            if f"source: {rel_str}" not in head:
+            recorded = re.search(r"^source: (.*)$", head, re.MULTILINE)
+            if not recorded or recorded.group(1).strip() != rel_str:
                 # Different bundle, same visibleName — disambiguate by content hash.
                 name = f"{safe_title}-{source_sha256[:8]}{OUT_SUFFIX}.md"
                 out_md = src.with_name(name) if OUT_ALONGSIDE else OUT / rel.parent / name
@@ -391,13 +451,36 @@ def safe_output_path(src, title=None, *, source_sha256=None):
     return out_md
 
 
-def is_under_out(pdf):
-    """True if this PDF lives inside the transcripts tree (don't transcribe our own tree)."""
+def _is_under(path, base):
     try:
-        pdf.resolve().relative_to(OUT.resolve())
+        path.resolve().relative_to(base.resolve())
         return True
     except ValueError:
         return False
+
+
+def is_under_out(pdf):
+    """True if this PDF lives inside the transcripts tree (don't transcribe our own tree)."""
+    return _is_under(pdf, OUT)
+
+
+def is_excluded_input(src):
+    """Inputs the scanner must never treat as a note, however they got under SOURCE_SUBDIR.
+
+    The daemon's own output and state are the main hazard: with STATE_DIR
+    inside the source tree, a cached render (``rendered/*.pdf``) or a harvested
+    ground-truth image (``goldset/*.png``) would be picked up as a new note,
+    transcribed, and its transcript written back into the state folder. Hidden
+    folders (``.obsidian``, ``.trash``, the state dir itself) are skipped as a
+    class, since nothing a person writes on the tablet lands in one.
+    """
+    if is_under_out(src) or _is_under(src, STATE):
+        return True
+    try:
+        rel_parts = src.resolve().relative_to(SRC.resolve()).parts
+    except ValueError:
+        rel_parts = src.parts
+    return any(part.startswith(".") for part in rel_parts[:-1])
 
 
 # ---------------------------------------------------------------------------
@@ -549,7 +632,12 @@ def write_md(out_md, title, rel, pages, source_modified=None, stroke_regions_fla
     body = [f"# {title}", "", f"Source: [[{rel}]]", ""]
     for n, text in pages:
         body += [f"## Page {n}", "", text, ""]
-    out_md.write_text("\n".join(fm + body))
+    # Temp file then rename, like the manifest and the daily-note embed: a
+    # crash or a full disk mid-write must never leave a truncated transcript
+    # for Obsidian (or its git sync) to pick up.
+    tmp = out_md.with_name(out_md.name + ".rm-ocr.tmp")
+    tmp.write_text("\n".join(fm + body))
+    tmp.replace(out_md)
     return chars
 
 
@@ -716,7 +804,8 @@ def dual_read(pdf, pages, hint):
     try:
         second = dict(ocr_pdf(pdf, VERIFY_MODEL, DPI, MAX_PX, timeout=TIMEOUT, threads=THREADS,
                               no_think=NO_THINK, skip_blank=SKIP_BLANK_PAGES,
-                              reflow=REFLOW_PARAGRAPHS, num_ctx=NUM_CTX, prompt_extra=hint))
+                              reflow=REFLOW_PARAGRAPHS, num_ctx=NUM_CTX, prompt_extra=hint,
+                              num_predict=NUM_PREDICT))
     except Exception as e:
         log.warning("verify: second reading with %s failed: %s (keeping the primary text)",
                     VERIFY_MODEL, e)
@@ -787,7 +876,21 @@ def harvest_one(rel, rec, learned):
     side_path = rm_verify.sidecar_path(STATE, out_rel)
     side = rm_verify.load_json(side_path, None)
     out_md = _out_md_path(out_rel)
-    if not side or not out_md.exists():
+    if not out_md.exists():
+        return 0
+    if not side:
+        # Written before sidecars existed. Adopt the file as it stands, so
+        # edits from now on are harvested and survive a re-OCR. Edits already
+        # in it cannot be told apart from the model's text, so they are not
+        # harvested, but a later re-OCR keeps a copy under STATE/superseded.
+        if rec.get("status") != "ok":
+            return 0
+        data = out_md.read_bytes()
+        pages = rm_verify.parse_pages(data.decode("utf-8", "replace"))
+        if not pages:
+            return 0
+        rm_verify.write_sidecar(STATE, out_rel, rel, sorted(pages.items()), data)
+        log.info("adopted %s: edits are tracked from now on", out_md.name)
         return 0
     st = out_md.stat()
     if side.get("seen_mtime") == st.st_mtime:
@@ -799,7 +902,16 @@ def harvest_one(rel, rec, learned):
         rm_verify.save_json(side_path, side)
         return 0
     side["seen_sha"] = sha
-    edits = rm_verify.edited_pages(side, rm_verify.parse_pages(data.decode("utf-8", "replace")))
+    current = rm_verify.parse_pages(data.decode("utf-8", "replace"))
+    if not rm_verify.pages_match(side, current):
+        # A page heading was added or removed by hand, so page-by-page
+        # comparison would pair the wrong texts. Skip rather than record
+        # corrections that were never made.
+        rm_verify.save_json(side_path, side)
+        log.warning("edits to %s not harvested: its page headings no longer match what was written",
+                    out_md.name)
+        return 0
+    edits = rm_verify.edited_pages(side, current)
     harvested = side.setdefault("harvested", {})
     new_terms = []
     for n, (written, current) in sorted(edits.items()):
@@ -998,7 +1110,7 @@ def process_one(src, result, rel, digest, man, page_regions=None):
     pages = ocr_pdf(result.pdf, MODEL, DPI, MAX_PX, timeout=TIMEOUT, threads=THREADS,
                     no_think=NO_THINK, skip_blank=SKIP_BLANK_PAGES, page_regions=page_regions,
                     reflow=REFLOW_PARAGRAPHS, num_ctx=NUM_CTX, prompt_extra=hint,
-                    confidence_out=confidences)
+                    confidence_out=confidences, num_predict=NUM_PREDICT)
     verify = None
     if verify_applies(src):
         pages, verify = dual_read(result.pdf, pages, hint)
@@ -1025,14 +1137,18 @@ def process_one(src, result, rel, digest, man, page_regions=None):
             break
         except ValueError:
             continue
+    # A "## Page N" line inside a page would split the transcript wrongly when
+    # it is read back; escape it before anything records this text.
+    pages = [(n, rm_verify.escape_page_headings(t)) for n, t in pages]
     kept = 0
     model_pages = pages
     if LEARN_CORRECTIONS and out_md.exists():
         # Harvest any edits before this write replaces the file, then keep the
         # edits of every page whose new model output is unchanged.
         prev = man.get(rel, {})
-        harvest_one(rel, {**prev, "out_path": prev.get("out_path") or out_rel},
-                    rm_verify.LearnedVocab(LEARNED_VOCAB, LEARN_MIN_COUNT))
+        learned = rm_verify.LearnedVocab(LEARNED_VOCAB, LEARN_MIN_COUNT)
+        if harvest_one(rel, {**prev, "out_path": prev.get("out_path") or out_rel}, learned):
+            learned.save()
         side = rm_verify.load_json(rm_verify.sidecar_path(STATE, out_rel), None)
         if side:
             old_text = out_md.read_text()
@@ -1091,8 +1207,8 @@ def scan_once(man):
     cutoff = (time.time() - MAX_AGE_HOURS * 3600) if MAX_AGE_HOURS > 0 else None
     done = skipped_old = 0
     for src in rm_render.iter_inputs(SRC):
-        if is_under_out(src):
-            continue  # never transcribe files inside our own transcripts tree
+        if is_excluded_input(src):
+            continue  # our own output or state, or a hidden folder: never a note
         if cutoff is not None and src.stat().st_mtime < cutoff:
             skipped_old += 1
             continue  # outside the recency window (MAX_AGE_HOURS)
@@ -1324,6 +1440,8 @@ def start_inotify_watcher(src, wake):
     wd_to_path = {}
 
     def add_dir(path):
+        if path != src and (path.name.startswith(".") or _is_under(path, STATE) or _is_under(path, OUT)):
+            return  # our own state/output, or a hidden folder: never a note source
         try:
             wd = inotify.add_watch(str(path), dir_mask)
             wd_to_path[wd] = path
@@ -1332,6 +1450,7 @@ def start_inotify_watcher(src, wake):
 
     add_dir(src)
     for dirpath, dirnames, _ in os.walk(src):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
         for d in dirnames:
             add_dir(pathlib.Path(dirpath) / d)
     if not wd_to_path:
@@ -1441,13 +1560,22 @@ def assert_model_sees_images(host, model, min_image_tokens=64):
     def b64_png(side):
         return base64.b64encode(_probe_png(side)).decode()
 
-    try:
-        without = prompt_tokens(None)
-        small = prompt_tokens([b64_png(64)])
-        large = prompt_tokens([b64_png(1024)])
-    except Exception as e:
-        log.warning("vision check could not run (%s) — continuing unguarded", e)
-        return
+    # The gate exists to stop fabricated transcripts, so it must not fail open:
+    # a probe that cannot run is retried, then refuses, never skipped.
+    for attempt in range(1, VISION_CHECK_RETRIES + 1):
+        try:
+            without = prompt_tokens(None)
+            small = prompt_tokens([b64_png(64)])
+            large = prompt_tokens([b64_png(1024)])
+            break
+        except Exception as e:
+            if attempt == VISION_CHECK_RETRIES:
+                raise SystemExit(
+                    f"vision check could not run against {host} after {attempt} attempts ({e}). "
+                    "Refusing to start unverified; set VISION_CHECK=0 to skip the gate deliberately.")
+            log.warning("vision check attempt %d/%d failed (%s), retrying", attempt,
+                        VISION_CHECK_RETRIES, e)
+            time.sleep(VISION_CHECK_RETRY_DELAY)
     growth = large - small
     log.info("vision check: %s prompt tokens %d none / %d at 64px / %d at 1024px "
              "(+%d for area)", model, without, small, large, growth)
@@ -1535,6 +1663,7 @@ def main():
         return
 
     assert_safe_paths()
+    acquire_instance_lock()
     rm_ocr.assert_local_host(rm_ocr.OLLAMA_URL, allow_remote=ALLOW_REMOTE_MODEL_HOST,
                              wait=max(MODEL_WAIT_TIMEOUT, 60), log=log.warning)
     if REQUIRE_SPLIT:
@@ -1556,6 +1685,8 @@ def main():
     log.info("rm-ocr starting | model=%s threads=%d no_think=%s dpi=%d max_px=%d max_age=%sh cooldown=%ss",
              MODEL, THREADS, NO_THINK, DPI, MAX_PX, MAX_AGE_HOURS, MIN_REPROCESS_INTERVAL)
     log.info("source=%s  out=%s  state=%s", SRC, OUT, STATE)
+    if _is_under(STATE, SRC):
+        log.info("state dir sits inside the source tree; it and every hidden folder are excluded from scanning")
     if AUTO_SPLIT:
         log.info("AUTO_SPLIT ON | split in place then OCR (max_aspect=%.2f, target_h=%d)",
                  SPLIT_MAX_ASPECT, SPLIT_TARGET_PAGE_HEIGHT)

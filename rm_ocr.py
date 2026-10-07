@@ -267,10 +267,17 @@ def _stream_generate(payload, timeout, tokens_out=None):
     return "".join(parts).strip(), think_chars, done_reason
 
 
-def _options(cpu=False, threads=None, num_ctx=0):
+TRUNCATED_TEXT = "[transcription cut off: the model hit its output limit]"
+
+
+def _options(cpu=False, threads=None, num_ctx=0, num_predict=0):
     opts = {"temperature": 0}
     if num_ctx:
         opts["num_ctx"] = num_ctx
+    if num_predict:
+        # Bounds a model stuck repeating itself. A dense handwritten page is a
+        # few hundred tokens, so a 4096 cap costs nothing on real text.
+        opts["num_predict"] = num_predict
     if cpu:
         opts["num_gpu"] = 0
     if threads:
@@ -296,7 +303,7 @@ def render_page_b64(pdf, n, dpi, max_px):
 
 
 def ocr_image_b64(img_b64, model, *, timeout=1800, no_think=False, num_ctx=0, threads=None,
-                  prompt_extra="", reflow=True, confidence_out=None):
+                  prompt_extra="", reflow=True, confidence_out=None, num_predict=4096):
     """Transcribe one already-encoded page image with the standard prompt.
 
     Used by the evaluation runner, which scores pages from a stored image set
@@ -304,13 +311,16 @@ def ocr_image_b64(img_b64, model, *, timeout=1800, no_think=False, num_ctx=0, th
     """
     prompt = f"{PROMPT}\n\n{prompt_extra}" if prompt_extra else PROMPT
     payload = {"model": model, "prompt": prompt, "images": [img_b64], "stream": True,
-               "keep_alive": "30m", "options": _options(threads=threads, num_ctx=num_ctx)}
+               "keep_alive": "30m",
+               "options": _options(threads=threads, num_ctx=num_ctx, num_predict=num_predict)}
     if no_think:
         payload["think"] = False
     tokens = [] if confidence_out is not None else None
-    text, _, _ = _stream_generate(payload, timeout, tokens_out=tokens)
+    text, _, done_reason = _stream_generate(payload, timeout, tokens_out=tokens)
     if confidence_out is not None:
         confidence_out[:] = rm_verify.word_confidences(tokens)
+    if text and done_reason == "length":
+        text = f"{text}\n\n{TRUNCATED_TEXT}"
     return reflow_paragraphs(text) if reflow else text
 
 
@@ -345,7 +355,7 @@ def unload_model(model, timeout=120):
 
 def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_think=False,
            skip_blank=True, page_regions=None, reflow=True, num_ctx=0, prompt_extra="",
-           confidence_out=None):
+           confidence_out=None, num_predict=4096):
     """Transcribe every page of ``pdf``; returns ``[(page_number, text), ...]``.
 
     ``prompt_extra`` is appended to the prompt for every page (the vocabulary
@@ -356,18 +366,14 @@ def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_t
     """
     results = []
     empty_pages = 0
-    opts = {"temperature": 0}
-    if num_ctx:
-        # Ollama defaults to a 4096 context. A full-page image already costs
-        # ~1800 of those tokens, so a model that reasons before answering can
-        # exhaust the window and be cut off with nothing in "response" (see the
-        # empty-answer handling below). Measured on qwen3-vl:8b against a real
-        # page: 4096 produced 0 chars, 16384 transcribed it correctly.
-        opts["num_ctx"] = num_ctx
-    if cpu:
-        opts["num_gpu"] = 0   # 0 layers on GPU == CPU-only (num_gpu = #layers, not #GPUs)
-    if threads:
-        opts["num_thread"] = threads   # override Ollama's under-detected count (cgroup "max" bug)
+    # num_ctx: Ollama defaults to a 4096 context. A full-page image already
+    # costs ~1800 of those tokens, so a model that reasons before answering can
+    # exhaust the window and be cut off with nothing in "response" (see the
+    # empty-answer handling below). Measured on qwen3-vl:8b against a real
+    # page: 4096 produced 0 chars, 16384 transcribed it correctly.
+    # num_gpu=0 is CPU-only (it counts layers, not GPUs). num_thread overrides
+    # Ollama's under-detected count (cgroup "max" bug).
+    opts = _options(cpu=cpu, threads=threads, num_ctx=num_ctx, num_predict=num_predict)
     # Render one page at a time. convert_from_path over the whole document
     # rasterizes EVERY page into RAM at once (at `dpi`); on a long notebook at a
     # high DPI that alone can OOM-kill the container before a single page is even
@@ -408,6 +414,11 @@ def ocr_pdf(pdf, model, dpi, max_px, cpu=False, timeout=1800, threads=None, no_t
         if confidence_out is not None and text:
             confidence_out[n] = rm_verify.word_confidences(tokens)
         print(f" {len(text)} chars", flush=True)
+        if text and done_reason == "length":
+            # Cut off by num_predict or the context window. Say so in the
+            # transcript rather than hand over a page that silently ends early.
+            print(f"    page {n}/{num_pages}: output cut off (done_reason=length)", flush=True)
+            text = f"{text}\n\n{TRUNCATED_TEXT}"
         if not text:
             # An empty answer used to be written out as an empty page under
             # status=ok, which is indistinguishable from a blank page and hides
