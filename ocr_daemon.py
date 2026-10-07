@@ -391,13 +391,36 @@ def safe_output_path(src, title=None, *, source_sha256=None):
     return out_md
 
 
-def is_under_out(pdf):
-    """True if this PDF lives inside the transcripts tree (don't transcribe our own tree)."""
+def _is_under(path, base):
     try:
-        pdf.resolve().relative_to(OUT.resolve())
+        path.resolve().relative_to(base.resolve())
         return True
     except ValueError:
         return False
+
+
+def is_under_out(pdf):
+    """True if this PDF lives inside the transcripts tree (don't transcribe our own tree)."""
+    return _is_under(pdf, OUT)
+
+
+def is_excluded_input(src):
+    """Inputs the scanner must never treat as a note, however they got under SOURCE_SUBDIR.
+
+    The daemon's own output and state are the main hazard: with STATE_DIR
+    inside the source tree, a cached render (``rendered/*.pdf``) or a harvested
+    ground-truth image (``goldset/*.png``) would be picked up as a new note,
+    transcribed, and its transcript written back into the state folder. Hidden
+    folders (``.obsidian``, ``.trash``, the state dir itself) are skipped as a
+    class, since nothing a person writes on the tablet lands in one.
+    """
+    if is_under_out(src) or _is_under(src, STATE):
+        return True
+    try:
+        rel_parts = src.resolve().relative_to(SRC.resolve()).parts
+    except ValueError:
+        rel_parts = src.parts
+    return any(part.startswith(".") for part in rel_parts[:-1])
 
 
 # ---------------------------------------------------------------------------
@@ -1091,8 +1114,8 @@ def scan_once(man):
     cutoff = (time.time() - MAX_AGE_HOURS * 3600) if MAX_AGE_HOURS > 0 else None
     done = skipped_old = 0
     for src in rm_render.iter_inputs(SRC):
-        if is_under_out(src):
-            continue  # never transcribe files inside our own transcripts tree
+        if is_excluded_input(src):
+            continue  # our own output or state, or a hidden folder: never a note
         if cutoff is not None and src.stat().st_mtime < cutoff:
             skipped_old += 1
             continue  # outside the recency window (MAX_AGE_HOURS)
@@ -1324,6 +1347,8 @@ def start_inotify_watcher(src, wake):
     wd_to_path = {}
 
     def add_dir(path):
+        if path != src and (path.name.startswith(".") or _is_under(path, STATE) or _is_under(path, OUT)):
+            return  # our own state/output, or a hidden folder: never a note source
         try:
             wd = inotify.add_watch(str(path), dir_mask)
             wd_to_path[wd] = path
@@ -1332,6 +1357,7 @@ def start_inotify_watcher(src, wake):
 
     add_dir(src)
     for dirpath, dirnames, _ in os.walk(src):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
         for d in dirnames:
             add_dir(pathlib.Path(dirpath) / d)
     if not wd_to_path:
@@ -1556,6 +1582,8 @@ def main():
     log.info("rm-ocr starting | model=%s threads=%d no_think=%s dpi=%d max_px=%d max_age=%sh cooldown=%ss",
              MODEL, THREADS, NO_THINK, DPI, MAX_PX, MAX_AGE_HOURS, MIN_REPROCESS_INTERVAL)
     log.info("source=%s  out=%s  state=%s", SRC, OUT, STATE)
+    if _is_under(STATE, SRC):
+        log.info("state dir sits inside the source tree; it and every hidden folder are excluded from scanning")
     if AUTO_SPLIT:
         log.info("AUTO_SPLIT ON | split in place then OCR (max_aspect=%.2f, target_h=%d)",
                  SPLIT_MAX_ASPECT, SPLIT_TARGET_PAGE_HEIGHT)
