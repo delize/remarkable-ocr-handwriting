@@ -843,7 +843,16 @@ def harvest_one(rel, rec, learned):
         rm_verify.save_json(side_path, side)
         return 0
     side["seen_sha"] = sha
-    edits = rm_verify.edited_pages(side, rm_verify.parse_pages(data.decode("utf-8", "replace")))
+    current = rm_verify.parse_pages(data.decode("utf-8", "replace"))
+    if not rm_verify.pages_match(side, current):
+        # A page heading was added or removed by hand, so page-by-page
+        # comparison would pair the wrong texts. Skip rather than record
+        # corrections that were never made.
+        rm_verify.save_json(side_path, side)
+        log.warning("edits to %s not harvested: its page headings no longer match what was written",
+                    out_md.name)
+        return 0
+    edits = rm_verify.edited_pages(side, current)
     harvested = side.setdefault("harvested", {})
     new_terms = []
     for n, (written, current) in sorted(edits.items()):
@@ -1069,6 +1078,9 @@ def process_one(src, result, rel, digest, man, page_regions=None):
             break
         except ValueError:
             continue
+    # A "## Page N" line inside a page would split the transcript wrongly when
+    # it is read back; escape it before anything records this text.
+    pages = [(n, rm_verify.escape_page_headings(t)) for n, t in pages]
     kept = 0
     model_pages = pages
     if LEARN_CORRECTIONS and out_md.exists():

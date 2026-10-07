@@ -372,6 +372,25 @@ def sha256_bytes(data):
     return hashlib.sha256(data).hexdigest()
 
 
+_HEADING_IN_TEXT = re.compile(r"^(\s*)(## Page \d+\s*)$", re.MULTILINE)
+
+
+def escape_page_headings(text):
+    """Make a ``## Page N`` line inside page text harmless to the page parser.
+
+    The transcript's own page headings are the only structure the sidecar
+    parser relies on. A model (or an editor) can write the same line inside a
+    page; a leading backslash keeps it rendering as text while
+    ``parse_pages`` no longer sees a page boundary there.
+    """
+    return _HEADING_IN_TEXT.sub(lambda m: f"{m.group(1)}\\{m.group(2)}", text)
+
+
+def pages_match(sidecar, current_pages):
+    """True when the file still has exactly the pages the daemon wrote."""
+    return set(current_pages) == {int(k) for k in (sidecar or {}).get("pages", {})}
+
+
 def parse_pages(md_text):
     """``{page_number: text}`` from a transcript's ``## Page N`` sections."""
     parts = _PAGE_RE.split(md_text)
