@@ -383,9 +383,11 @@ def safe_output_path(src, title=None, *, source_sha256=None):
 
     if source_sha256 and out_md.exists():
         try:
-            head = out_md.read_text()[:512]
+            with open(out_md, encoding="utf-8", errors="replace") as f:
+                head = f.read(512)
             rel_str = str(src.relative_to(VAULT))
-            if f"source: {rel_str}" not in head:
+            recorded = re.search(r"^source: (.*)$", head, re.MULTILINE)
+            if not recorded or recorded.group(1).strip() != rel_str:
                 # Different bundle, same visibleName — disambiguate by content hash.
                 name = f"{safe_title}-{source_sha256[:8]}{OUT_SUFFIX}.md"
                 out_md = src.with_name(name) if OUT_ALONGSIDE else OUT / rel.parent / name
