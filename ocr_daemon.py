@@ -351,9 +351,12 @@ def acquire_instance_lock():
         handle.close()
         raise SystemExit(f"another rm-ocr instance ({holder}) holds {lock_path}; "
                          "stop it first, or point this one at its own STATE_DIR")
+    import socket
     handle.seek(0)
     handle.truncate()
-    handle.write(str(os.getpid()))
+    # Host plus pid: inside a container the daemon is pid 1, which alone would
+    # tell a reader nothing about where the holder runs.
+    handle.write(f"{socket.gethostname()}:{os.getpid()}")
     handle.flush()
     _LOCK_HANDLE = handle
     return handle
