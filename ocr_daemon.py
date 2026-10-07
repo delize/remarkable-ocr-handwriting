@@ -1075,8 +1075,9 @@ def process_one(src, result, rel, digest, man, page_regions=None):
         # Harvest any edits before this write replaces the file, then keep the
         # edits of every page whose new model output is unchanged.
         prev = man.get(rel, {})
-        harvest_one(rel, {**prev, "out_path": prev.get("out_path") or out_rel},
-                    rm_verify.LearnedVocab(LEARNED_VOCAB, LEARN_MIN_COUNT))
+        learned = rm_verify.LearnedVocab(LEARNED_VOCAB, LEARN_MIN_COUNT)
+        if harvest_one(rel, {**prev, "out_path": prev.get("out_path") or out_rel}, learned):
+            learned.save()
         side = rm_verify.load_json(rm_verify.sidecar_path(STATE, out_rel), None)
         if side:
             old_text = out_md.read_text()
