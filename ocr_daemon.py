@@ -108,6 +108,8 @@ VISION_CHECK = _env_bool("VISION_CHECK", True)
 # Measured growth: qwen3.5:9b 1015, gemma4:26b 207; a runner that drops images
 # shows ~0. 64 sits an order of magnitude clear of the failure case.
 VISION_CHECK_MIN_TOKENS = int(os.environ.get("VISION_CHECK_MIN_TOKENS", "64"))
+VISION_CHECK_RETRIES = 3          # probe attempts before the gate refuses to start
+VISION_CHECK_RETRY_DELAY = 10.0   # seconds between attempts
 INTERVAL = int(os.environ.get("INTERVAL", "600"))
 # Inotify wake-up signal layered on top of the poll. The poll stays as a
 # correctness floor (so a missed event never strands a file forever), but a
@@ -1501,13 +1503,22 @@ def assert_model_sees_images(host, model, min_image_tokens=64):
     def b64_png(side):
         return base64.b64encode(_probe_png(side)).decode()
 
-    try:
-        without = prompt_tokens(None)
-        small = prompt_tokens([b64_png(64)])
-        large = prompt_tokens([b64_png(1024)])
-    except Exception as e:
-        log.warning("vision check could not run (%s) — continuing unguarded", e)
-        return
+    # The gate exists to stop fabricated transcripts, so it must not fail open:
+    # a probe that cannot run is retried, then refuses, never skipped.
+    for attempt in range(1, VISION_CHECK_RETRIES + 1):
+        try:
+            without = prompt_tokens(None)
+            small = prompt_tokens([b64_png(64)])
+            large = prompt_tokens([b64_png(1024)])
+            break
+        except Exception as e:
+            if attempt == VISION_CHECK_RETRIES:
+                raise SystemExit(
+                    f"vision check could not run against {host} after {attempt} attempts ({e}). "
+                    "Refusing to start unverified; set VISION_CHECK=0 to skip the gate deliberately.")
+            log.warning("vision check attempt %d/%d failed (%s), retrying", attempt,
+                        VISION_CHECK_RETRIES, e)
+            time.sleep(VISION_CHECK_RETRY_DELAY)
     growth = large - small
     log.info("vision check: %s prompt tokens %d none / %d at 64px / %d at 1024px "
              "(+%d for area)", model, without, small, large, growth)
