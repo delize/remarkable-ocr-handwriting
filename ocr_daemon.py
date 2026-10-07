@@ -291,10 +291,24 @@ def setup_logging():
 # Manifest
 # ---------------------------------------------------------------------------
 def load_manifest():
-    try:
-        return json.loads(MANIFEST.read_text())
-    except Exception:
+    """The manifest, or an empty one when none exists yet.
+
+    A manifest that exists but cannot be read or parsed is fatal. Treating it
+    as empty would re-transcribe every recent note and overwrite transcripts,
+    including hand-corrected ones, so the daemon refuses and says what to do.
+    """
+    if not MANIFEST.exists():
         return {}
+    try:
+        data = json.loads(MANIFEST.read_text())
+    except (OSError, ValueError) as e:
+        raise SystemExit(
+            f"manifest {MANIFEST} exists but cannot be loaded ({e}). Refusing to start "
+            "from an empty manifest, which would re-OCR and overwrite recent transcripts. "
+            "Repair or move the file aside (the daemon then starts fresh deliberately).")
+    if not isinstance(data, dict):
+        raise SystemExit(f"manifest {MANIFEST} is not a JSON object; move it aside to start fresh")
+    return data
 
 
 def save_manifest(man):
