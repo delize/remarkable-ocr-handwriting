@@ -324,6 +324,41 @@ def save_manifest(man):
     tmp.replace(MANIFEST)  # atomic: never leave a half-written manifest
 
 
+_LOCK_HANDLE = None   # kept open for the life of the process; closing it releases the lock
+
+
+def acquire_instance_lock():
+    """Hold STATE/daemon.lock so two instances never write one manifest.
+
+    A cron ``--scan`` racing the daemon, or two daemons on one state dir,
+    would each rewrite the manifest from their own copy and lose the other's
+    work. Advisory flock, non-blocking: the second instance exits with a
+    message. Platforms without fcntl (Windows) run unlocked.
+    """
+    global _LOCK_HANDLE
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    STATE.mkdir(parents=True, exist_ok=True)
+    lock_path = STATE / "daemon.lock"
+    handle = open(lock_path, "a+")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.seek(0)
+        holder = handle.read().strip() or "unknown pid"
+        handle.close()
+        raise SystemExit(f"another rm-ocr instance ({holder}) holds {lock_path}; "
+                         "stop it first, or point this one at its own STATE_DIR")
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()))
+    handle.flush()
+    _LOCK_HANDLE = handle
+    return handle
+
+
 def sha256(p):
     h = hashlib.sha256()
     with open(p, "rb") as f:
@@ -1611,6 +1646,7 @@ def main():
         return
 
     assert_safe_paths()
+    acquire_instance_lock()
     rm_ocr.assert_local_host(rm_ocr.OLLAMA_URL, allow_remote=ALLOW_REMOTE_MODEL_HOST,
                              wait=max(MODEL_WAIT_TIMEOUT, 60), log=log.warning)
     if REQUIRE_SPLIT:
