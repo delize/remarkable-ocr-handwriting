@@ -1428,16 +1428,18 @@ def main():
         _urllib_request.urlopen = saved_urlopen
 
     # --- hardening: one instance per state dir ---
-    first = ocr_daemon.acquire_instance_lock()
-    if first is not None:   # platforms without fcntl run unlocked
+    if ocr_daemon.acquire_instance_lock() is not None:   # platforms without fcntl run unlocked
+        held = ocr_daemon._LOCK_FD
         try:
             ocr_daemon.acquire_instance_lock()
             check("lock: a second instance is refused", False, True)
         except SystemExit as e:
             check("lock: a second instance is refused", "another rm-ocr instance" in str(e), True)
-        first.close()
-        ocr_daemon.acquire_instance_lock().close()
-        check("lock: released when the holder exits", True, True)
+        ocr_daemon._LOCK_FD = held   # the refused attempt must not have clobbered the holder
+        ocr_daemon.release_instance_lock()
+        check("lock: released when the holder lets go",
+              ocr_daemon.acquire_instance_lock() is not None, True)
+        ocr_daemon.release_instance_lock()
 
     # --- hardening: bundle extraction limits ---
     import io as _io

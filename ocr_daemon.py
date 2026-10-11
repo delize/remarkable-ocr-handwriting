@@ -324,7 +324,7 @@ def save_manifest(man):
     tmp.replace(MANIFEST)  # atomic: never leave a half-written manifest
 
 
-_LOCK_HANDLE = None   # kept open for the life of the process; closing it releases the lock
+_LOCK_FD = None   # held for the life of the process; release_instance_lock() lets it go
 
 
 def acquire_instance_lock():
@@ -333,33 +333,44 @@ def acquire_instance_lock():
     A cron ``--scan`` racing the daemon, or two daemons on one state dir,
     would each rewrite the manifest from their own copy and lose the other's
     work. Advisory flock, non-blocking: the second instance exits with a
-    message. Platforms without fcntl (Windows) run unlocked.
+    message naming the holder. Platforms without fcntl (Windows) run unlocked.
+    Returns the descriptor, or None when unlocked.
     """
-    global _LOCK_HANDLE
+    global _LOCK_FD
     try:
         import fcntl
     except ImportError:
         return None
+    import atexit
+    import socket
     STATE.mkdir(parents=True, exist_ok=True)
     lock_path = STATE / "daemon.lock"
-    handle = open(lock_path, "a+")
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
     try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        handle.seek(0)
-        holder = handle.read().strip() or "unknown pid"
-        handle.close()
+        holder = os.read(fd, 256).decode("utf-8", "replace").strip() or "unknown"
+        os.close(fd)
         raise SystemExit(f"another rm-ocr instance ({holder}) holds {lock_path}; "
                          "stop it first, or point this one at its own STATE_DIR")
-    import socket
-    handle.seek(0)
-    handle.truncate()
     # Host plus pid: inside a container the daemon is pid 1, which alone would
     # tell a reader nothing about where the holder runs.
-    handle.write(f"{socket.gethostname()}:{os.getpid()}")
-    handle.flush()
-    _LOCK_HANDLE = handle
-    return handle
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{socket.gethostname()}:{os.getpid()}".encode())
+    _LOCK_FD = fd
+    atexit.register(release_instance_lock)
+    return fd
+
+
+def release_instance_lock():
+    """Drop the instance lock (closing the descriptor releases the flock)."""
+    global _LOCK_FD
+    if _LOCK_FD is not None:
+        try:
+            os.close(_LOCK_FD)
+        except OSError:
+            pass
+        _LOCK_FD = None
 
 
 def sha256(p):
