@@ -1163,6 +1163,7 @@ def main():
             setattr(rm_ocr, n, v)
 
     # --- scheduled quality self-check ---
+    import datetime as _dt
     gold_sc = tmp / "gold-selfcheck"
     for i in range(3):
         rm_verify.write_gold_case(gold_sc, f"sc{i}.pdf", 1, f"truth {i}", b"png")
@@ -1175,7 +1176,9 @@ def main():
                  "hyp_words": 100, "diff_errors": 5, "caught": 3, "seconds": 1,
                  "primary": "x"} for c in cases]
         return {"config": {"model": model, "verify_model": verify_model, "resolve": False},
-                "summary": rm_eval.summarize(rows), "cases": rows, "at": "2026-10-02T03:00:00"}
+                "summary": rm_eval.summarize(rows), "cases": rows,
+                # Now, not a fixed date: the interval check compares against the clock.
+                "at": _dt.datetime.now().isoformat(timespec="seconds")}
 
     saved_sc = {n: getattr(ocr_daemon, n) for n in (
         "GOLDSET_DIR", "EVAL_INTERVAL_DAYS", "EVAL_HISTORY", "EVAL_BASELINE", "VERIFY_MODEL")}
