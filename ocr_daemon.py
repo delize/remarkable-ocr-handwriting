@@ -324,53 +324,55 @@ def save_manifest(man):
     tmp.replace(MANIFEST)  # atomic: never leave a half-written manifest
 
 
-_LOCK_FD = None   # held for the life of the process; release_instance_lock() lets it go
+class _InstanceLock:
+    """STATE/daemon.lock, held for the life of the process so two instances never share a manifest.
 
-
-def acquire_instance_lock():
-    """Hold STATE/daemon.lock so two instances never write one manifest.
-
-    A cron ``--scan`` racing the daemon, or two daemons on one state dir,
-    would each rewrite the manifest from their own copy and lose the other's
-    work. Advisory flock, non-blocking: the second instance exits with a
-    message naming the holder. Platforms without fcntl (Windows) run unlocked.
-    Returns the descriptor, or None when unlocked.
+    A cron ``--scan`` racing the daemon, or two daemons on one state dir, would
+    each rewrite the manifest from their own copy and lose the other's work.
+    Advisory flock, non-blocking: the second instance exits with a message
+    naming the holder. Platforms without fcntl (Windows) run unlocked.
     """
-    global _LOCK_FD
-    try:
-        import fcntl
-    except ImportError:
-        return None
-    import atexit
-    import socket
-    STATE.mkdir(parents=True, exist_ok=True)
-    lock_path = STATE / "daemon.lock"
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        holder = os.read(fd, 256).decode("utf-8", "replace").strip() or "unknown"
-        os.close(fd)
-        raise SystemExit(f"another rm-ocr instance ({holder}) holds {lock_path}; "
-                         "stop it first, or point this one at its own STATE_DIR")
-    # Host plus pid: inside a container the daemon is pid 1, which alone would
-    # tell a reader nothing about where the holder runs.
-    os.ftruncate(fd, 0)
-    os.write(fd, f"{socket.gethostname()}:{os.getpid()}".encode())
-    _LOCK_FD = fd
-    atexit.register(release_instance_lock)
-    return fd
 
+    def __init__(self):
+        self.fd = None
 
-def release_instance_lock():
-    """Drop the instance lock (closing the descriptor releases the flock)."""
-    global _LOCK_FD
-    if _LOCK_FD is not None:
+    def acquire(self):
+        """Take the lock; True when held, None when this platform cannot lock."""
         try:
-            os.close(_LOCK_FD)
+            import fcntl
+        except ImportError:
+            return None
+        import atexit
+        import socket
+        STATE.mkdir(parents=True, exist_ok=True)
+        lock_path = STATE / "daemon.lock"
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            pass
-        _LOCK_FD = None
+            holder = os.read(fd, 256).decode("utf-8", "replace").strip() or "unknown"
+            os.close(fd)
+            raise SystemExit(f"another rm-ocr instance ({holder}) holds {lock_path}; "
+                             "stop it first, or point this one at its own STATE_DIR")
+        # Host plus pid: inside a container the daemon is pid 1, which alone
+        # would tell a reader nothing about where the holder runs.
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{socket.gethostname()}:{os.getpid()}".encode())
+        self.fd = fd
+        atexit.register(self.release)
+        return True
+
+    def release(self):
+        """Let the lock go (closing the descriptor releases the flock)."""
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass   # already closed, or the state dir went away; nothing left to release
+            self.fd = None
+
+
+INSTANCE_LOCK = _InstanceLock()
 
 
 def sha256(p):
@@ -1674,7 +1676,7 @@ def main():
         return
 
     assert_safe_paths()
-    acquire_instance_lock()
+    INSTANCE_LOCK.acquire()
     rm_ocr.assert_local_host(rm_ocr.OLLAMA_URL, allow_remote=ALLOW_REMOTE_MODEL_HOST,
                              wait=max(MODEL_WAIT_TIMEOUT, 60), log=log.warning)
     if REQUIRE_SPLIT:
