@@ -73,6 +73,12 @@ repeat-prevention design.
 
 ## Safety guarantees (enforced in code)
 
+- The daemon never treats its own files as notes. Anything under `STATE_DIR` or `OUT_DIR`, and anything in a hidden folder (`.obsidian`, `.trash`, a state dir kept inside the vault), is excluded from scanning and from the inotify watch.
+- Transcripts, the manifest and daily-note embeds are written to a temp file and renamed, so a crash or a full disk never leaves a truncated file for Obsidian or its sync to pick up.
+- A manifest that exists but cannot be loaded stops the daemon. Starting from an empty one would re-transcribe every recent note and overwrite hand-corrected transcripts.
+- One instance per `STATE_DIR`: an advisory lock on `daemon.lock` makes a second daemon or a racing cron `--scan` exit with a message instead of fighting over the manifest.
+- Bundles are refused if they would extract beyond `MAX_BUNDLE_MB` (512) or `MAX_BUNDLE_MEMBERS` (5000), or contain a member whose name points outside the folder.
+- Every page is capped at `NUM_PREDICT` tokens (4096), and a page cut off by that cap or by the context window carries a visible marker in the transcript.
 - Handwriting never leaves your machines. At startup the daemon, the CLI and `rm_eval.py` resolve the model host and refuse to run if any address it resolves to is public. Loopback, private LAN ranges, link-local, `100.64.0.0/10` (Tailscale) and any subnet directly attached to the machine count as local. The last one matters for Docker with IPv6 on a delegated prefix, where the Ollama container gets a globally routable address on the same bridge. On systems without Linux's `/proc/net` route tables, list such networks in `LOCAL_MODEL_NETS`. `ALLOW_REMOTE_MODEL_HOST=1` downgrades the refusal to a warning, for a deployment that knowingly runs its model elsewhere.
 - The vault is mounted **fully read-only** (default); transcripts go to a separate
   `OUT_DIR` volume, so nothing is ever written back into the vault.
@@ -84,6 +90,8 @@ repeat-prevention design.
   you run both tools on the same host) — in every mode.
 - A malformed PDF logs an error, increments a capped retry counter, and the batch
   continues.
+
+**Trust boundary.** Everything under `SOURCE_SUBDIR` is treated as the owner's own writing and handed to poppler, PyMuPDF, `rmc` and Inkscape. Whatever can place a file there (the sync tool and the cloud behind it) gets to exercise those parsers as the container user, so run the container unprivileged (the example compose sets `user`, drops all capabilities and sets `no-new-privileges`). The local-only guard checks where the model host resolves at startup. It cannot see a LAN host that forwards traffic elsewhere.
 
 ## Prerequisites
 
@@ -191,6 +199,9 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `TIMEOUT` | `1800` | Per-page socket timeout |
 | `VISION_CHECK` | `1` | Startup gate: prove the model actually **receives** the images. A runner that drops them makes the model invent a fluent transcript that looks successful. See [The vision gate](#the-vision-gate) |
 | `VISION_CHECK_MIN_TOKENS` | `64` | Minimum extra prompt tokens a 1024×1024 image must cost over a 64×64 one. Measured growth: `qwen3.5:9b` +1015, `gemma4:26b` +207; a runner that drops images stays flat |
+| `NUM_PREDICT` | `4096` | Most tokens the model may generate for one page (`0` = no cap). Bounds a model stuck repeating itself, and a page that hits it is marked as cut off |
+| `MAX_BUNDLE_MB` | `512` | Refuse a `.zip`/`.rmdoc` that would extract to more than this |
+| `MAX_BUNDLE_MEMBERS` | `5000` | Refuse a bundle with more members than this |
 | `NUM_CTX` | `0` | Model context window in tokens (`0` = Ollama's default of 4096). A page image alone costs ~1800, so a model that reasons first can run out and return **nothing**. **Set `16384` for real handwriting** — dense pages exhaust 4096 even with `IMAGE_AUTOCONTRAST` on. Costs VRAM |
 | `ALLOW_REMOTE_MODEL_HOST` | `0` | `1` = allow a model host that resolves to a public address (warns instead of refusing). Leave off to keep every page on your own network |
 | `LOCAL_MODEL_NETS` | _(empty)_ | Extra CIDRs the local-only guard treats as local, comma separated. Linux reads directly attached subnets from the kernel, so this is rarely needed there |
@@ -607,6 +618,7 @@ The model is confident even on many of its misreads, so useful thresholds sit ju
 **Learning from your edits.** With `LEARN_CORRECTIONS` (on by default) the daemon keeps a sidecar of what it wrote to each transcript. When you fix a transcript in Obsidian, the next pass notices, and:
 
 - logs each correction to `STATE_DIR/corrections.jsonl`,
+- adopts transcripts written before v0.9.0 (no sidecar) as they stand, so edits from then on are tracked too,
 - stores the edited page, with the page image OCR saw, as ground truth under `GOLDSET_DIR`,
 - counts term-like corrections (acronyms, names, words with digits or an inner hyphen or slash) toward a learned vocabulary,
 - and keeps your edit when the source changes later, for every page whose new model output is the same as before. A page that really changed is re-transcribed, and the edited file is saved under `STATE_DIR/superseded/`.
