@@ -568,22 +568,22 @@ so with an external `OUT_DIR` the embed is skipped with a warning.
 
 ### Self-checking transcripts
 
-Handwriting OCR fails on the words that matter most: acronyms, product names and people. Over 26 hand-checked pages of real notes, gemma4:26b and qwen3.6:35b-a3b both land around 6% word error rate, 1 to 5% on flowing prose and 10 to 13% on jargon-heavy work notes. Neither model was clearly better, and each made errors that flip meaning ("can't" read as "can", "understand" as "misunderstood"). This pipeline does not try to find a perfect model. It makes the transcript tell you where it is unsure, and it learns from the corrections you make.
+Handwriting OCR fails on the words that matter most: acronyms, product names and people. Over 26 hand-checked pages of real notes, gemma4:26b and qwen3.6:35b-a3b both land around 6% word error rate, 1 to 5% on flowing prose and 10 to 13% on jargon-heavy work notes. Neither model was clearly better, and each made errors that flip meaning, such as a dropped negation or a verb read as its opposite. This pipeline does not try to find a perfect model. It makes the transcript tell you where it is unsure, and it learns from the corrections you make.
 
 **Vocabulary hint.** Put the terms you actually write in `VOCAB_FILE`:
 
 ```text
 # one per line or comma separated
-Okta, Oktane, ISPM, ITDR, OIG, OPA, CIMD, XAA, ID-JAG
-Pulumi, Terraform, LiteLLM, Gartner, Permiso, Verkada
+Kubernetes, Terraform, OAuth, OIDC, SAML, SCIM
+Grafana, Prometheus, PostgreSQL, Redis, Kafka
 ```
 
-The prompt then asks the model to use those spellings when a word is ambiguous, and to write arrows as plain `->`. Measured on 16 jargon-heavy pages: WER 9.6% to 8.6% (gemma4:26b) and 8.5% to 7.8% (qwen3.6:35b-a3b), no speed cost. It pulls near misses toward listed terms (CIMD became SCIM when only SCIM was listed), so list your full working vocabulary rather than a sample.
+The prompt then asks the model to use those spellings when a word is ambiguous, and to write arrows as plain `->`. Measured on 16 jargon-heavy pages: WER 9.6% to 8.6% (gemma4:26b) and 8.5% to 7.8% (qwen3.6:35b-a3b), no speed cost. It pulls near misses toward listed terms (an acronym missing from the list was rewritten as a similar listed one), so list your full working vocabulary rather than a sample.
 
 **Dual read.** With `VERIFY_MODEL` set, every page (or every page under `VERIFY_PATHS`) is transcribed a second time and the two readings are aligned word by word. Where they agree the text stands. Where they differ, the span is written as a highlight:
 
 ```markdown
-We moved the ==CIMD|SCIM== metadata into the ==Serval|Several== workflow.
+We moved the ==OIDC|OLDC== config into the ==Grafana|Granada== dashboard.
 ```
 
 Obsidian renders `==text==` as a highlight, so reviewing a transcript means reading the highlights. The first reading is the primary model's, the second is the verify model's, and `?` means that reading had nothing there. Frontmatter records `verify_model` and `verify_flagged`.

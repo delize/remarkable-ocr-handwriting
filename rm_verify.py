@@ -271,8 +271,9 @@ def vocab_hint(terms):
 
     Measured on 16 jargon-heavy pages: WER 9.6% -> 8.6% (gemma4:26b) and
     8.5% -> 7.8% (qwen3.6:35b-a3b) at no speed cost. It pulls near misses
-    toward listed terms (CIMD became SCIM when only SCIM was listed), so the
-    list works best when it is the writer's full working vocabulary.
+    toward listed terms (an acronym missing from the list was rewritten as a
+    similar listed one), so the list works best when it is the writer's full
+    working vocabulary.
     """
     if not terms:
         return ""

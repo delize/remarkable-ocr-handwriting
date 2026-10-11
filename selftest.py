@@ -978,12 +978,12 @@ def main():
     import rm_eval
     import rm_verify
 
-    a = "We use Palantir with GH Actions and the Gartner guide to track CIMD work."
-    b = "We use Pulumi with GH Actions and the gather guide to track CIMD work."
+    a = "We use Granada with GH Actions and the Postgres guide to track OIDC work."
+    b = "We use Grafana with GH Actions and the posters guide to track OIDC work."
     text, st = rm_verify.verify_page(a, b)
     check("verify: disagreements are flagged as ==A|B==",
-          ("==Palantir|Pulumi==" in text, "==Gartner|gather==" in text), (True, True))
-    check("verify: agreed words are untouched", text.startswith("We use ") and "CIMD work." in text, True)
+          ("==Granada|Grafana==" in text, "==Postgres|posters==" in text), (True, True))
+    check("verify: agreed words are untouched", text.startswith("We use ") and "OIDC work." in text, True)
     check("verify: stats count spans and flags", (st["spans"], st["flagged"]), (2, 2))
     check("verify: formatting-only differences are not flagged",
           rm_verify.verify_page("see Claude/OpenAI docs", "see Claude / Open AI docs")[1]["spans"], 0)
@@ -994,7 +994,7 @@ def main():
     fixed, st = rm_verify.verify_page(a, b, resolver=lambda spans: {"answers": [
         {"id": 1, "choice": "B"}, {"id": 2, "choice": "A"}]})
     check("verify: resolver choices are applied",
-          fixed, "We use Pulumi with GH Actions and the Gartner guide to track CIMD work.")
+          fixed, "We use Grafana with GH Actions and the Postgres guide to track OIDC work.")
     check("verify: resolved counts", (st["resolved_a"], st["resolved_b"], st["flagged"]), (1, 1, 0))
     ins, _ = rm_verify.verify_page("engine. At the very least", "engine. Or at the very least",
                                    resolver=lambda s: {"answers": [{"id": 1, "choice": "B"}]})
@@ -1010,35 +1010,35 @@ def main():
           rm_verify.strip_marks("x ==?|Or== at", side="b"), "x Or at")
 
     corr = rm_verify.diff_corrections(
-        "Look at the ==CIMD|SCIM== data. We use Palantir daily.",
-        "Look at the CIMD data. We use Pulumi daily.")
+        "Look at the ==OIDC|OLDC== data. We use Granada daily.",
+        "Look at the OIDC data. We use Grafana daily.")
     check("harvest: corrections pair what was written with the edit",
-          [(c["before"], c["after"]) for c in corr], [("==CIMD|SCIM==", "CIMD"), ("Palantir", "Pulumi")])
-    check("harvest: term-like words are extracted", [c["terms"] for c in corr], [["CIMD"], ["Pulumi"]])
+          [(c["before"], c["after"]) for c in corr], [("==OIDC|OLDC==", "OIDC"), ("Granada", "Grafana")])
+    check("harvest: term-like words are extracted", [c["terms"] for c in corr], [["OIDC"], ["Grafana"]])
     check("harvest: a sentence-start capital is not a term",
-          rm_verify.diff_corrections("Lustly there is", "Lastly there is")[0]["terms"], [])
+          rm_verify.diff_corrections("Fistly there is", "Firstly there is")[0]["terms"], [])
     check("harvest: a case-only change is not a correction",
           rm_verify.diff_corrections("with GH actions", "with GH Actions"), [])
 
     lv = rm_verify.LearnedVocab(tmp / "lv-test.json", min_count=2)
-    lv.record("Pulumi", "a#1")
-    lv.record("Pulumi", "a#1")
+    lv.record("Grafana", "a#1")
+    lv.record("Grafana", "a#1")
     check("learned vocab: the same place counts once", lv.candidates(), [])
-    lv.record("Pulumi", "b#2")
-    check("learned vocab: two places make a candidate", lv.candidates(), ["Pulumi"])
-    lv.reject(["Pulumi"])
+    lv.record("Grafana", "b#2")
+    check("learned vocab: two places make a candidate", lv.candidates(), ["Grafana"])
+    lv.reject(["Grafana"])
     check("learned vocab: a rejected term is not retried", lv.candidates(), [])
 
     check("vocab: parse_terms splits commas, newlines and drops comments and duplicates",
-          rm_verify.parse_terms("Okta, ISPM  # identity\nPulumi,okta\n"), ["Okta", "ISPM", "Pulumi"])
-    check("vocab: the hint lists the terms", "Okta, ISPM." in rm_verify.vocab_hint(["Okta", "ISPM"]), True)
+          rm_verify.parse_terms("Grafana, OIDC  # identity\nPrometheus,grafana\n"), ["Grafana", "OIDC", "Prometheus"])
+    check("vocab: the hint lists the terms", "Grafana, OIDC." in rm_verify.vocab_hint(["Grafana", "OIDC"]), True)
     check("vocab: no terms means no hint", rm_verify.vocab_hint([]), "")
 
-    s = rm_eval.score("We use Pulumi daily", "We use Pulumi daily.")
+    s = rm_eval.score("We use Grafana daily", "We use Grafana daily.")
     check("eval: a perfect page scores zero errors", (s["word_errors"], s["char_errors"]), (0, 0))
     check("eval: slash spacing is not an error",
           rm_eval.score("Claude/OpenAI", "Claude / OpenAI")["word_errors"], 0)
-    fs = rm_eval.flag_score("We use ==Palantir|Pulumi== with the gather guide", "We use Pulumi with the Gartner guide")
+    fs = rm_eval.flag_score("We use ==Granada|Grafana== with the posters guide", "We use Grafana with the Postgres guide")
     check("eval: flag_score finds one caught and one missed error", (fs["caught"], fs["diff_errors"]), (1, 2))
     summ = rm_eval.summarize([{"words": 10, "chars": 50, "primary_word_errors": 2, "primary_char_errors": 5,
                                "final_word_errors": 1, "final_char_errors": 2, "seconds": 4,
@@ -1056,8 +1056,8 @@ def main():
     VDIR = tmp / "vault/remarkable/Verify"
     VDIR.mkdir(parents=True, exist_ok=True)
     (tmp / "vault/remarkable/Work/Plain.pdf").write_text("plain-v1")
-    READINGS = {"gemma4:26b": "We use Palantir with GH Actions.",
-                "qwen3.6:35b-a3b": "We use Pulumi with GH Actions."}
+    READINGS = {"gemma4:26b": "We use Granada with GH Actions.",
+                "qwen3.6:35b-a3b": "We use Grafana with GH Actions."}
     prompts = []
 
     def fake_dual(pdf, model, *a, **k):
@@ -1081,12 +1081,12 @@ def main():
         ocr_daemon.scan_once(ocr_daemon.load_manifest())
         frec = ocr_daemon.load_manifest()["remarkable/Verify/Flags.pdf"]
         check("daemon verify: by default a disagreement is written as a flag",
-              "==Palantir|Pulumi==" in ocr_daemon._out_md_path(frec["out_path"]).read_text(), True)
+              "==Granada|Grafana==" in ocr_daemon._out_md_path(frec["out_path"]).read_text(), True)
         ocr_daemon.VERIFY_RESOLVE = True
         prompts.clear()
         (VDIR / "Roadmap.pdf").write_text("roadmap-v1")
         vocab = tmp / "state/vocab.txt"
-        vocab.write_text("Pulumi, GH Actions\n")
+        vocab.write_text("Grafana, GH Actions\n")
         ocr_daemon.VOCAB_FILE = vocab
 
         ocr_daemon.scan_once(ocr_daemon.load_manifest())
@@ -1095,7 +1095,7 @@ def main():
         out_md = ocr_daemon._out_md_path(rec["out_path"])
         md_v = out_md.read_text()
         check("daemon verify: the resolver's choice lands in the transcript",
-              "We use Pulumi with GH Actions." in md_v, True)
+              "We use Grafana with GH Actions." in md_v, True)
         check("daemon verify: frontmatter records the verification",
               ("verify_model: qwen3.6:35b-a3b" in md_v, "verify_resolved: 1" in md_v,
                "verify_flagged: 0" in md_v), (True, True, True))
@@ -1104,22 +1104,22 @@ def main():
         check("daemon verify: VERIFY_PATHS leaves other folders single-read",
               "verify" in man["remarkable/Work/Plain.pdf"], False)
         check("daemon vocab: the hint reaches every OCR call",
-              all("Pulumi, GH Actions." in p for p in prompts), True)
+              all("Grafana, GH Actions." in p for p in prompts), True)
         check("daemon learn: a sidecar records what was written",
               rm_verify.sidecar_path(ocr_daemon.STATE, rec["out_path"]).exists(), True)
 
         # The user fixes page 2 in Obsidian; the next pass harvests it.
-        edited = md_v.replace("Second page agrees.", "Second page agrees with Kontext.")
+        edited = md_v.replace("Second page agrees.", "Second page agrees with Prometheus.")
         out_md.write_text(edited)
         n_h = ocr_daemon.harvest_edits(ocr_daemon.load_manifest())
         check("daemon learn: an edited page is harvested", n_h, 1)
         log_lines = [_json2.loads(x) for x in ocr_daemon.CORRECTIONS_LOG.read_text().splitlines()]
         check("daemon learn: the correction is logged",
-              (log_lines[-1]["page"], log_lines[-1]["after"]), (2, "agrees with Kontext."))
+              (log_lines[-1]["page"], log_lines[-1]["after"]), (2, "agrees with Prometheus."))
         gold = rm_eval.load_goldset(ocr_daemon.GOLDSET_DIR)
         check("daemon learn: the edited page becomes ground truth with its image",
               [(c["page"], c["truth"], c["png"].read_bytes()) for c in gold],
-              [(2, "Second page agrees with Kontext.", b"png")])
+              [(2, "Second page agrees with Prometheus.", b"png")])
         check("daemon learn: an unchanged file is not harvested twice",
               ocr_daemon.harvest_edits(ocr_daemon.load_manifest()), 0)
 
@@ -1128,16 +1128,16 @@ def main():
         ocr_daemon.scan_once(ocr_daemon.load_manifest())
         md_v2 = out_md.read_text()
         check("daemon learn: a re-OCR keeps edits on unchanged pages",
-              "Second page agrees with Kontext." in md_v2, True)
+              "Second page agrees with Prometheus." in md_v2, True)
         check("daemon learn: kept edits are recorded", "kept_edits: 1" in md_v2, True)
         (VDIR / "Roadmap.pdf").write_text("roadmap-v3")
         ocr_daemon.scan_once(ocr_daemon.load_manifest())
         check("daemon learn: ...and keeps them on the re-OCR after that too",
-              "Second page agrees with Kontext." in out_md.read_text(), True)
+              "Second page agrees with Prometheus." in out_md.read_text(), True)
 
         # A learned term becomes active only through the gate.
         lv = rm_verify.LearnedVocab(ocr_daemon.LEARNED_VOCAB)
-        lv.record("Kontext", "other.pdf#1")
+        lv.record("Prometheus", "other.pdf#1")
         lv.save()
         ocr_daemon.USE_LEARNED_VOCAB = True
         ocr_daemon.LEARN_MIN_COUNT = 2
@@ -1147,15 +1147,15 @@ def main():
         rm_eval.gate_terms = saved_gate
         lv = rm_verify.LearnedVocab(ocr_daemon.LEARNED_VOCAB)
         check("daemon gate: a term that makes the eval worse is rejected",
-              (lv.active(), lv.data["rejected"]), ([], ["Kontext"]))
+              (lv.active(), lv.data["rejected"]), ([], ["Prometheus"]))
         lv.data["rejected"] = []
         lv.save()
         ocr_daemon.LEARN_GATE = False
         ocr_daemon.gate_learned_terms()
         check("daemon gate: LEARN_GATE=0 activates candidates directly",
-              rm_verify.LearnedVocab(ocr_daemon.LEARNED_VOCAB).active(), ["Kontext"])
+              rm_verify.LearnedVocab(ocr_daemon.LEARNED_VOCAB).active(), ["Prometheus"])
         check("daemon gate: active learned terms join the hint",
-              "Kontext" in ocr_daemon.current_terms(), True)
+              "Prometheus" in ocr_daemon.current_terms(), True)
     finally:
         for n, v in saved.items():
             setattr(ocr_daemon, n, v)
@@ -1217,10 +1217,10 @@ def main():
             setattr(ocr_daemon, n, v)
 
     # --- pairs: choosing a second reader from saved runs ---
-    truth_p = {"p1": "We use Pulumi with the Gartner guide", "p2": "Lastly the third item"}
-    reads = {"A": {"p1": "We use Palantir with the Gartner guide", "p2": "Lustly the third item"},
-             "B": {"p1": "We use Pulumi with the gather guide", "p2": "Lastly the third item"},
-             "A2": {"p1": "We use Palantir with the Gartner guide", "p2": "Lustly the third item"}}
+    truth_p = {"p1": "We use Grafana with the Postgres guide", "p2": "Firstly the third item"}
+    reads = {"A": {"p1": "We use Granada with the Postgres guide", "p2": "Fistly the third item"},
+             "B": {"p1": "We use Grafana with the posters guide", "p2": "Firstly the third item"},
+             "A2": {"p1": "We use Granada with the Postgres guide", "p2": "Fistly the third item"}}
     table = {(r["primary"], r["verifier"]): r for r in rm_eval.pair_scores(reads, truth_p)}
     check("pairs: a different reader flags the primary's errors",
           table[("A", "B")]["error_recall"], 1.0)
