@@ -1163,6 +1163,7 @@ def main():
             setattr(rm_ocr, n, v)
 
     # --- scheduled quality self-check ---
+    import datetime as _dt
     gold_sc = tmp / "gold-selfcheck"
     for i in range(3):
         rm_verify.write_gold_case(gold_sc, f"sc{i}.pdf", 1, f"truth {i}", b"png")
@@ -1175,7 +1176,9 @@ def main():
                  "hyp_words": 100, "diff_errors": 5, "caught": 3, "seconds": 1,
                  "primary": "x"} for c in cases]
         return {"config": {"model": model, "verify_model": verify_model, "resolve": False},
-                "summary": rm_eval.summarize(rows), "cases": rows, "at": "2026-10-02T03:00:00"}
+                "summary": rm_eval.summarize(rows), "cases": rows,
+                # Now, not a fixed date: the interval check compares against the clock.
+                "at": _dt.datetime.now().isoformat(timespec="seconds")}
 
     saved_sc = {n: getattr(ocr_daemon, n) for n in (
         "GOLDSET_DIR", "EVAL_INTERVAL_DAYS", "EVAL_HISTORY", "EVAL_BASELINE", "VERIFY_MODEL")}
@@ -1229,6 +1232,60 @@ def main():
           sorted(rm_eval.reads_from_runs([{"config": {"model": "m1", "verify_model": "m2"},
                                            "cases": [{"id": "x", "primary": "a", "secondary": "b"}]}])),
           ["m1", "m2"])
+
+    # --- confidence flags: the primary model's own uncertainty ---
+    toks = [("We", 0.0), (" use", 0.0), (" Gran", -0.01), ("ada", -0.4), (" with", 0.0),
+            (" the", 0.0), (" posters", -0.3), (" guide", 0.0)]
+    confs = rm_verify.word_confidences(toks)
+    check("confidence: a word takes its weakest token", confs, [0.0, 0.0, -0.4, 0.0, 0.0, -0.3, 0.0])
+    check("confidence: words below the threshold are flagged",
+          rm_verify.mark_low_confidence("We use Granada with the posters guide", confs, -0.2),
+          ("We use ==Granada|~== with the ==posters|~== guide", 2))
+    check("confidence: words already in a dual-read flag are left alone",
+          rm_verify.mark_low_confidence("We use ==Granada|Grafana== with the posters guide", confs, -0.2),
+          ("We use ==Granada|Grafana== with the ==posters|~== guide", 1))
+    check("confidence: a reshaped page is left unflagged, not misflagged",
+          rm_verify.mark_low_confidence("We use Granada with the posters guide today", confs, -0.2),
+          ("We use Granada with the posters guide today", None))
+    check("confidence: a low-confidence flag resolves to the model's own word",
+          (rm_verify.strip_marks("x ==posters|~== y"), rm_verify.strip_marks("x ==posters|~== y", side="b")),
+          ("x posters y", "x posters y"))
+    sw_run = {"cases": [{"id": "s1", "primary": "We use Granada with the posters guide",
+                         "primary_confs": confs, "secondary": "We use Grafana with the posters guide"}]}
+    sw = {r["threshold"]: r for r in rm_eval.sweep(sw_run, {"s1": "We use Grafana with the Postgres guide"},
+                                                  [None, -0.2])}
+    check("sweep: dual read alone catches only the error the readers disagree on",
+          sw[None]["error_recall"], 0.5)
+    check("sweep: confidence flags add the error both readers shared", sw[-0.2]["error_recall"], 1.0)
+
+    def fake_conf(pdf, model, *a, confidence_out=None, **k):
+        if confidence_out is not None:
+            confidence_out[1] = confs
+        return [(1, "We use Granada with the posters guide")]
+
+    saved_cf = {n: getattr(ocr_daemon, n) for n in ("ocr_pdf", "CONFIDENCE_THRESHOLD", "VERIFY_MODEL")}
+    try:
+        ocr_daemon.ocr_pdf = fake_conf
+        ocr_daemon.VERIFY_MODEL = ""
+        ocr_daemon.CONFIDENCE_THRESHOLD = -0.2
+        (tmp / "vault/remarkable/Work/Conf.pdf").write_text("conf-v1")
+        ocr_daemon.scan_once(ocr_daemon.load_manifest())
+        crec = ocr_daemon.load_manifest()["remarkable/Work/Conf.pdf"]
+        cmd = ocr_daemon._out_md_path(crec["out_path"]).read_text()
+        check("daemon confidence: low-confidence words are flagged in the transcript",
+              "We use ==Granada|~== with the ==posters|~== guide" in cmd, True)
+        check("daemon confidence: frontmatter and manifest record the count",
+              ("confidence_flagged: 2" in cmd, crec["confidence"]["flagged"]), (True, 2))
+        ocr_daemon.CONFIDENCE_THRESHOLD = None
+        (tmp / "vault/remarkable/Work/Conf.pdf").write_text("conf-v2")
+        ocr_daemon.scan_once(ocr_daemon.load_manifest())
+        crec = ocr_daemon.load_manifest()["remarkable/Work/Conf.pdf"]
+        check("daemon confidence: off by default, no flags written",
+              ("|~==" in ocr_daemon._out_md_path(crec["out_path"]).read_text(), "confidence" in crec),
+              (False, False))
+    finally:
+        for n, v in saved_cf.items():
+            setattr(ocr_daemon, n, v)
 
     # --- local-only guard: page images never go to a public host ---
     for url in ("http://127.0.0.1:11434", "http://192.168.50.2:11434", "http://10.0.0.5",

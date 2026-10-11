@@ -205,15 +205,20 @@ def export(cases, out_dir, holdout=0.25, prompt=None):
 # ---------------------------------------------------------------------------
 # Running a configuration
 # ---------------------------------------------------------------------------
-def _transcribe_all(cases, model, prompt_extra, cfg, log):
+def _transcribe_all(cases, model, prompt_extra, cfg, log, confidences=None):
+    """``{case_id: (text, seconds)}``; fills ``confidences[case_id]`` when given a dict."""
     import rm_ocr
     out = {}
     for c in cases:
         t0 = time.time()
         img = base64.b64encode(c["png"].read_bytes()).decode()
+        conf = [] if confidences is not None else None
         out[c["id"]] = (rm_ocr.ocr_image_b64(img, model, timeout=cfg["timeout"], no_think=True,
-                                             num_ctx=cfg["num_ctx"], prompt_extra=prompt_extra),
+                                             num_ctx=cfg["num_ctx"], prompt_extra=prompt_extra,
+                                             confidence_out=conf),
                         time.time() - t0)
+        if confidences is not None:
+            confidences[c["id"]] = conf
         log(f"  {model} {c['id']} {out[c['id']][1]:.0f}s")
     return out
 
@@ -227,12 +232,19 @@ def _unload(model, log):
 
 
 def run(cases, *, model, verify_model="", resolve=False, resolve_model="", terms=(),
-        timeout=1800, num_ctx=16384, max_span_words=6, log=print):
-    """Score one configuration. Models run in stages so a CPU host holds one at a time."""
+        timeout=1800, num_ctx=16384, max_span_words=6, confidence_threshold=None, log=print):
+    """Score one configuration. Models run in stages so a CPU host holds one at a time.
+
+    With ``confidence_threshold`` the primary model's word confidences are
+    recorded (``primary_confs`` per case, reusable by ``sweep``) and its
+    low-confidence words are flagged on top of any dual-read flags, exactly as
+    the daemon does.
+    """
     import rm_ocr
     cfg = {"timeout": timeout, "num_ctx": num_ctx}
     hint = rm_verify.vocab_hint(list(terms))
-    primary = _transcribe_all(cases, model, hint, cfg, log)
+    confs = {} if confidence_threshold is not None else None
+    primary = _transcribe_all(cases, model, hint, cfg, log, confidences=confs)
     secondary = {}
     if verify_model:
         _unload(model, log)
@@ -269,13 +281,21 @@ def run(cases, *, model, verify_model="", resolve=False, resolve_model="", terms
                 # resolution adds over flagging.
                 flagged_only, _ = rm_verify.verify_page(text, b_text, max_span_words=max_span_words)
                 row["flags_only"] = flag_score(flagged_only, c["truth"])
+        if confs is not None:
+            base = row.get("final", text)
+            marked, _ = rm_verify.mark_low_confidence(base, confs.get(c["id"]), confidence_threshold)
+            f = score(marked, c["truth"])
+            row.update(final_word_errors=f["word_errors"], final_char_errors=f["char_errors"],
+                       **flag_score(marked, c["truth"]), final=marked,
+                       primary_confs=confs.get(c["id"]))
         row["primary"] = text
         if verify_model:
             row["secondary"] = b_text
         results.append(row)
     config = {"model": model, "verify_model": verify_model, "resolve": bool(resolve),
               "resolve_model": resolver_model if resolve else "", "terms": len(terms),
-              "num_ctx": num_ctx, "max_span_words": max_span_words}
+              "num_ctx": num_ctx, "max_span_words": max_span_words,
+              "confidence_threshold": confidence_threshold}
     return {"config": config, "summary": summarize(results), "cases": results,
             "at": datetime.datetime.now().isoformat(timespec="seconds")}
 
@@ -352,6 +372,35 @@ def pair_scores(reads, truth, max_span_words=6):
     return sorted(out, key=lambda r: (r["review_wer"] is None, r["review_wer"]))
 
 
+def sweep(run, truth, thresholds, max_span_words=6):
+    """Re-score saved readings at several confidence thresholds, without calling a model.
+
+    Uses each case's ``primary_confs`` (and ``secondary`` when the run had a
+    verify model), so a threshold can be re-tuned from corrections as the
+    ground-truth set grows.
+    """
+    out = []
+    for t in thresholds:
+        rows = []
+        for c in run["cases"]:
+            if c["id"] not in truth or c.get("primary_confs") is None:
+                continue
+            base = c["primary"]
+            if c.get("secondary") is not None:
+                base, _ = rm_verify.verify_page(base, c["secondary"], max_span_words=max_span_words)
+            if t is not None:
+                base, _ = rm_verify.mark_low_confidence(base, c["primary_confs"], t)
+            s = score(c["primary"], truth[c["id"]])
+            rows.append({"words": s["words"], "chars": s["chars"], "seconds": 0,
+                         "primary_word_errors": s["word_errors"],
+                         "primary_char_errors": s["char_errors"],
+                         "final_word_errors": s["word_errors"], "final_char_errors": s["char_errors"],
+                         **flag_score(base, truth[c["id"]])})
+        if rows:
+            out.append({"threshold": t, **summarize(rows)})
+    return out
+
+
 def compare(paths):
     runs = [json.loads(pathlib.Path(p).read_text()) for p in paths]
     width = max(len(pathlib.Path(p).name) for p in paths)
@@ -386,6 +435,8 @@ def main():
     r.add_argument("--num-ctx", type=int, default=16384)
     r.add_argument("--timeout", type=int, default=1800)
     r.add_argument("--max-span-words", type=int, default=6)
+    r.add_argument("--confidence-threshold", type=float, default=None,
+                   help="Flag the primary model's words below this log-probability (e.g. -0.2)")
     r.add_argument("--limit", type=int, default=0, help="Score only the first N pages")
     r.add_argument("--include-flagged", action="store_true",
                    help="Also score edited pages that still carry unresolved flags")
@@ -398,6 +449,12 @@ def main():
     c.add_argument("runs", nargs="+")
     c.add_argument("--gate", action="store_true",
                    help="Exit 1 unless the last run's final (or primary) CER beats the first's")
+
+    sw = sub.add_parser("sweep", help="Re-score a saved run at several confidence thresholds")
+    sw.add_argument("run")
+    sw.add_argument("--goldset", default=os.environ.get("GOLDSET_DIR", "/state/goldset"))
+    sw.add_argument("--thresholds", default="none,-0.5,-0.2,-0.1,-0.05",
+                    help="Comma-separated; 'none' scores dual-read flags alone")
 
     pr = sub.add_parser("pairs", help="Score every model pair as dual read from saved runs")
     pr.add_argument("runs", nargs="+")
@@ -437,7 +494,8 @@ def main():
             sys.exit(f"no ground-truth pages in {args.goldset}")
         result = run(cases, model=args.model, verify_model=args.verify_model, resolve=args.resolve,
                      resolve_model=args.resolve_model, terms=_terms_from(args), timeout=args.timeout,
-                     num_ctx=args.num_ctx, max_span_words=args.max_span_words)
+                     num_ctx=args.num_ctx, max_span_words=args.max_span_words,
+                     confidence_threshold=args.confidence_threshold)
         rm_verify.save_json(args.out, result)
         if args.history:
             with open(args.history, "a") as f:
@@ -451,6 +509,15 @@ def main():
                 return s.get("final_cer") if s.get("final_cer") is not None else s.get("primary_cer")
             first, last = cer(runs[0]["summary"]), cer(runs[-1]["summary"])
             sys.exit(0 if first is not None and last is not None and last < first else 1)
+    elif args.cmd == "sweep":
+        run_data = json.loads(pathlib.Path(args.run).read_text())
+        truth = {c["id"]: c["truth"] for c in load_goldset(args.goldset, include_flagged=True)}
+        ts = [None if x.strip().lower() == "none" else float(x) for x in args.thresholds.split(",")]
+        print(f"{'threshold':>10}{'pages':>7}{'flag_rate':>11}{'error_recall':>14}{'review_wer':>12}")
+        for r in sweep(run_data, truth, ts):
+            label = "none" if r["threshold"] is None else f"{r['threshold']:g}"
+            print(f"{label:>10}{r['cases']:>7}{_fmt('flag_rate', r['flag_rate']):>11}"
+                  f"{_fmt('error_recall', r['error_recall']):>14}{_fmt('review_wer', r['review_wer']):>12}")
     elif args.cmd == "pairs":
         runs = [json.loads(pathlib.Path(x).read_text()) for x in args.runs]
         truth = {c["id"]: c["truth"] for c in load_goldset(args.goldset, include_flagged=True)}
