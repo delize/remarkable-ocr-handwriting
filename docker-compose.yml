@@ -27,6 +27,11 @@ services:
     container_name: rm-ocr
     restart: unless-stopped
     env_file: .env
+    # Run as an unprivileged user that owns the state and output volumes, with
+    # no Linux capabilities and no privilege escalation. The daemon needs none.
+    user: "${PUID:-1000}:${PGID:-1000}"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     environment:
       VAULT_DIR: /vault
       SOURCE_SUBDIR: remarkable
@@ -41,6 +46,7 @@ services:
       # VOCAB_FILE: /state/vocab.txt            # your terms, used when the file exists
       # VERIFY_MODEL: qwen3.6:35b-a3b           # second reader, flags disagreements as ==A|B==
       # VERIFY_PATHS: "Work,Meeting Notes"      # limit dual read to these folders (empty = all)
+      # CONFIDENCE_THRESHOLD: "-0.2"            # also flag words the primary model was unsure of
       # USE_LEARNED_VOCAB: "1"                  # learn terms from your edits, eval-gated
       # EVAL_INTERVAL_DAYS: "7"                 # weekly quality self-check against the ground truth
       STATE_DIR: /state

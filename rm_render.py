@@ -86,6 +86,11 @@ IMAGE_AUTOCONTRAST = os.environ.get("IMAGE_AUTOCONTRAST", "1").strip().lower() n
 # Percent of the histogram clipped at each end before stretching. Too large and
 # genuine light-grey pencil gets crushed to white along with the paper.
 IMAGE_AUTOCONTRAST_CUTOFF = float(os.environ.get("IMAGE_AUTOCONTRAST_CUTOFF", "0.5"))
+# A bundle is extracted whole before rendering. These bound what one archive
+# may expand to, so a damaged or hostile file cannot fill the disk or memory.
+# A real notebook is a few MB and a few hundred members.
+MAX_BUNDLE_BYTES = int(float(os.environ.get("MAX_BUNDLE_MB", "512")) * 1024 * 1024)
+MAX_BUNDLE_MEMBERS = int(os.environ.get("MAX_BUNDLE_MEMBERS", "5000"))
 
 
 class RenderResult(NamedTuple):
@@ -259,11 +264,33 @@ def _read_visible_name(src):
         return None
 
 
+def check_bundle(z):
+    """Refuse a bundle that would extract outside its folder or beyond the size limits.
+
+    ``zipfile`` already strips absolute paths and ``..`` on extraction, so the
+    path check is a loud refusal rather than the only defence. Raises
+    ValueError with the reason.
+    """
+    infos = z.infolist()
+    if len(infos) > MAX_BUNDLE_MEMBERS:
+        raise ValueError(f"bundle has {len(infos)} members, over MAX_BUNDLE_MEMBERS={MAX_BUNDLE_MEMBERS}")
+    total = 0
+    for info in infos:
+        parts = pathlib.PurePosixPath(info.filename).parts
+        if info.filename.startswith(("/", "\\")) or ".." in parts or (parts and ":" in parts[0]):
+            raise ValueError(f"bundle member escapes its folder: {info.filename!r}")
+        total += info.file_size
+    if total > MAX_BUNDLE_BYTES:
+        raise ValueError(f"bundle expands to {total / 1048576:.0f} MB, over "
+                         f"MAX_BUNDLE_MB={MAX_BUNDLE_BYTES // 1048576}")
+
+
 def _render_zip_bundle(src, workdir, extract_regions=False):
     """Extract a `.zip`/`.rmdoc`, render each `.rm` page, return (merged PDF, page_regions)."""
     ex = workdir / "bundle"
     ex.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(src) as z:
+        check_bundle(z)
         z.extractall(ex)
     content = next(ex.glob("*.content"), None)
     page_dir = content.with_suffix("") if content else ex

@@ -73,6 +73,12 @@ repeat-prevention design.
 
 ## Safety guarantees (enforced in code)
 
+- The daemon never treats its own files as notes. Anything under `STATE_DIR` or `OUT_DIR`, and anything in a hidden folder (`.obsidian`, `.trash`, a state dir kept inside the vault), is excluded from scanning and from the inotify watch.
+- Transcripts, the manifest and daily-note embeds are written to a temp file and renamed, so a crash or a full disk never leaves a truncated file for Obsidian or its sync to pick up.
+- A manifest that exists but cannot be loaded stops the daemon. Starting from an empty one would re-transcribe every recent note and overwrite hand-corrected transcripts.
+- One instance per `STATE_DIR`: an advisory lock on `daemon.lock` makes a second daemon or a racing cron `--scan` exit with a message instead of fighting over the manifest.
+- Bundles are refused if they would extract beyond `MAX_BUNDLE_MB` (512) or `MAX_BUNDLE_MEMBERS` (5000), or contain a member whose name points outside the folder.
+- Every page is capped at `NUM_PREDICT` tokens (4096), and a page cut off by that cap or by the context window carries a visible marker in the transcript.
 - Handwriting never leaves your machines. At startup the daemon, the CLI and `rm_eval.py` resolve the model host and refuse to run if any address it resolves to is public. Loopback, private LAN ranges, link-local, `100.64.0.0/10` (Tailscale) and any subnet directly attached to the machine count as local. The last one matters for Docker with IPv6 on a delegated prefix, where the Ollama container gets a globally routable address on the same bridge. On systems without Linux's `/proc/net` route tables, list such networks in `LOCAL_MODEL_NETS`. `ALLOW_REMOTE_MODEL_HOST=1` downgrades the refusal to a warning, for a deployment that knowingly runs its model elsewhere.
 - The vault is mounted **fully read-only** (default); transcripts go to a separate
   `OUT_DIR` volume, so nothing is ever written back into the vault.
@@ -84,6 +90,8 @@ repeat-prevention design.
   you run both tools on the same host) — in every mode.
 - A malformed PDF logs an error, increments a capped retry counter, and the batch
   continues.
+
+**Trust boundary.** Everything under `SOURCE_SUBDIR` is treated as the owner's own writing and handed to poppler, PyMuPDF, `rmc` and Inkscape. Whatever can place a file there (the sync tool and the cloud behind it) gets to exercise those parsers as the container user, so run the container unprivileged (the example compose sets `user`, drops all capabilities and sets `no-new-privileges`). The local-only guard checks where the model host resolves at startup. It cannot see a LAN host that forwards traffic elsewhere.
 
 ## Prerequisites
 
@@ -191,6 +199,9 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `TIMEOUT` | `1800` | Per-page socket timeout |
 | `VISION_CHECK` | `1` | Startup gate: prove the model actually **receives** the images. A runner that drops them makes the model invent a fluent transcript that looks successful. See [The vision gate](#the-vision-gate) |
 | `VISION_CHECK_MIN_TOKENS` | `64` | Minimum extra prompt tokens a 1024×1024 image must cost over a 64×64 one. Measured growth: `qwen3.5:9b` +1015, `gemma4:26b` +207; a runner that drops images stays flat |
+| `NUM_PREDICT` | `4096` | Most tokens the model may generate for one page (`0` = no cap). Bounds a model stuck repeating itself, and a page that hits it is marked as cut off |
+| `MAX_BUNDLE_MB` | `512` | Refuse a `.zip`/`.rmdoc` that would extract to more than this |
+| `MAX_BUNDLE_MEMBERS` | `5000` | Refuse a bundle with more members than this |
 | `NUM_CTX` | `0` | Model context window in tokens (`0` = Ollama's default of 4096). A page image alone costs ~1800, so a model that reasons first can run out and return **nothing**. **Set `16384` for real handwriting** — dense pages exhaust 4096 even with `IMAGE_AUTOCONTRAST` on. Costs VRAM |
 | `ALLOW_REMOTE_MODEL_HOST` | `0` | `1` = allow a model host that resolves to a public address (warns instead of refusing). Leave off to keep every page on your own network |
 | `LOCAL_MODEL_NETS` | _(empty)_ | Extra CIDRs the local-only guard treats as local, comma separated. Linux reads directly attached subnets from the kernel, so this is rarely needed there |
@@ -224,6 +235,7 @@ read the build brief before touching `MODEL`, `NO_THINK`, `THREADS`, or `MAX_PX`
 | `VOCAB_FILE` | `$STATE_DIR/vocab.txt` | Your own terms (comma or newline separated, `#` comments). When the file exists, the prompt asks the model to prefer these spellings for ambiguous words. See [Self-checking transcripts](#self-checking-transcripts) |
 | `VERIFY_MODEL` | _(empty)_ | Second vision model. Each page is read twice and disagreements are flagged as `==A\|B==`. Roughly doubles OCR time |
 | `VERIFY_PATHS` | _(empty)_ | Comma-separated folders under `SOURCE_SUBDIR` to verify (e.g. `Work,Meeting Notes`). Empty = everything |
+| `CONFIDENCE_THRESHOLD` | _(empty)_ | Flag the primary model's own low-confidence words as `==word\|~==` (log-probability of the weakest token below this value, e.g. `-0.2`). Comes with the normal read, no extra model call. Empty = off. See [Confidence flags](#confidence-flags) |
 | `VERIFY_RESOLVE` | `0` | `1` = ask a model to settle each disagreement against the page image instead of flagging it. Not recommended: measured barely better than chance, ~90 s extra per page, and it removes the flags |
 | `RESOLVE_MODEL` | `$VERIFY_MODEL` | Model that answers the resolution questions |
 | `VERIFY_MAX_SPAN_WORDS` | `6` | Longer disagreements are layout differences (a diagram read in another order), not misreads, and are left alone |
@@ -568,22 +580,22 @@ so with an external `OUT_DIR` the embed is skipped with a warning.
 
 ### Self-checking transcripts
 
-Handwriting OCR fails on the words that matter most: acronyms, product names and people. Over 26 hand-checked pages of real notes, gemma4:26b and qwen3.6:35b-a3b both land around 6% word error rate, 1 to 5% on flowing prose and 10 to 13% on jargon-heavy work notes. Neither model was clearly better, and each made errors that flip meaning ("can't" read as "can", "understand" as "misunderstood"). This pipeline does not try to find a perfect model. It makes the transcript tell you where it is unsure, and it learns from the corrections you make.
+Handwriting OCR fails on the words that matter most: acronyms, product names and people. Over 26 hand-checked pages of real notes, gemma4:26b and qwen3.6:35b-a3b both land around 6% word error rate, 1 to 5% on flowing prose and 10 to 13% on jargon-heavy work notes. Neither model was clearly better, and each made errors that flip meaning, such as a dropped negation or a verb read as its opposite. This pipeline does not try to find a perfect model. It makes the transcript tell you where it is unsure, and it learns from the corrections you make.
 
 **Vocabulary hint.** Put the terms you actually write in `VOCAB_FILE`:
 
 ```text
 # one per line or comma separated
-Okta, Oktane, ISPM, ITDR, OIG, OPA, CIMD, XAA, ID-JAG
-Pulumi, Terraform, LiteLLM, Gartner, Permiso, Verkada
+Kubernetes, Terraform, OAuth, OIDC, SAML, SCIM
+Grafana, Prometheus, PostgreSQL, Redis, Kafka
 ```
 
-The prompt then asks the model to use those spellings when a word is ambiguous, and to write arrows as plain `->`. Measured on 16 jargon-heavy pages: WER 9.6% to 8.6% (gemma4:26b) and 8.5% to 7.8% (qwen3.6:35b-a3b), no speed cost. It pulls near misses toward listed terms (CIMD became SCIM when only SCIM was listed), so list your full working vocabulary rather than a sample.
+The prompt then asks the model to use those spellings when a word is ambiguous, and to write arrows as plain `->`. Measured on 16 jargon-heavy pages: WER 9.6% to 8.6% (gemma4:26b) and 8.5% to 7.8% (qwen3.6:35b-a3b), no speed cost. It pulls near misses toward listed terms (an acronym missing from the list was rewritten as a similar listed one), so list your full working vocabulary rather than a sample.
 
 **Dual read.** With `VERIFY_MODEL` set, every page (or every page under `VERIFY_PATHS`) is transcribed a second time and the two readings are aligned word by word. Where they agree the text stands. Where they differ, the span is written as a highlight:
 
 ```markdown
-We moved the ==CIMD|SCIM== metadata into the ==Serval|Several== workflow.
+We moved the ==OIDC|OLDC== config into the ==Grafana|Granada== dashboard.
 ```
 
 Obsidian renders `==text==` as a highlight, so reviewing a transcript means reading the highlights. The first reading is the primary model's, the second is the verify model's, and `?` means that reading had nothing there. Frontmatter records `verify_model` and `verify_flagged`.
@@ -592,9 +604,21 @@ Measured on 26 hand-checked pages with gemma4:26b as primary, qwen3.6:35b-a3b as
 
 `VERIFY_RESOLVE=1` instead puts each disagreement back to `RESOLVE_MODEL` with the page image as a constrained question (reading A, reading B, the exact text if neither, or unsure). On the same pages it answered 88 of 90 questions, choosing unsure only twice, and its choices were barely better than chance: unattended WER went from 5.4% to 5.1%, at about 90 s more per page, while the flags that make review effective disappeared. It stays available for experiments but is off by default.
 
+**Confidence flags.** Two readers catch the errors they disagree on, but not the ones they make the same way. The primary model's own confidence covers part of that gap at no extra cost: with `CONFIDENCE_THRESHOLD` set, the first read asks Ollama for per-token log-probabilities, and every word whose weakest token falls below the threshold is flagged as `==word|~==` (`~` means the model was unsure and there is no second reading). Words already inside a dual-read flag are left alone. Measured on 26 hand-checked pages with gemma4:26b and qwen3.6:35b-a3b:
+
+| Flags | Words flagged | Errors under a flag | WER after review |
+|---|---|---|---|
+| Dual read only | 4.8% | 59% | 2.1% |
+| Dual read + confidence below -0.5 | 6.0% | 66% | 1.8% |
+| Dual read + confidence below -0.2 | 8.0% | 72% | 1.5% |
+| Dual read + confidence below -0.05 | 10.2% | 79% | 1.1% |
+
+The model is confident even on many of its misreads, so useful thresholds sit just below zero. Use it to add flags, not to decide which pages can skip the second read: almost every page has at least one uncertain word. `rm_eval.py run --confidence-threshold` records each page's word confidences, and `rm_eval.py sweep RUN.json` re-scores a saved run at other thresholds without calling a model, so the threshold can be re-tuned as corrections grow the ground-truth set. Frontmatter records `confidence_flagged`.
+
 **Learning from your edits.** With `LEARN_CORRECTIONS` (on by default) the daemon keeps a sidecar of what it wrote to each transcript. When you fix a transcript in Obsidian, the next pass notices, and:
 
 - logs each correction to `STATE_DIR/corrections.jsonl`,
+- adopts transcripts written before v0.9.0 (no sidecar) as they stand, so edits from then on are tracked too,
 - stores the edited page, with the page image OCR saw, as ground truth under `GOLDSET_DIR`,
 - counts term-like corrections (acronyms, names, words with digits or an inner hyphen or slash) toward a learned vocabulary,
 - and keeps your edit when the source changes later, for every page whose new model output is the same as before. A page that really changed is re-transcribed, and the edited file is saved under `STATE_DIR/superseded/`.

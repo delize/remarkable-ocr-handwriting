@@ -905,18 +905,25 @@ def main():
     finally:
         _urllib_request.urlopen = saved_urlopen2
 
-    # An unreachable/odd server must not block startup — warn and continue.
+    # A probe that cannot run must not fail open: retry, then refuse to start.
+    _boom_calls = {"n": 0}
+
     def _boom(req, timeout=None):
+        _boom_calls["n"] += 1
         raise OSError("connection refused")
 
+    saved_delay = ocr_daemon.VISION_CHECK_RETRY_DELAY
     try:
+        ocr_daemon.VISION_CHECK_RETRY_DELAY = 0
         _urllib_request.urlopen = _boom
         ocr_daemon.assert_model_sees_images("http://x", "unreachable", 64)
-        check("vision gate degrades to a warning when it can't run", True, True)
-    except SystemExit:
-        check("vision gate degrades to a warning when it can't run", False, True)
+        check("vision gate refuses to start when the probe cannot run", False, True)
+    except SystemExit as e:
+        check("vision gate refuses to start when the probe cannot run", "could not run" in str(e), True)
+        check("vision gate retries before refusing", _boom_calls["n"], ocr_daemon.VISION_CHECK_RETRIES)
     finally:
         _urllib_request.urlopen = saved_urlopen2
+        ocr_daemon.VISION_CHECK_RETRY_DELAY = saved_delay
 
     # --- reflow_paragraphs (pure text transform, no model/PIL involved) ---
     check("reflow_paragraphs: joins word-wrapped lines within a paragraph",
@@ -978,12 +985,12 @@ def main():
     import rm_eval
     import rm_verify
 
-    a = "We use Palantir with GH Actions and the Gartner guide to track CIMD work."
-    b = "We use Pulumi with GH Actions and the gather guide to track CIMD work."
+    a = "We use Granada with GH Actions and the Postgres guide to track OIDC work."
+    b = "We use Grafana with GH Actions and the posters guide to track OIDC work."
     text, st = rm_verify.verify_page(a, b)
     check("verify: disagreements are flagged as ==A|B==",
-          ("==Palantir|Pulumi==" in text, "==Gartner|gather==" in text), (True, True))
-    check("verify: agreed words are untouched", text.startswith("We use ") and "CIMD work." in text, True)
+          ("==Granada|Grafana==" in text, "==Postgres|posters==" in text), (True, True))
+    check("verify: agreed words are untouched", text.startswith("We use ") and "OIDC work." in text, True)
     check("verify: stats count spans and flags", (st["spans"], st["flagged"]), (2, 2))
     check("verify: formatting-only differences are not flagged",
           rm_verify.verify_page("see Claude/OpenAI docs", "see Claude / Open AI docs")[1]["spans"], 0)
@@ -994,7 +1001,7 @@ def main():
     fixed, st = rm_verify.verify_page(a, b, resolver=lambda spans: {"answers": [
         {"id": 1, "choice": "B"}, {"id": 2, "choice": "A"}]})
     check("verify: resolver choices are applied",
-          fixed, "We use Pulumi with GH Actions and the Gartner guide to track CIMD work.")
+          fixed, "We use Grafana with GH Actions and the Postgres guide to track OIDC work.")
     check("verify: resolved counts", (st["resolved_a"], st["resolved_b"], st["flagged"]), (1, 1, 0))
     ins, _ = rm_verify.verify_page("engine. At the very least", "engine. Or at the very least",
                                    resolver=lambda s: {"answers": [{"id": 1, "choice": "B"}]})
@@ -1010,35 +1017,35 @@ def main():
           rm_verify.strip_marks("x ==?|Or== at", side="b"), "x Or at")
 
     corr = rm_verify.diff_corrections(
-        "Look at the ==CIMD|SCIM== data. We use Palantir daily.",
-        "Look at the CIMD data. We use Pulumi daily.")
+        "Look at the ==OIDC|OLDC== data. We use Granada daily.",
+        "Look at the OIDC data. We use Grafana daily.")
     check("harvest: corrections pair what was written with the edit",
-          [(c["before"], c["after"]) for c in corr], [("==CIMD|SCIM==", "CIMD"), ("Palantir", "Pulumi")])
-    check("harvest: term-like words are extracted", [c["terms"] for c in corr], [["CIMD"], ["Pulumi"]])
+          [(c["before"], c["after"]) for c in corr], [("==OIDC|OLDC==", "OIDC"), ("Granada", "Grafana")])
+    check("harvest: term-like words are extracted", [c["terms"] for c in corr], [["OIDC"], ["Grafana"]])
     check("harvest: a sentence-start capital is not a term",
-          rm_verify.diff_corrections("Lustly there is", "Lastly there is")[0]["terms"], [])
+          rm_verify.diff_corrections("Fistly there is", "Firstly there is")[0]["terms"], [])
     check("harvest: a case-only change is not a correction",
           rm_verify.diff_corrections("with GH actions", "with GH Actions"), [])
 
     lv = rm_verify.LearnedVocab(tmp / "lv-test.json", min_count=2)
-    lv.record("Pulumi", "a#1")
-    lv.record("Pulumi", "a#1")
+    lv.record("Grafana", "a#1")
+    lv.record("Grafana", "a#1")
     check("learned vocab: the same place counts once", lv.candidates(), [])
-    lv.record("Pulumi", "b#2")
-    check("learned vocab: two places make a candidate", lv.candidates(), ["Pulumi"])
-    lv.reject(["Pulumi"])
+    lv.record("Grafana", "b#2")
+    check("learned vocab: two places make a candidate", lv.candidates(), ["Grafana"])
+    lv.reject(["Grafana"])
     check("learned vocab: a rejected term is not retried", lv.candidates(), [])
 
     check("vocab: parse_terms splits commas, newlines and drops comments and duplicates",
-          rm_verify.parse_terms("Okta, ISPM  # identity\nPulumi,okta\n"), ["Okta", "ISPM", "Pulumi"])
-    check("vocab: the hint lists the terms", "Okta, ISPM." in rm_verify.vocab_hint(["Okta", "ISPM"]), True)
+          rm_verify.parse_terms("Grafana, OIDC  # identity\nPrometheus,grafana\n"), ["Grafana", "OIDC", "Prometheus"])
+    check("vocab: the hint lists the terms", "Grafana, OIDC." in rm_verify.vocab_hint(["Grafana", "OIDC"]), True)
     check("vocab: no terms means no hint", rm_verify.vocab_hint([]), "")
 
-    s = rm_eval.score("We use Pulumi daily", "We use Pulumi daily.")
+    s = rm_eval.score("We use Grafana daily", "We use Grafana daily.")
     check("eval: a perfect page scores zero errors", (s["word_errors"], s["char_errors"]), (0, 0))
     check("eval: slash spacing is not an error",
           rm_eval.score("Claude/OpenAI", "Claude / OpenAI")["word_errors"], 0)
-    fs = rm_eval.flag_score("We use ==Palantir|Pulumi== with the gather guide", "We use Pulumi with the Gartner guide")
+    fs = rm_eval.flag_score("We use ==Granada|Grafana== with the posters guide", "We use Grafana with the Postgres guide")
     check("eval: flag_score finds one caught and one missed error", (fs["caught"], fs["diff_errors"]), (1, 2))
     summ = rm_eval.summarize([{"words": 10, "chars": 50, "primary_word_errors": 2, "primary_char_errors": 5,
                                "final_word_errors": 1, "final_char_errors": 2, "seconds": 4,
@@ -1056,8 +1063,8 @@ def main():
     VDIR = tmp / "vault/remarkable/Verify"
     VDIR.mkdir(parents=True, exist_ok=True)
     (tmp / "vault/remarkable/Work/Plain.pdf").write_text("plain-v1")
-    READINGS = {"gemma4:26b": "We use Palantir with GH Actions.",
-                "qwen3.6:35b-a3b": "We use Pulumi with GH Actions."}
+    READINGS = {"gemma4:26b": "We use Granada with GH Actions.",
+                "qwen3.6:35b-a3b": "We use Grafana with GH Actions."}
     prompts = []
 
     def fake_dual(pdf, model, *a, **k):
@@ -1081,12 +1088,12 @@ def main():
         ocr_daemon.scan_once(ocr_daemon.load_manifest())
         frec = ocr_daemon.load_manifest()["remarkable/Verify/Flags.pdf"]
         check("daemon verify: by default a disagreement is written as a flag",
-              "==Palantir|Pulumi==" in ocr_daemon._out_md_path(frec["out_path"]).read_text(), True)
+              "==Granada|Grafana==" in ocr_daemon._out_md_path(frec["out_path"]).read_text(), True)
         ocr_daemon.VERIFY_RESOLVE = True
         prompts.clear()
         (VDIR / "Roadmap.pdf").write_text("roadmap-v1")
         vocab = tmp / "state/vocab.txt"
-        vocab.write_text("Pulumi, GH Actions\n")
+        vocab.write_text("Grafana, GH Actions\n")
         ocr_daemon.VOCAB_FILE = vocab
 
         ocr_daemon.scan_once(ocr_daemon.load_manifest())
@@ -1095,7 +1102,7 @@ def main():
         out_md = ocr_daemon._out_md_path(rec["out_path"])
         md_v = out_md.read_text()
         check("daemon verify: the resolver's choice lands in the transcript",
-              "We use Pulumi with GH Actions." in md_v, True)
+              "We use Grafana with GH Actions." in md_v, True)
         check("daemon verify: frontmatter records the verification",
               ("verify_model: qwen3.6:35b-a3b" in md_v, "verify_resolved: 1" in md_v,
                "verify_flagged: 0" in md_v), (True, True, True))
@@ -1104,22 +1111,22 @@ def main():
         check("daemon verify: VERIFY_PATHS leaves other folders single-read",
               "verify" in man["remarkable/Work/Plain.pdf"], False)
         check("daemon vocab: the hint reaches every OCR call",
-              all("Pulumi, GH Actions." in p for p in prompts), True)
+              all("Grafana, GH Actions." in p for p in prompts), True)
         check("daemon learn: a sidecar records what was written",
               rm_verify.sidecar_path(ocr_daemon.STATE, rec["out_path"]).exists(), True)
 
         # The user fixes page 2 in Obsidian; the next pass harvests it.
-        edited = md_v.replace("Second page agrees.", "Second page agrees with Kontext.")
+        edited = md_v.replace("Second page agrees.", "Second page agrees with Prometheus.")
         out_md.write_text(edited)
         n_h = ocr_daemon.harvest_edits(ocr_daemon.load_manifest())
         check("daemon learn: an edited page is harvested", n_h, 1)
         log_lines = [_json2.loads(x) for x in ocr_daemon.CORRECTIONS_LOG.read_text().splitlines()]
         check("daemon learn: the correction is logged",
-              (log_lines[-1]["page"], log_lines[-1]["after"]), (2, "agrees with Kontext."))
+              (log_lines[-1]["page"], log_lines[-1]["after"]), (2, "agrees with Prometheus."))
         gold = rm_eval.load_goldset(ocr_daemon.GOLDSET_DIR)
         check("daemon learn: the edited page becomes ground truth with its image",
               [(c["page"], c["truth"], c["png"].read_bytes()) for c in gold],
-              [(2, "Second page agrees with Kontext.", b"png")])
+              [(2, "Second page agrees with Prometheus.", b"png")])
         check("daemon learn: an unchanged file is not harvested twice",
               ocr_daemon.harvest_edits(ocr_daemon.load_manifest()), 0)
 
@@ -1128,16 +1135,16 @@ def main():
         ocr_daemon.scan_once(ocr_daemon.load_manifest())
         md_v2 = out_md.read_text()
         check("daemon learn: a re-OCR keeps edits on unchanged pages",
-              "Second page agrees with Kontext." in md_v2, True)
+              "Second page agrees with Prometheus." in md_v2, True)
         check("daemon learn: kept edits are recorded", "kept_edits: 1" in md_v2, True)
         (VDIR / "Roadmap.pdf").write_text("roadmap-v3")
         ocr_daemon.scan_once(ocr_daemon.load_manifest())
         check("daemon learn: ...and keeps them on the re-OCR after that too",
-              "Second page agrees with Kontext." in out_md.read_text(), True)
+              "Second page agrees with Prometheus." in out_md.read_text(), True)
 
         # A learned term becomes active only through the gate.
         lv = rm_verify.LearnedVocab(ocr_daemon.LEARNED_VOCAB)
-        lv.record("Kontext", "other.pdf#1")
+        lv.record("Prometheus", "other.pdf#1")
         lv.save()
         ocr_daemon.USE_LEARNED_VOCAB = True
         ocr_daemon.LEARN_MIN_COUNT = 2
@@ -1147,15 +1154,15 @@ def main():
         rm_eval.gate_terms = saved_gate
         lv = rm_verify.LearnedVocab(ocr_daemon.LEARNED_VOCAB)
         check("daemon gate: a term that makes the eval worse is rejected",
-              (lv.active(), lv.data["rejected"]), ([], ["Kontext"]))
+              (lv.active(), lv.data["rejected"]), ([], ["Prometheus"]))
         lv.data["rejected"] = []
         lv.save()
         ocr_daemon.LEARN_GATE = False
         ocr_daemon.gate_learned_terms()
         check("daemon gate: LEARN_GATE=0 activates candidates directly",
-              rm_verify.LearnedVocab(ocr_daemon.LEARNED_VOCAB).active(), ["Kontext"])
+              rm_verify.LearnedVocab(ocr_daemon.LEARNED_VOCAB).active(), ["Prometheus"])
         check("daemon gate: active learned terms join the hint",
-              "Kontext" in ocr_daemon.current_terms(), True)
+              "Prometheus" in ocr_daemon.current_terms(), True)
     finally:
         for n, v in saved.items():
             setattr(ocr_daemon, n, v)
@@ -1163,6 +1170,7 @@ def main():
             setattr(rm_ocr, n, v)
 
     # --- scheduled quality self-check ---
+    import datetime as _dt
     gold_sc = tmp / "gold-selfcheck"
     for i in range(3):
         rm_verify.write_gold_case(gold_sc, f"sc{i}.pdf", 1, f"truth {i}", b"png")
@@ -1175,7 +1183,9 @@ def main():
                  "hyp_words": 100, "diff_errors": 5, "caught": 3, "seconds": 1,
                  "primary": "x"} for c in cases]
         return {"config": {"model": model, "verify_model": verify_model, "resolve": False},
-                "summary": rm_eval.summarize(rows), "cases": rows, "at": "2026-10-02T03:00:00"}
+                "summary": rm_eval.summarize(rows), "cases": rows,
+                # Now, not a fixed date: the interval check compares against the clock.
+                "at": _dt.datetime.now().isoformat(timespec="seconds")}
 
     saved_sc = {n: getattr(ocr_daemon, n) for n in (
         "GOLDSET_DIR", "EVAL_INTERVAL_DAYS", "EVAL_HISTORY", "EVAL_BASELINE", "VERIFY_MODEL")}
@@ -1217,10 +1227,10 @@ def main():
             setattr(ocr_daemon, n, v)
 
     # --- pairs: choosing a second reader from saved runs ---
-    truth_p = {"p1": "We use Pulumi with the Gartner guide", "p2": "Lastly the third item"}
-    reads = {"A": {"p1": "We use Palantir with the Gartner guide", "p2": "Lustly the third item"},
-             "B": {"p1": "We use Pulumi with the gather guide", "p2": "Lastly the third item"},
-             "A2": {"p1": "We use Palantir with the Gartner guide", "p2": "Lustly the third item"}}
+    truth_p = {"p1": "We use Grafana with the Postgres guide", "p2": "Firstly the third item"}
+    reads = {"A": {"p1": "We use Granada with the Postgres guide", "p2": "Fistly the third item"},
+             "B": {"p1": "We use Grafana with the posters guide", "p2": "Firstly the third item"},
+             "A2": {"p1": "We use Granada with the Postgres guide", "p2": "Fistly the third item"}}
     table = {(r["primary"], r["verifier"]): r for r in rm_eval.pair_scores(reads, truth_p)}
     check("pairs: a different reader flags the primary's errors",
           table[("A", "B")]["error_recall"], 1.0)
@@ -1229,6 +1239,60 @@ def main():
           sorted(rm_eval.reads_from_runs([{"config": {"model": "m1", "verify_model": "m2"},
                                            "cases": [{"id": "x", "primary": "a", "secondary": "b"}]}])),
           ["m1", "m2"])
+
+    # --- confidence flags: the primary model's own uncertainty ---
+    toks = [("We", 0.0), (" use", 0.0), (" Gran", -0.01), ("ada", -0.4), (" with", 0.0),
+            (" the", 0.0), (" posters", -0.3), (" guide", 0.0)]
+    confs = rm_verify.word_confidences(toks)
+    check("confidence: a word takes its weakest token", confs, [0.0, 0.0, -0.4, 0.0, 0.0, -0.3, 0.0])
+    check("confidence: words below the threshold are flagged",
+          rm_verify.mark_low_confidence("We use Granada with the posters guide", confs, -0.2),
+          ("We use ==Granada|~== with the ==posters|~== guide", 2))
+    check("confidence: words already in a dual-read flag are left alone",
+          rm_verify.mark_low_confidence("We use ==Granada|Grafana== with the posters guide", confs, -0.2),
+          ("We use ==Granada|Grafana== with the ==posters|~== guide", 1))
+    check("confidence: a reshaped page is left unflagged, not misflagged",
+          rm_verify.mark_low_confidence("We use Granada with the posters guide today", confs, -0.2),
+          ("We use Granada with the posters guide today", None))
+    check("confidence: a low-confidence flag resolves to the model's own word",
+          (rm_verify.strip_marks("x ==posters|~== y"), rm_verify.strip_marks("x ==posters|~== y", side="b")),
+          ("x posters y", "x posters y"))
+    sw_run = {"cases": [{"id": "s1", "primary": "We use Granada with the posters guide",
+                         "primary_confs": confs, "secondary": "We use Grafana with the posters guide"}]}
+    sw = {r["threshold"]: r for r in rm_eval.sweep(sw_run, {"s1": "We use Grafana with the Postgres guide"},
+                                                  [None, -0.2])}
+    check("sweep: dual read alone catches only the error the readers disagree on",
+          sw[None]["error_recall"], 0.5)
+    check("sweep: confidence flags add the error both readers shared", sw[-0.2]["error_recall"], 1.0)
+
+    def fake_conf(pdf, model, *a, confidence_out=None, **k):
+        if confidence_out is not None:
+            confidence_out[1] = confs
+        return [(1, "We use Granada with the posters guide")]
+
+    saved_cf = {n: getattr(ocr_daemon, n) for n in ("ocr_pdf", "CONFIDENCE_THRESHOLD", "VERIFY_MODEL")}
+    try:
+        ocr_daemon.ocr_pdf = fake_conf
+        ocr_daemon.VERIFY_MODEL = ""
+        ocr_daemon.CONFIDENCE_THRESHOLD = -0.2
+        (tmp / "vault/remarkable/Work/Conf.pdf").write_text("conf-v1")
+        ocr_daemon.scan_once(ocr_daemon.load_manifest())
+        crec = ocr_daemon.load_manifest()["remarkable/Work/Conf.pdf"]
+        cmd = ocr_daemon._out_md_path(crec["out_path"]).read_text()
+        check("daemon confidence: low-confidence words are flagged in the transcript",
+              "We use ==Granada|~== with the ==posters|~== guide" in cmd, True)
+        check("daemon confidence: frontmatter and manifest record the count",
+              ("confidence_flagged: 2" in cmd, crec["confidence"]["flagged"]), (True, 2))
+        ocr_daemon.CONFIDENCE_THRESHOLD = None
+        (tmp / "vault/remarkable/Work/Conf.pdf").write_text("conf-v2")
+        ocr_daemon.scan_once(ocr_daemon.load_manifest())
+        crec = ocr_daemon.load_manifest()["remarkable/Work/Conf.pdf"]
+        check("daemon confidence: off by default, no flags written",
+              ("|~==" in ocr_daemon._out_md_path(crec["out_path"]).read_text(), "confidence" in crec),
+              (False, False))
+    finally:
+        for n, v in saved_cf.items():
+            setattr(ocr_daemon, n, v)
 
     # --- local-only guard: page images never go to a public host ---
     for url in ("http://127.0.0.1:11434", "http://192.168.50.2:11434", "http://10.0.0.5",
@@ -1282,6 +1346,144 @@ def main():
     held = set((tmp / "export-test/holdout.ids").read_text().split())
     check("export: holdout ids are never in train",
           held & set((tmp / "export-test/train.ids").read_text().split()), set())
+
+    # --- hardening: the daemon never scans its own files ---
+    saved_state = ocr_daemon.STATE
+    try:
+        ocr_daemon.STATE = tmp / "vault/remarkable/.remarkable-ocr"
+        check("scan guard: a file under STATE inside the source tree is excluded",
+              ocr_daemon.is_excluded_input(ocr_daemon.STATE / "goldset/abc.png"), True)
+        check("scan guard: a file under OUT is excluded",
+              ocr_daemon.is_excluded_input(ocr_daemon.OUT / "remarkable/x.pdf"), True)
+        check("scan guard: a note in a hidden folder is excluded",
+              ocr_daemon.is_excluded_input(tmp / "vault/remarkable/.trash/old.pdf"), True)
+        check("scan guard: an ordinary note is not",
+              ocr_daemon.is_excluded_input(tmp / "vault/remarkable/Work/Sample.pdf"), False)
+    finally:
+        ocr_daemon.STATE = saved_state
+    (tmp / "vault/remarkable/.hidden").mkdir(exist_ok=True)
+    (tmp / "vault/remarkable/.hidden/Ghost.pdf").write_text("ghost-v1")
+    ocr_daemon.scan_once(ocr_daemon.load_manifest())
+    check("scan guard: the scanner skips a hidden folder",
+          "remarkable/.hidden/Ghost.pdf" in ocr_daemon.load_manifest(), False)
+
+    # --- hardening: atomic transcript writes leave no temp file behind ---
+    check("atomic write: no transcript temp file is left anywhere",
+          list(tmp.rglob("*.rm-ocr.tmp")), [])
+
+    # --- hardening: a broken manifest stops the daemon ---
+    good = ocr_daemon.MANIFEST.read_text()
+    try:
+        ocr_daemon.MANIFEST.write_text("{broken")
+        try:
+            ocr_daemon.load_manifest()
+            check("manifest: a corrupt manifest refuses to load", False, True)
+        except SystemExit as e:
+            check("manifest: a corrupt manifest refuses to load", "Refusing" in str(e), True)
+    finally:
+        ocr_daemon.MANIFEST.write_text(good)
+    saved_manifest = ocr_daemon.MANIFEST
+    try:
+        ocr_daemon.MANIFEST = tmp / "state/never-written.json"
+        check("manifest: a missing manifest is a fresh start", ocr_daemon.load_manifest(), {})
+    finally:
+        ocr_daemon.MANIFEST = saved_manifest
+
+    # --- hardening: page headings inside model text ---
+    esc = rm_verify.escape_page_headings("real text\n## Page 2\nmore")
+    check("headings: a heading inside page text is escaped", esc, "real text\n\\## Page 2\nmore")
+    check("headings: the escaped line is no longer a page boundary",
+          rm_verify.parse_pages("# T\n\n## Page 1\n\n" + esc + "\n\n## Page 2\n\nsecond\n"),
+          {1: esc, 2: "second"})
+    check("headings: a transcript whose headings changed does not match its sidecar",
+          rm_verify.pages_match({"pages": {"1": "a", "2": "b"}}, {1: "a"}), False)
+
+    # --- hardening: the collision check compares the source line exactly ---
+    coll_src = tmp / "vault/remarkable/Work/Collide.pdf"
+    coll_src.write_text("collide")
+    coll_md = ocr_daemon.safe_output_path(coll_src)   # where this source's transcript lands
+    coll_md.parent.mkdir(parents=True, exist_ok=True)
+    coll_md.write_text("---\nsource: remarkable/Work/Collide.pdfx\n---\n")
+    check("collision: a transcript recorded for a longer-named source is not ours",
+          ocr_daemon.safe_output_path(coll_src, source_sha256="abcdef1234").name,
+          f"Collide-abcdef12{ocr_daemon.OUT_SUFFIX}.md")
+    coll_md.write_text("---\nsource: remarkable/Work/Collide.pdf\n---\n")
+    check("collision: the exact source line keeps the plain name",
+          ocr_daemon.safe_output_path(coll_src, source_sha256="abcdef1234").name,
+          f"Collide{ocr_daemon.OUT_SUFFIX}.md")
+
+    # --- hardening: generated tokens are capped and a cut-off page says so ---
+    check("num_predict: the cap reaches the request options",
+          rm_ocr._options(num_predict=4096).get("num_predict"), 4096)
+    _doc_pages = [content_page_img]
+    rm_ocr.convert_from_path = lambda *a, first_page=1, **k: [_doc_pages[first_page - 1]]
+    rm_ocr.pdfinfo_from_path = lambda *a, **k: {"Pages": len(_doc_pages)}
+    _urllib_request.urlopen = make_urlopen([{"response": "partial text"},
+                                            {"done": True, "done_reason": "length"}])
+    try:
+        cut = _real_ocr_pdf("fake.pdf", "test-model", 150, 1568)
+        check("num_predict: a page cut off by the limit carries a marker",
+              cut[0][1].startswith("partial text") and rm_ocr.TRUNCATED_TEXT in cut[0][1], True)
+    finally:
+        _urllib_request.urlopen = saved_urlopen
+
+    # --- hardening: one instance per state dir ---
+    if ocr_daemon.INSTANCE_LOCK.acquire() is not None:   # platforms without fcntl run unlocked
+        second = ocr_daemon._InstanceLock()
+        try:
+            second.acquire()
+            check("lock: a second instance is refused", False, True)
+        except SystemExit as e:
+            check("lock: a second instance is refused", "another rm-ocr instance" in str(e), True)
+        ocr_daemon.INSTANCE_LOCK.release()
+        check("lock: released when the holder lets go", second.acquire(), True)
+        second.release()
+
+    # --- hardening: bundle extraction limits ---
+    import io as _io
+    import zipfile as _zipfile
+
+    def _zip(members):
+        buf = _io.BytesIO()
+        with _zipfile.ZipFile(buf, "w") as z:
+            for name, size in members:
+                z.writestr(name, b"x" * size)
+        buf.seek(0)
+        return _zipfile.ZipFile(buf)
+
+    saved_bytes = rm_render.MAX_BUNDLE_BYTES
+    try:
+        rm_render.MAX_BUNDLE_BYTES = 100
+        try:
+            rm_render.check_bundle(_zip([("a.rm", 60), ("b.rm", 60)]))
+            check("bundle: an archive over MAX_BUNDLE_MB is refused", False, True)
+        except ValueError as e:
+            check("bundle: an archive over MAX_BUNDLE_MB is refused", "MAX_BUNDLE_MB" in str(e), True)
+        try:
+            rm_render.check_bundle(_zip([("../evil.rm", 1)]))
+            check("bundle: a member escaping its folder is refused", False, True)
+        except ValueError as e:
+            check("bundle: a member escaping its folder is refused", "escapes" in str(e), True)
+        rm_render.check_bundle(_zip([("uuid/page.rm", 10), ("uuid.content", 5)]))
+        check("bundle: a normal archive passes", True, True)
+    finally:
+        rm_render.MAX_BUNDLE_BYTES = saved_bytes
+
+    # --- hardening: transcripts from before sidecars are adopted ---
+    legacy_md = out_base / "remarkable/Work" / f"Legacy{ocr_daemon.OUT_SUFFIX}.md"
+    legacy_md.parent.mkdir(parents=True, exist_ok=True)
+    legacy_md.write_text("---\nsource: remarkable/Work/Legacy.pdf\nstatus: ok\n---\n\n# Legacy\n\n"
+                         "## Page 1\n\nold page one\n\n## Page 2\n\nold page two\n")
+    man = ocr_daemon.load_manifest()
+    man["remarkable/Work/Legacy.pdf"] = {"status": "ok", "sha256": "legacy",
+                                         "out_path": f"remarkable/Work/Legacy{ocr_daemon.OUT_SUFFIX}.md"}
+    ocr_daemon.save_manifest(man)
+    check("adopt: the first pass adopts a sidecar-less transcript without harvesting",
+          (ocr_daemon.harvest_edits(man),
+           rm_verify.sidecar_path(ocr_daemon.STATE, man["remarkable/Work/Legacy.pdf"]["out_path"]).exists()),
+          (0, True))
+    legacy_md.write_text(legacy_md.read_text().replace("old page two", "old page two, corrected"))
+    check("adopt: an edit made after adoption is harvested", ocr_daemon.harvest_edits(man), 1)
 
     print(f"\n--- sample transcript ---\n{md}")
     if failures:
